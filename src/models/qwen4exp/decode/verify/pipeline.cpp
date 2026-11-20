@@ -126,7 +126,7 @@ bool Verifier::pl_commit_opt(int n_keep, std::string& err) {
     if (++commit_epoch_ == 0) ++commit_epoch_;
     h_commit_[2 + max_t_] = (int32_t) commit_epoch_;
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
+    const cudaError_t le = cudaGraphLaunch(commit_exec_[last_rope_context_], cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
     if (ev_opt_ == nullptr && cudaEventCreateWithFlags(&ev_opt_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";

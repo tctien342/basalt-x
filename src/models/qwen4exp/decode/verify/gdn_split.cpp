@@ -111,6 +111,25 @@ int64_t Verifier::gs_cuda0_bytes(const WeightTable& wt, const ModelGeometry& g, 
     return b;
 }
 
+struct GdnSplitSource {
+    const WeightRef *qkv, *z, *out, *a, *b, *conv, *norm, *dt, *sa;
+};
+
+static bool gs_layer_source(const WeightTable& wt, const ModelGeometry& g, int64_t layer, GdnSplitSource& s) {
+    const int64_t C = g.ssm_conv_channels, HV = g.ssm_v_heads, N = g.n_embd, S = g.ssm_state_size;
+    const auto blocked = [](int t) { return t == 11 || t == 12 || t == 13 || t == 14 || t == 23; };
+    const LayerView v(wt, layer);
+    s = {v.get("attn_qkv.weight"), v.get("attn_gate.weight"), v.get("ssm_out.weight"),
+         v.get("ssm_alpha.weight"), v.get("ssm_beta.weight"), v.get("ssm_conv1d.weight"), v.get("ssm_norm.weight"),
+         v.get("ssm_dt.bias"), v.get("ssm_a")};
+    return s.qkv && s.z && s.out && s.a && s.b && s.conv && s.norm && s.dt && s.sa &&
+           s.qkv->native_data && s.z->native_data && s.out->native_data &&
+           blocked(s.qkv->native_type) && blocked(s.z->native_type) && blocked(s.out->native_type) &&
+           s.conv->bytes == (uint64_t) C * g.ssm_d_conv * 4 &&
+           s.a->bytes == (uint64_t) HV * N * 2 && s.b->bytes == (uint64_t) HV * N * 2 &&
+           s.dt->bytes == (uint64_t) HV * 4 && s.sa->bytes == (uint64_t) HV * 4 && s.norm->bytes == (uint64_t) S * 4;
+}
+
 int64_t Verifier::gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, int dev0, int dev1) {
     if (dev1 < 0 || dev1 == dev0) return 0;
     const int nk0 = gs_plan(g, dev0, dev1);
@@ -121,12 +140,11 @@ int64_t Verifier::gs_peer_bytes(const WeightTable& wt, const ModelGeometry& g, i
     int64_t b = 0, layers = 0;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         if (is_qsa_layer(g, l)) continue;
-        const LayerView v(wt, l);
-        const WeightRef *q = v.get("attn_qkv.weight"), *z = v.get("attn_gate.weight"), *o = v.get("ssm_out.weight");
-        if (!q || !z || !o) return 0;
-        b += (int64_t) basalt::kernels::native_mmvq_weight_bytes(q->native_type, (int) N, (int) C1) +
-             (int64_t) basalt::kernels::native_mmvq_weight_bytes(z->native_type, (int) N, (int) Z1) +
-             (int64_t) basalt::kernels::native_mmvq_weight_bytes(o->native_type, (int) Z1, (int) N) +
+        GdnSplitSource s;
+        if (!gs_layer_source(wt, g, l, s)) return 0;
+        b += (int64_t) basalt::kernels::native_mmvq_weight_bytes(s.qkv->native_type, (int) N, (int) C1) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(s.z->native_type, (int) N, (int) Z1) +
+             (int64_t) basalt::kernels::native_mmvq_weight_bytes(s.out->native_type, (int) Z1, (int) N) +
              C1 * (HIST + 1) * 4 + V1 * N * 2 * 2 + V1 * 4 * 2 + (int64_t) S * 4 +
              (int64_t) basalt::core::gdn_slice_state_floats(sl, HIST) * 4;
         ++layers;
@@ -145,23 +163,11 @@ void Verifier::gs_init() {
     const int nk0 = gs_plan(g, device_, dm_->pdev);
     if (nk0 == 0) return;
     const GdnHeadSlice sl{HK, HV, S, nk0, HK - nk0};
-    auto blocked = [](int t) { return t == 11 || t == 12 || t == 13 || t == 14 || t == 23; };   // 256-value blocks
-    // every GDN layer's tensors, as the verify window reads them
-    struct Src {
-        const WeightRef *qkv, *z, *out, *a, *b, *conv, *norm, *dt, *sa;
-    };
-    std::vector<Src> src;
+    std::vector<GdnSplitSource> src;
     for (int64_t l = 0; l < g.n_layers; ++l) {
         if (is_qsa_layer(g, l)) continue;
-        const LayerView v(*wt_, l);
-        Src s{v.get("attn_qkv.weight"), v.get("attn_gate.weight"), v.get("ssm_out.weight"), v.get("ssm_alpha.weight"),
-              v.get("ssm_beta.weight"), v.get("ssm_conv1d.weight"), v.get("ssm_norm.weight"), v.get("ssm_dt.bias"),
-              v.get("ssm_a")};
-        if (!s.qkv || !s.z || !s.out || !s.a || !s.b || !s.conv || !s.norm || !s.dt || !s.sa || !s.qkv->native_data ||
-            !s.z->native_data || !s.out->native_data || !blocked(s.qkv->native_type) || !blocked(s.z->native_type) ||
-            !blocked(s.out->native_type) || s.conv->bytes != (uint64_t) C * (HIST + 1) * 4 ||
-            s.a->bytes != (uint64_t) HV * N * 2 || s.b->bytes != (uint64_t) HV * N * 2 ||
-            s.dt->bytes != (uint64_t) HV * 4 || s.sa->bytes != (uint64_t) HV * 4 || s.norm->bytes != (uint64_t) S * 4) {
+        GdnSplitSource s;
+        if (!gs_layer_source(*wt_, g, l, s)) {
             basalt::log::warn("basalt verify", "the GDN mixer stays whole on CUDA0: a layer the split does not cover");
             return;
         }
@@ -210,7 +216,7 @@ void Verifier::gs_init() {
     gs_layers_.assign(src.size(), GsLayer{});
     gs_dev_ = dm_->pdev;
     for (size_t i = 0; i < src.size() && ok; ++i) {
-        const Src& s = src[i];
+        const GdnSplitSource& s = src[i];
         GsLayer& L = gs_layers_[i];
         L.tq = s.qkv->native_type; L.tz = s.z->native_type; L.to = s.out->native_type;
         const size_t rq = basalt::kernels::native_mmvq_weight_bytes(L.tq, (int) N, 1),
@@ -284,7 +290,7 @@ void Verifier::gs_init() {
              cudaHostAlloc((void**) &gs_h_slice_, basalt::core::gdn_slice_state_floats(sl, HIST) * nl * 4,
                            cudaHostAllocPortable) == cudaSuccess;
     }
-    for (const Src& s : src)
+    for (const GdnSplitSource& s : src)
         ok = ok && basalt::kernels::dec_moe_mix_type_ok(s.qkv->native_type) &&
              basalt::kernels::dec_moe_mix_type_ok(s.z->native_type) && basalt::kernels::dec_moe_mix_type_ok(s.out->native_type);
     if (ok) {

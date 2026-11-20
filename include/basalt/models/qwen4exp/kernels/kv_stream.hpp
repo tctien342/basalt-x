@@ -38,6 +38,9 @@ struct KvHostPools {
     uint16_t* v_scale = nullptr;
     uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
     uint8_t* v_q4 = nullptr;
+    // Optional CUDA table for FP16: logical sequence page -> physical host page.
+    const int32_t* fp16_host_pages = nullptr;
+    bool fp16_shared_residency = false;
     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
 };
 
@@ -67,6 +70,10 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 /// Every block evicted: page table all -1, slots free, counters zero.
 void kv_stream_reset(const KvStreamMap& m, void* stream);
 
+/// Invalidate selected physical pages in a shared map. All prior map users must
+/// have drained or precede this operation on the same stream. IDs must be distinct.
+void kv_stream_invalidate(const KvStreamMap& m, const int32_t* physical_pages, int64_t count, void* stream);
+
 /// Make every block named by the selections of `n_q` queries resident (ids [n_q][cap], width from
 /// steps[q * kStepCount + kStepWidth]). Capturable. `n_slots` must hold the distinct blocks of one call
 /// (n_q x (cap / page_size + 2)); a call that cannot sets ctl[3] (see `kv_stream_counters`).
@@ -91,6 +98,12 @@ void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, i
 /// path's staging of one layer. Not capturable (DMA).
 void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t n_blocks,
                         const QsaShapes& s, void* stream);
+
+/// Stage selected FP16 or INT8 historical pages into the identity pool with 2 heads, 4 cells and head_dim 256.
+/// Bitmap scratch needs ceil(ceil(past / 4) / 32) uint32_t words. The original resident map stays read-only.
+bool kv_stage_selected(const QsaAttnPools& stage, const QsaAttnPools& resident, const KvHostPools& host,
+                       int fmt, const QsaShapes& shapes, uint32_t* selected_pages,
+                       const int32_t* ids, const int32_t* steps, int n_q, int cap, int past, void* stream);
 
 struct KvStreamCounters {
     uint64_t misses = 0, lookups = 0, calls = 0;

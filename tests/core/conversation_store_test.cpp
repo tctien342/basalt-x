@@ -9,6 +9,7 @@
 #include "basalt/platform/file.hpp"
 #include "basalt/platform/system.hpp"
 
+#include <array>
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -521,6 +522,96 @@ int main() {
         CHECK(st.load(m, got, err));
         CHECK(same_state(got.live, sb.checkpoints[1]) && same_state(got.checkpoints[0], sa.checkpoints[0]));
         remove_dir(d3);
+    }
+    {
+        const std::string normal_dir = dir + "-pooled-base", adapted_dir = dir + "-pooled-adapter";
+        std::vector<int32_t> adapted(ids.size());
+        for (size_t i = 0; i < adapted.size(); ++i) adapted[i] = (int32_t) (i * 11 + 5);
+        const SavedConversation adapter_image = image(adapted, {2048, 4096, 5000});
+        std::vector<int32_t> spare(1024);
+        for (size_t i = 0; i < spare.size(); ++i) spare[i] = (int32_t) (i * 3 + 23);
+        const SavedConversation survivor = image(spare, {512});
+        const uint64_t budget = src.bytes() + src.bytes() / 2;
+        std::vector<int32_t> base_prompt = ids, adapter_prompt = adapted;
+        base_prompt.push_back(-5);
+        adapter_prompt.push_back(-5);
+        {
+            ConversationStore base, adapter;
+            std::string err;
+            base.set_row_cells(4);
+            adapter.set_row_cells(4);
+            CHECK(base.open(normal_dir, id, budget, err));
+            CHECK(adapter.open(adapted_dir, id + 1, budget, err));
+            base.share_budget_with(adapter);
+            CHECK(base.put(SavedConversation(src), 1ull << 30));
+            base.flush();
+            CHECK(base.stats().bytes > budget / 2 && base.stats().bytes <= budget);
+            CHECK(adapter.best(base_prompt.data(), base_prompt.size(), {}, true).tokens == 0);
+            const auto stale = base.best(base_prompt.data(), base_prompt.size(), {}, true);
+            CHECK(stale.tokens == (int64_t) ids.size());
+            CHECK(base.put(SavedConversation(survivor), 1ull << 30));
+            base.flush();
+            CHECK(base.stats().files == 2);
+            CHECK(adapter.put(SavedConversation(adapter_image), 1ull << 30));
+            adapter.flush();
+            CHECK(base.stats().files == 1 && base.stats().evicted == 1);
+            CHECK(adapter.stats().files == 1 && base.stats().bytes + adapter.stats().bytes <= budget);
+            CHECK(base.best(adapter_prompt.data(), adapter_prompt.size(), {}, true).tokens == 0);
+            SavedConversation restored;
+            CHECK(!base.load(stale, restored, err));
+            const auto hit = adapter.best(adapter_prompt.data(), adapter_prompt.size(), {}, true);
+            CHECK(hit.tokens == (int64_t) adapted.size() && adapter.load(hit, restored, err));
+            CHECK(restored.live.ids == adapted);
+        }
+        {
+            ConversationStore base, adapter;
+            std::string err;
+            base.set_row_cells(4);
+            adapter.set_row_cells(4);
+            CHECK(base.open(normal_dir, id, budget, err));
+            CHECK(adapter.open(adapted_dir, id + 1, budget, err));
+            base.share_budget_with(adapter);
+            CHECK(base.stats().files == 1 && adapter.stats().files == 1);
+            SavedConversation restored;
+            const auto hit = adapter.best(adapter_prompt.data(), adapter_prompt.size(), {}, true);
+            CHECK(hit.tokens == (int64_t) adapted.size() && adapter.load(hit, restored, err));
+            CHECK(restored.live.ids == adapted);
+        }
+        remove_dir(normal_dir);
+        remove_dir(adapted_dir);
+    }
+    {
+        constexpr size_t modes = 4;
+        std::array<std::string, modes> paths;
+        const uint64_t budget = src.bytes() + src.bytes() / 2;
+        std::vector<int32_t> prompt = ids;
+        prompt.push_back(-5);
+        {
+            std::array<ConversationStore, modes> stores;
+            std::array<ConversationStore*, modes> group;
+            std::string err;
+            for (size_t mode = 0; mode < modes; ++mode) {
+                paths[mode] = dir + "-group-" + std::to_string(mode);
+                stores[mode].set_row_cells(4);
+                CHECK(stores[mode].open(paths[mode], id + mode, budget, err));
+                group[mode] = &stores[mode];
+            }
+            ConversationStore::share_budget(group);
+            for (size_t mode = 0; mode < modes; ++mode) {
+                CHECK(stores[mode].best(prompt.data(), prompt.size(), {}, true).tokens == 0);
+                CHECK(stores[mode].put(SavedConversation(src), 1ull << 30));
+                stores[mode].flush();
+                const auto hit = stores[mode].best(prompt.data(), prompt.size(), {}, true);
+                CHECK(hit.tokens == (int64_t) ids.size());
+                uint64_t total = 0;
+                for (size_t index = 0; index < modes; ++index) {
+                    total += stores[index].stats().bytes;
+                    CHECK(stores[index].stats().files == (index == mode ? 1 : 0));
+                }
+                CHECK(total <= budget);
+            }
+        }
+        for (const auto& path : paths) remove_dir(path);
     }
     {
         const std::string dir2 = dir + "-rows";

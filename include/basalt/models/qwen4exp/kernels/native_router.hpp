@@ -14,11 +14,11 @@ namespace basalt::kernels {
 void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
 /// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
-/// Residency-biased routing (opt-in, changes the output): n_tok rows as native_router_top10_multi, except that an
+/// Residency-biased routing (opt-in, changes the output): n_tok rows of 512 logits with 10 or 23 picks. An
 /// expert a GPU holds (any table of `held` has a slot for it) is picked as if its probability were exp(lambda) times
 /// larger. Only the selection is biased: the weights are the router's own probabilities of the picked experts,
-/// renormalised over the ten. lambda 0 gives native_router_top10_multi's output bit for bit.
+/// renormalised over the picks. For K=10, lambda 0 matches native_router_top10_multi bit for bit.
 /// counts (device, optional): [3] entries, [4] entries picked only because of the bias, [5] entries no GPU holds (added to).
-void route_prior_top10(const float* logits, const ResidentTabs& held, float lambda, int32_t* ids, float* weights, int n_tok,
-                       unsigned long long* counts, void* stream);
+void route_prior_topk(const float* logits, const ResidentTabs& held, float lambda, int32_t* ids, float* weights, int n_tok, int k,
+                      unsigned long long* counts, void* stream);
 }

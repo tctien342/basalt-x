@@ -34,6 +34,18 @@
 #include <vector>
 #include "basalt/log.hpp"
 
+#if defined(__linux__)
+#include <cerrno>
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <sys/file.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <sys/vfs.h>
+#endif
+
 namespace basalt::core {
 
 namespace detail {
@@ -1006,18 +1018,36 @@ bool FileExpertSource::pin_cache_complement(
                 err = "FileExpertSource: pageable resident complement allocation failed";
                 return false;
             }
-            if (pin) {
-                // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
-                // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
-                // read by the GPU over PCIe (the PCIe share) and copied by DMA; only the rest is locked in the working
-                // set (the registered prefix is page-locked by the driver already - locking it twice made the next
-                // device allocation fail).
-                lock_off = partial_pin;
-                const basalt::platform::LockResult lr =
-                    basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
-                locked = lr.locked_bytes;
-                note += (note.empty() ? "" : "; ") + lr.note;
+        }
+#if defined(__linux__)
+        if (const char* opt = std::getenv("BASALT_CPU_EXPERT_INTERLEAVE"); opt && std::strcmp(opt, "1") == 0) {
+            unsigned long nodes = 0;
+            constexpr unsigned long node_bits = sizeof(nodes) * 8;
+            if (syscall(SYS_get_mempolicy, nullptr, &nodes, node_bits, nullptr, MPOL_F_MEMS_ALLOWED) != 0) {
+                err = std::string("FileExpertSource: reading allowed NUMA nodes: ") + std::strerror(errno);
+                release();
+                return false;
             }
+            if ((nodes & (nodes - 1)) == 0) {
+                err = "FileExpertSource: interleave requires at least two allowed NUMA nodes";
+                release();
+                return false;
+            }
+            if (syscall(SYS_mbind, arena, (unsigned long) bytes, MPOL_INTERLEAVE, &nodes, node_bits, 0u) != 0) {
+                err = std::string("FileExpertSource: binding CPU complement: ") + std::strerror(errno);
+                release();
+                return false;
+            }
+            basalt::log::info("basalt", "FileExpertSource: interleaved CPU complement on NUMA mask 0x%lx", nodes);
+        }
+#endif
+        if (pin && !register_after) {
+            // CS-T: lock the part of the pageable fallback that the driver did not register.
+            lock_off = partial_pin;
+            const basalt::platform::LockResult lr =
+                basalt::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
+            locked = lr.locked_bytes;
+            note += (note.empty() ? "" : "; ") + lr.note;
         }
         host = (const uint8_t*) arena;
     }
@@ -1874,7 +1904,8 @@ ArenaExpertSource::~ArenaExpertSource() { close(); }
 
 bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err,
-                             const std::string& shared_arena_file) {
+                             const std::string& shared_arena_file,
+                             const std::function<bool()>& before_register) {
     close();
     const std::string& path = files_in.experts.path;
     // the layout (the per-layer blobs) was loaded by the driver
@@ -1936,9 +1967,25 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         }
     }
 
+    const auto identity_start = std::chrono::steady_clock::now();
     uint64_t arena_hash = 0;
     if (!shared_arena_file.empty() && !shared_arena_range_hash(files_in, lay, arena_hash, err)) return false;
+    const auto identity_done = std::chrono::steady_clock::now();
 
+#if defined(__linux__)
+    struct PopulationLock {
+        int fd = -1;
+        ~PopulationLock() { if (fd >= 0) ::close(fd); }
+    } publication;
+    if (!shared_arena_file.empty()) {
+        const int flags = O_WRONLY | O_CLOEXEC | (before_register ? 0 : O_CREAT);
+        publication.fd = ::open((shared_arena_file + ".lock").c_str(), flags, 0600);
+        if (publication.fd < 0 || flock(publication.fd, LOCK_EX) != 0) {
+            err = "ArenaExpertSource: unable to lock shared expert publication";
+            return false;
+        }
+    }
+#endif
     // one layer per registration slice, so no expert straddles two registrations.  The arena is one blob
     // longer than the file: a copy of a whole VRAM slot (the largest blob) may then start at any expert.
     std::vector<uint64_t> bounds, loff, lbytes;
@@ -1948,8 +1995,10 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
         lbytes.push_back(lay.blob_bytes(l) * (uint64_t) n_expert);
     }
     bounds.push_back(want);
+    const auto attach_start = std::chrono::steady_clock::now();
     PinnedArena* a = new PinnedArena(want + (uint64_t) blob, bounds, shared_arena_file,
-                                     arena_hash);
+                                     arena_hash, before_register);
+    const auto attach_done = std::chrono::steady_clock::now();
     if (!a->valid()) {
         const std::string why = a->note;
         delete a;
@@ -1958,42 +2007,71 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
               (why.empty() ? std::string{} : ": " + why);
         return false;
     }
-    // read through the file cache, which a warm restart serves from
-    const int fd = basalt::platform::open_fd_utf8(path);
-    if (fd < 0) {
-        delete a;
-        err = "ArenaExpertSource: cannot open " + path;
-        return false;
-    }
-    constexpr uint64_t kChunk = 8ull << 20;
-    LoadProgress progress("ram", want);
-    RamLoad load;
-    load.fd = fd;
-    load.unbuffered = false;
-    load.threads = std::max(threads, 1);
-    load.chunk = kChunk;
-    load.progress = &progress;
-    load.groups.resize((size_t) n_layers);
-    for (size_t l = 0; l < (size_t) n_layers; ++l)
-        for (uint64_t pos = 0; pos < lbytes[l]; pos += kChunk) {
-            RamRun r;
-            r.dst = a->data() + (size_t) (loff[l] + pos);
-            r.file_pos = files_in.experts.offset + loff[l] + pos;
-            r.bytes = std::min(kChunk, lbytes[l] - pos);
-            r.progress = r.bytes;
-            load.groups[l].push_back(r);
-        }
     RamLoadStats st;
-    std::string read_err;
-    const bool read_ok = read_ram_runs(load, st, read_err);
-    basalt::platform::close_fd(fd);
-    basalt::log::info("basalt generate", "expert arena read through the file cache (buffered)");
-    if (!read_ok) {
-        delete a;
-        err = "ArenaExpertSource: the expert load was refused: " + read_err;
-        return false;
+    const bool reuse = !shared_arena_file.empty() && basalt::platform::shared_arena_ready(a->mapping_base);
+    if (!shared_arena_file.empty()) {
+        using Seconds = std::chrono::duration<double>;
+        basalt::log::info("basalt startup", "shared expert arena: identity %.3f s, lock/layout %.3f s, map/register %.3f s, reused=%d",
+                         Seconds(identity_done - identity_start).count(), Seconds(attach_start - identity_done).count(),
+                         Seconds(attach_done - attach_start).count(), int(reuse));
     }
-    progress.finish();
+    if (reuse) {
+        basalt::log::info("basalt generate", "expert arena: retained shared RAM payload reused without copying expert pack");
+    } else {
+#if defined(__linux__)
+        if (!shared_arena_file.empty()) {
+            struct statvfs bytes{};
+            struct statfs fs{};
+            struct stat st{};
+            if (statvfs(shared_arena_file.c_str(), &bytes) != 0 ||
+                statfs(shared_arena_file.c_str(), &fs) != 0 ||
+                static_cast<uint64_t>(fs.f_type) != 0x01021994 ||
+                ::stat(shared_arena_file.c_str(), &st) != 0 ||
+                static_cast<uint64_t>(bytes.f_bavail) * bytes.f_frsize +
+                    static_cast<uint64_t>(st.st_blocks) * 512 < a->mapping_bytes) {
+                delete a;
+                err = "ArenaExpertSource: shared arena requires enough capacity on tmpfs";
+                return false;
+            }
+        }
+#endif
+        // read through the file cache, which a warm restart serves from
+        const int fd = basalt::platform::open_fd_utf8(path);
+        if (fd < 0) {
+            delete a;
+            err = "ArenaExpertSource: cannot open " + path;
+            return false;
+        }
+        constexpr uint64_t kChunk = 8ull << 20;
+        LoadProgress progress("ram", want);
+        RamLoad load;
+        load.fd = fd;
+        load.unbuffered = false;
+        load.threads = std::max(threads, 1);
+        load.chunk = kChunk;
+        load.progress = &progress;
+        load.groups.resize((size_t) n_layers);
+        for (size_t l = 0; l < (size_t) n_layers; ++l)
+            for (uint64_t pos = 0; pos < lbytes[l]; pos += kChunk) {
+                RamRun r;
+                r.dst = a->data() + (size_t) (loff[l] + pos);
+                r.file_pos = files_in.experts.offset + loff[l] + pos;
+                r.bytes = std::min(kChunk, lbytes[l] - pos);
+                r.progress = r.bytes;
+                load.groups[l].push_back(r);
+            }
+        std::string read_err;
+        const bool read_ok = read_ram_runs(load, st, read_err);
+        basalt::platform::close_fd(fd);
+        basalt::log::info("basalt generate", "expert arena read through the file cache (buffered)");
+        if (!read_ok) {
+            delete a;
+            err = "ArenaExpertSource: the expert load was refused: " + read_err;
+            return false;
+        }
+        progress.finish();
+        if (!shared_arena_file.empty()) basalt::platform::publish_shared_arena(a->mapping_base);
+    }
     arena_ = a;
     base_ = a->data();
     pinned_bytes_ = a->registered_bytes;
@@ -2014,7 +2092,7 @@ bool ArenaExpertSource::open(const ExpertFiles& files_in, int64_t n_layers, int6
     }
     blobs_ = n_layers * n_expert;
     n_expert_ = n_expert;
-    reads_ = 0;
+    reads_.store(0, std::memory_order_relaxed);
     note_ = a->note;
     gib_per_s_ = st.seconds > 0 ? (double) st.copied / 1073741824.0 / st.seconds : 0.0;
     return true;
@@ -2071,7 +2149,7 @@ const uint8_t* ArenaExpertSource::blob(int64_t layer, int64_t expert) {
     if (layer < 0 || expert < 0 || expert >= n_expert_) return nullptr;
     const int64_t idx = layer * n_expert_ + expert;
     if (idx < 0 || idx >= blobs_) return nullptr;
-    ++reads_;
+    reads_.fetch_add(1, std::memory_order_relaxed);
     // Pointer arithmetic into resident memory.  No fault, no copy, no mapping - which is the entire point of
     // this class over `FileExpertSource`.
     return base_ + basalt::kernels::cpu::expert_layout().blob_offset(layer, expert);

@@ -1,3 +1,5 @@
+#include "basalt/models/qwen4exp/swift_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/swift_lora.hpp"
 // src/models/qwen4exp/kernels/shared_expert.cu - the shared expert.
 //
 // the Python reference, transcribed:
@@ -18,6 +20,7 @@
 // The canonical projections use their explicit Q8_0/Q8_K activation images. The scalar gate reads the original F32
 // input and uses the BF16 MMVF plus an FP32 sigmoid. Native projection overrides independently select CUDA Q8_1
 // MMVQ and FP32 SwiGLU.
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "basalt/models/qwen4exp/kernels/shared_expert.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
@@ -97,6 +100,30 @@ __global__ void sigmoid_scale_rows_kernel(float* __restrict__ out, const float* 
     }
 }
 
+// Materialize SwiGLU only after the base down projection has consumed its packed input.
+void shared_lora(const NativeSharedWeights& nw, float* gate, const float* up, float* out,
+                 int rows, int n_ff, int n_embd, void* stream) {
+    if (!nw.down_lora_scale && !nw.swift_scale) return;
+    const int count = rows * n_ff;
+    native_swiglu_kernel<<<(count + THREADS - 1) / THREADS, THREADS, 0,
+                            static_cast<cudaStream_t>(stream)>>>(gate, up, gate, count);
+    if (nw.down_lora_scale)
+        atomic_lora_project(gate, nw.down_lora_a, nw.down_lora_b, nullptr, rows,
+                            n_ff, n_embd, nw.down_lora_scale, out, stream, nw.down_lora_per_row);
+    if (nw.swift_scale)
+        swift_lora_project(gate, nw.swift_down->a, nw.swift_down->b, rows, n_ff, n_embd, n_embd,
+                           nw.swift_scale, nw.swift_per_row, nw.swift_scratch, out, stream);
+}
+
+void shared_swift_pre(const NativeSharedWeights& nw, float* gate, float* up,
+                      int rows, int inputs, int outputs, void* stream) {
+    if (!nw.swift_scale) return;
+    swift_lora_project(nw.swift_input, nw.swift_gate->a, nw.swift_gate->b, rows, inputs, outputs, outputs,
+                       nw.swift_scale, nw.swift_per_row, nw.swift_scratch, gate, stream);
+    swift_lora_project(nw.swift_input, nw.swift_up->a, nw.swift_up->b, rows, inputs, outputs, outputs,
+                       nw.swift_scale, nw.swift_per_row, nw.swift_scratch, up, stream);
+}
+
 constexpr bool fused_swiglu_q81_enabled() { return true; }
 }  // namespace
 
@@ -110,8 +137,10 @@ void shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
     const void* x_q8_1 = nw.q8_1;
     native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
     native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+    shared_swift_pre(nw, gate, up, n_tok, (int) n_embd, (int) n_ff, stream);
     native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    shared_lora(nw, gate, up, out, n_tok, (int) n_ff, (int) n_embd, stream);
     if (n_tok > 1) {   // one gemv for all rows (outputs identical), fused sigmoid+scale
         bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         launch_pdl(sigmoid_scale_rows_kernel, dim3((unsigned) ((n_embd + THREADS - 1) / THREADS), (unsigned) n_tok),
@@ -139,8 +168,10 @@ void shared_expert_multi_rows(int n_tok, const NativeSharedWeights& nw, float* g
     } else {
         native_mmvq(nw.up_type, nw.up_data, nw.q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
     }
+    shared_swift_pre(nw, gate, up, n_tok, (int) n_embd, (int) n_ff, stream);
     native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    shared_lora(nw, gate, up, out, n_tok, (int) n_ff, (int) n_embd, stream);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi_rows: ") + cudaGetErrorString(e));
 }
@@ -221,6 +252,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const SForm& gat
     if (native_projection && native_down && fused_swiglu_q81_enabled()) {
         native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
+        shared_lora(*native, gate, up, out, 1, (int) n_ff, (int) n_embd, stream);
     } else {
         if (native_projection)
             native_swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);

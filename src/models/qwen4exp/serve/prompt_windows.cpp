@@ -1,6 +1,7 @@
 // src/models/qwen4exp/serve/prompt_windows.cpp - request prompt_windows operations.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "basalt/models/qwen4exp/decode/dflash2.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -10,11 +11,27 @@ namespace basalt::models::qwen4exp::serve {
 // not in VRAM over PCIe) and it borrows slots it must refill after; a window costs little per token, with
 // the misses on the CPU.  Each part below is decided on its own, so a long first message is read batched
 // and its header still goes through the windows.  Picture rows need the batched path.
+ShortPrefillTiming* QfnRequest::short_prefill_timing(int64_t at) {
+    if (!runtime_.o.prefill_auto_fit ||
+        !(runtime_.scheduler_enabled || basalt::core::exp_flag("adaptive_short_prefill")) ||
+        runtime_.batch_on() || (in_slot && !solo_req) || resumed_chunk > 0 || !runtime_.req_imgs.empty())
+        return nullptr;
+    const bool streamed = runtime_.o.kv_resident > 0 && at >= runtime_.o.kv_resident;
+    return &runtime_.short_prefill_timings[2 * runtime_.active_cache + streamed];
+}
+
 bool QfnRequest::windows_ok(int64_t a, int64_t b) {
-    if ((in_slot && !solo_req) || b - a > runtime_.o.short_read) return false;   // (the verifier is bound to this request's state)
+    const int64_t tokens = b - a;
+    if ((in_slot && !solo_req) || tokens > runtime_.o.short_read) return false;   // (the verifier is bound to this request's state)
     if (runtime_.sp.embd_rows != nullptr)
         for (int64_t i = a; i < b; ++i)
             if (runtime_.sp.embd_rows[i] != nullptr) return false;
+    if (auto* timing = short_prefill_timing(a); timing && tokens >= runtime_.o.short_read / 2) {
+        if (!timing->use_windows(tokens)) {
+            basalt::log::info("basalt serve", "short prefill: measured costs selected batching for %lld tokens", (long long) tokens);
+            return false;
+        }
+    }
     return true;
 }
 
@@ -43,6 +60,7 @@ bool QfnRequest::read_windows(int64_t a, int64_t b, std::string& e) {
             return false;
         }
         if (!runtime_.ver.commit(T, e) || (runtime_.mtp_on && !runtime_.mtp.prefill(runtime_.ver.final_R_all(), nxt.data(), T, q, e))) return false;
+        if (dflash && !dflash->remember_verify(q, T, e)) return false;
         q += T;
         runtime_.pp_reached = q;
     }

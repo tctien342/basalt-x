@@ -1,12 +1,18 @@
 // src/models/qwen4exp/serve/qfn_state.hpp - Flash-Next's serving state, ordered by resource lifetime.
 #pragma once
 
+#include <deque>
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/swift_lora.hpp"
 #include "../../../program/serve/state.hpp"
 #include "qfn_runtime.hpp"
+#include "basalt/models/qwen4exp/decode/shared_kv_table.hpp"
 #include "basalt/model/adapter.hpp"
 #include "../../../program/cli/tokens.hpp"
 #include "loans.hpp"
+#include "prefill_chunk.hpp"
+#include "decode_budget.hpp"
 #include "loan_moves.hpp"
 #include "basalt/models/qwen4exp/options.hpp"
 #include "basalt/program/community_row.hpp"
@@ -152,6 +158,7 @@ class QfnRuntime final : public Runtime, private Context {
 public:
     explicit QfnRuntime(Context& context)
         : Runtime(context.o, context.model_file, context.err, context.n_vocab, context.grammar_vocab), Context(context) {}
+    ~QfnRuntime() override;
     int init_before_input() override;
     int init_after_input() override;
     void after_input_start() override;
@@ -160,9 +167,11 @@ public:
     bool windows_in_flight() override;
     bool next_batch_window() override;
     bool drain_windows() override;
+    int grow_batch_slot() override;
     void script_command(const std::string& line) override;
     void probe_command(const std::string& line, std::string& e) override;
     void sleep_command(bool down, std::string& e) override;
+    bool before_command() override;
     void between_requests(const std::string& line) override;
     Flow run_request() override;
     bool slot0_solo() const override { return slot0_is_solo; }
@@ -177,6 +186,48 @@ private:
     using Context::n_vocab;
     using Context::grammar_vocab;
     friend class Request;
+    std::unique_ptr<basalt::qwen4exp::AtomicLora> lora_host;
+    std::unique_ptr<basalt::qwen4exp::AtomicLoraDevice> lora_main;
+    std::unique_ptr<basalt::qwen4exp::AtomicLoraDevice> lora_peer;
+    static constexpr float atomic_lora_scale = 1.25f;
+    static constexpr float swift_lora_scale = 1.0f;
+    static constexpr unsigned adapter_count = 4;
+    static constexpr unsigned cache_count = 2 * adapter_count;
+    bool rope_context_profiles{};
+    unsigned active_adapter{};
+    unsigned active_cache{};
+    unsigned configured_adapters() const { return (lora_main ? 1u : 0u) | (swift_main ? 2u : 0u); }
+    static unsigned cache_key(unsigned adapter, basalt::kernels::RopeContext context) {
+        return adapter + (context == basalt::kernels::RopeContext::YaRN2 ? adapter_count : 0);
+    }
+    bool cache_configured(unsigned key) const {
+        const unsigned mode = key % adapter_count;
+        return !(mode & ~configured_adapters()) &&
+               (rope_context_profiles ? mode != 3 : key < adapter_count);
+    }
+    std::array<std::optional<basalt::core::ConversationCache>, cache_count> parked_conversations;
+    std::array<basalt::core::ConversationStore, cache_count - 1> profile_disk;
+    basalt::core::ConversationStore& disk_store() override { return disk_store(active_cache); }
+    basalt::core::ConversationStore& disk_store(unsigned key) { return key ? profile_disk[key - 1] : disk; }
+    std::array<basalt::core::ConversationStore, cache_count> recovery_stores;
+    std::future<basalt::core::ConversationSharedSnapshot> frozen_recovery;
+    size_t frozen_recovery_bytes = 0;
+    unsigned frozen_recovery_cache = 0;
+    bool has_cold_profile_source();
+    bool defer_profile_park(int slot, int64_t cells);
+    void finish_frozen_recovery();
+    std::array<Clock::time_point, 2> idle_spill_retry{};  // disk and RAM recovery admission backoff
+    basalt::core::ConversationStore* ram_checkpoint_store() override {
+        auto& store = recovery_stores[active_cache];
+        return store.enabled() ? &store : nullptr;
+    }
+    uint64_t adapter_cache_identity(unsigned mode, uint64_t seed) const;
+    size_t checkpoint_for_recovery() override;
+    size_t spill_conversations(bool at_exit, size_t limit, bool ram_recovery);
+    unsigned cached_adapter(int slot) const;
+    unsigned cached_context_key(int slot) const;
+    int init_atomic_lora();
+    void bind_lora_ple(basalt::core::SessionState& session, const basalt::qwen4exp::AtomicLoraDevice* device);
     basalt::prefill::Prefill sp{};
     void* borrow{};
     uint64_t borrow_bytes{};
@@ -208,6 +259,8 @@ private:
     // most) and it lends and reads as on an idle engine.  A longer read goes beside them, within the limits above,
     // and so does the rest of one that gave way to a shorter request (in its chunk).
     static constexpr int64_t kReadAlone = 16384;
+    // Separate costs by adapter and whether attention has crossed the resident KV span.
+    std::array<ShortPrefillTiming, 2 * cache_count> short_prefill_timings;
     bool any_loan{};
     static constexpr int64_t kStepChunks[] = {6144, 4096, 3072, 2048, 1536, 1024, 512};
     int64_t split_chunk_max{};
@@ -223,6 +276,7 @@ private:
     std::vector<int32_t> hist_stage{};
     int hist_dev{};
     basalt::core::Verifier ver{};
+    std::unique_ptr<basalt::core::Verifier> thinking_ver;
     basalt::core::VerifyHits vh{};
     // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
     // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
@@ -238,7 +292,7 @@ private:
     // A turn-boundary checkpoint's GDN bytes reach the host after the first token (see the deferral class); this
     // is declared after `checks` so it is destroyed, and its copy finished, before the checkpoints are.
     basalt::core::ConversationCheckpointDeferral ckd{};
-    std::vector<basalt::core::SessionState> rviews{};
+    std::deque<basalt::core::SessionState> rviews{};
     basalt::core::SessionState* rsp{};
     // A layer split's mid-prompt checkpoints: when the last stage reports a chunk, the earlier ones already read
     // the next, so each stage saves its own part when it reaches a checkpoint position (the same rule as the main card's:
@@ -326,6 +380,49 @@ private:
     /// the solo conversation's draft K/V waits in slot 0's store while a request in another slot holds the main one
     bool solo_draft_in0{};
     int S_all{};
+    bool tune_decode_rows{};
+    DecodeRowBudget<basalt::kernels::kVerifyMaxT> decode_rows;
+    enum class SchedulerPhase { idle, prefill, overlap, solo_decode, batch_decode };
+    const bool scheduler_enabled = basalt::core::exp_flag("adaptive_engine_scheduler");
+    bool overlap_learning_enabled = false;
+    uint64_t overlap_episode = 0;
+    std::map<uint64_t, std::pair<int64_t, int64_t>> overlap_learned;   // scope -> chunk, expiry
+    std::map<uint64_t, int64_t> overlap_rejected;
+    struct OverlapSettlement {
+        struct Decoder {
+            size_t slot;
+            Clock::time_point started, last_emit;
+            int64_t context;
+            unsigned cache_key;
+            bool seen = false;
+        };
+        uint64_t scope;
+        int64_t chunk;
+        double gap_limit_ms;
+        std::vector<Decoder> decoders;
+    };
+    std::optional<OverlapSettlement> overlap_settlement;
+    void observe_overlap_emission(size_t slot, Clock::time_point emitted);
+    void reject_overlap_learning(uint64_t scope, int64_t chunk);
+    void report_overlap_learning(const char* outcome, uint64_t scope, int64_t chunk);
+    uint64_t overlap_hint_scope = 0;
+    int64_t overlap_hint_chunk = 0;
+    int64_t overlap_hint_gap_ms = 0;
+    int64_t overlap_hint_expires = 0;
+    const bool scheduler_warm_start = scheduler_enabled && basalt::core::exp_flag("adaptive_scheduler_warm_start");
+    SchedulerPhase scheduler_phase = SchedulerPhase::idle;
+    uint64_t scheduler_epoch = 0;
+    Clock::time_point scheduler_reported{}, scheduler_checked{};
+    SchedulerQueue scheduler_pressure{};
+    int64_t scheduler_prompt_left = 0, scheduler_chunk = 0;
+    int scheduler_hard_rows = 0, scheduler_rows = 0, scheduler_trial_rows = 0;
+    double scheduler_quantum_ms = 0.0;
+    double scheduler_output_gap_ms = -1.0;
+    uint64_t scheduler_batch_windows = 0, scheduler_limited_windows = 0;
+    double scheduler_batch_ms = 0.0, scheduler_limited_ms = 0.0;
+    const char* scheduler_decision = "none";
+    void observe_scheduler(SchedulerPhase phase, int64_t prompt_left = -1);
+    int scheduler_pressure_class(bool require_fresh = false);
     std::optional<basalt::spec::DraftPolicy> bpolicy;
     double bt_draft{};
     double bt_draft_last{};
@@ -356,7 +453,8 @@ private:
     int64_t bt_miss0{};
     int64_t bt_hits0{};
     int64_t bt_pcie0{};
-    int64_t bt_windows{};
+    size_t batch_cursor = 0;
+    int64_t bt_windows{}, bt_mixed_adapters{};
     int64_t bt_rows{};
     int64_t bt_tokens{};
     Clock::time_point bt_start{};
@@ -387,7 +485,8 @@ private:
     basalt::core::Verifier& stage_verb(int st);
     void ckd_finish() override;
     bool capture_admit(uint64_t need, uint64_t floor) override;
-    bool park_current(size_t held, int64_t kept) override;
+    bool park_current(size_t held, int64_t kept) override { return park_current(held, kept, false); }
+    bool park_current(size_t held, int64_t kept, bool profile_switch);
     bool gpu_sync_ok();
     bool checkpoint_at(int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool defer = false,
                        ConvCheckpoint::Source source = ConvCheckpoint::kPeriodic);
@@ -402,6 +501,19 @@ private:
     bool xq_advance(bool wait);
     bool xq_drain();
     void save_profile(const char* why);
+    // Indexed by logical sequence; backing and tables are installed by startup.
+    struct SharedSequence {
+        basalt::core::SharedKvPages::Lease lease;
+        unsigned adapter = 0;
+        basalt::kernels::RopeContext rope_context = basalt::kernels::RopeContext::Startup;
+        std::vector<basalt::core::SharedKvTable::Stage> stages;
+        std::vector<int32_t> image_rope;
+    };
+    std::unique_ptr<basalt::core::SharedKvPages> shared_pages;
+    std::vector<std::unique_ptr<SharedSequence>> shared_sequences;
+    Flow publish_shared_request(int slot, uint32_t pages, unsigned adapter);
+    bool settle_shared_slot(int slot, bool retain, int64_t solo_cells = -1);
+    bool append_shared_session(std::string& error);
     void make_view(basalt::core::SessionState& v, int b);
     int32_t loan_plan(int64_t live, int64_t& chunk);
     void relend();
@@ -414,6 +526,7 @@ private:
                            const std::vector<serve_loans::LentEntry>* lent_out = nullptr);
     bool kv_drain(std::string& e);
     bool cache_regrow(std::string& e);
+    bool shared_expert_room(uint64_t bytes, std::string& e, bool lend_another_segment = false);
     bool peer_take(const std::vector<int32_t>& off, std::string& e);
     void peer_due_lent(std::vector<std::pair<int32_t, int32_t>>& lent);
     bool peer_due_apply(std::string& e);
@@ -426,12 +539,41 @@ private:
     bool park_one(int b, std::string& e);
     bool park_idle_engine(std::string& e) override;
     void enc_command(const std::string& cmd) override;
+    bool submit_async_image(const std::string& cmd) override;
+    bool async_image_active() const override { return vision_decode_lease.load(); }
+    bool tick_async_image() override { return service_vision(); }
+    bool service_vision(bool finish = false);
+    int64_t vision_tail_first(const basalt::core::PeerExperts& tier) const;
+    size_t vision_stage_bytes(const basalt::core::PeerExperts& tier) const;
+    void offer_vision_tail(void* arena, size_t bytes);
+    bool close_vision_tail(std::string& error);
+    void start_image_locked();
+    const bool vision_overlap = o.peer_device > 0 && o.vision_in_engine && peer.valid() && !peer.exclusive() &&
+                                stages.empty() && std::getenv("BASALT_ADAPTIVE_VISION") != nullptr &&
+                                [] { const char* v = std::getenv("BASALT_GPU1_VISION_OVERLAP"); return v && v[0]=='1' && !v[1]; }();
+    std::mutex vision_mutex;
+    std::string vision_pending;
+    std::atomic<bool> vision_queued{false};
+    std::future<void> image_job;
+    std::atomic<bool> vision_fence_ok{true};
+    void* vision_tail = nullptr;   // published only after the expert lease drains
+    size_t vision_tail_bytes = 0;
+    std::atomic<bool> vision_decode_lease{false};
+    std::vector<std::pair<int32_t, int32_t>> vision_decode_experts;
     bool copy_to_slot(int b, const std::vector<int32_t>& ids, std::string& e) override;
     bool hold_slot(int b, const ConvCheckpoint* at, std::string& e);
     bool copy_from_slot(int b, const ConvCheckpoint* at, std::string& e) override;
     void solo_draft_back(bool keep) override;
     bool slot_digest(int b, int64_t upto, uint64_t* part);
-    bool batch_step();
+    bool batch_step(bool beside_prefill = false);
+    bool batch_rows(int slots, int row_budget, int* rows, int64_t* pos, bool tune);
+    bool batch_prompt_rows(int slots, int row_budget, const int* rows, const int64_t* pos);
+    bool next_batch_prefers_decode = false;
+    const char* pcie_state = "idle";
+    int pcie_applied_q8 = 0;
+    long long pcie_window_payload_mbps = 0;
+    uint64_t pcie_tuner_windows = 0, pcie_tuner_bytes = 0;
+    basalt::core::Verifier::PcieWindow pcie_last_window{};
     basalt::core::Verifier& stage_verifier(int k);
     bool pipe_inflight();
     bool group_active(int gi);

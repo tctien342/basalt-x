@@ -32,6 +32,7 @@ using namespace detail;
 
 namespace detail {
 int64_t g_stream_all_min = 6144;
+bool g_lora_fallback = false;
 int g_ring_depth = kPrefillRingDeep;
 double g_pinned_share = 1.0;
 // Whether the fused experts' buffers apply: a streamed chunk of a pack the fused kernels cover.
@@ -201,7 +202,7 @@ MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
         if (fp4_pack()) { xq = std::max(xq, fp4_x_bytes(T * K, n_expert)); hq = std::max(hq, fp4_h_bytes(gr)); }
         return {gr * 1280, gr * 640, xq, hq};
     }
-    const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
+    const size_t ts = g_lora_fallback ? T : (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);
     return {std::max(ts * K * 1280, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max(ts * K * 640, (fused::act_bytes((int64_t) (T * K), 640) + 3) / 4),
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
@@ -354,12 +355,16 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
+    m.layout_bytes = o.used;
     return true;
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+uint64_t Prefill::workspace_bytes() const { return impl_->layout_bytes; }
+bool Prefill::workspace_borrowed() const { return impl_->borrowed; }
 
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
+void Prefill::set_lora_fallback(bool enabled) { g_lora_fallback = enabled; }
 void Prefill::set_stream_all_min(int64_t tokens) { g_stream_all_min = tokens; }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
 void Prefill::set_cpu_share(double share) { impl_->cpu_share_now = std::max(0.0, std::min(share, 1.0)); }

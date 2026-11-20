@@ -23,6 +23,38 @@ SavedConversation image(std::initializer_list<int32_t> ids, bool cvec = true) {
 
 int main() {
     {
+        ConversationCache cache(1 << 20, 1);
+        int owner = 0, peer = 0;
+        SavedConversation image;
+        image.live.ids = {1, 2, 3, 4};
+        image.live.state_a.resize(128);
+        image.live.state_a[0] = 79;
+        image.kv.resize(1);
+        image.kv[0].k.resize(64);
+        const auto ids = image.live.ids;
+        const size_t bytes = image.bytes();
+        auto writer = image.shared_recovery_view();
+        check(writer.has_value(), "writer view accepts an unsplit image");
+        const auto* original_state = std::as_const(writer->live).state_a.data();
+        cache.retain_complete(std::move(image), &owner, 8);
+        check(cache.bytes() == bytes, "retention accounts the whole image once");
+        check(!cache.take_complete(&peer, 8, ids, {}, true), "peer cannot take a foreign owner");
+        check(!cache.take_complete(&owner, 9, ids, {}, true), "intervening command invalidates exact capture");
+        check(!cache.take_complete(&owner, 8, ids, {}, false), "control vector mismatch prevents handoff");
+        check(!cache.take_complete(&owner, 8, {1, 2, 3}, {}, true), "live token mismatch prevents handoff");
+        auto parked = cache.take_complete(&owner, 8, ids, {}, true);
+        check(parked.has_value(), "immediate exact owner can take a full image");
+        check(std::as_const(parked->live).state_a.data() == original_state, "writer and park share the checkpoint state");
+        check(parked->kv.size() == 1 && parked->kv[0].k.size() == 64, "park retains its KV buffers");
+        check(cache.bytes() == 0, "take frees the retained charge");
+        cache.retain_complete(std::move(*parked), &owner, 10);
+        cache.limit_reuse(3);
+        check(!cache.take_complete(&owner, 10, ids, {}, true), "rewind prevents full image reuse");
+        auto prefix = cache.take_reuse(&owner);
+        check(prefix.unchanged_tokens == 3 && prefix.kv.size() == 1, "rewind keeps reusable prefix KV");
+        check(cache.bytes() == 0, "prefix take frees retained bytes");
+    }
+    {
         ConversationBuffer bytes;
         const size_t first = ConversationBuffer::segment_bytes + 17;
         const size_t peak = bytes.allocation_peak(first);

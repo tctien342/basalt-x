@@ -14,8 +14,10 @@
 
 namespace basalt::core {
 
+enum class HostPlanTouch { Zero, Page, Prefault };
 /// Holds `bytes` of RAM, its pages written, for a later host_alloc.  False when the RAM is not there.
-bool host_plan(size_t bytes);
+/// Page and Prefault commit the same pages without initializing unused reservation contents.
+bool host_plan(size_t bytes, HostPlanTouch touch = HostPlanTouch::Zero);
 /// cudaHostAlloc, after giving back the smallest hold of at least `bytes` (else the largest one).
 cudaError_t host_alloc(void** p, size_t bytes, unsigned flags);
 /// The RAM still held.

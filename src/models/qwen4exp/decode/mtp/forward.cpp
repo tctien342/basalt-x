@@ -58,9 +58,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
     const int32_t* step = step_ + row0 * 4;
     const int32_t* pos = pos_ + row0 * NH;
-    const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && !st_.kv_rot &&
-                          qsa_dec_fused_supported(s);
-    const bool kv_par = par_ && full && !reuse_row && kv_fused;
+    const int value_width = kv_value_rotation_width(st_.kv_rot && st_.kv_int8 && !st_.kv_q4);
+    const bool kv_fused = st_.kv_int8 && !st_.kv_q4 && qsa_dec_fused_supported(s);
+    const bool kv_par = par_ && full && !reuse_row && kv_fused && !st_.kv_rot;
     // chain-step kernels that start while the one before them still runs (the paths below all use the fused kernels)
     const bool pdl_ok = kv_par && !st_.kv_rot && qsa_dec_fused_supported(s) &&
                         qsa_dec_attn_supported(qsa_attn_pools(st_), s) && par_ && dec_draft_hcf() && have_pre_;
@@ -94,7 +94,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             uint8_t* const xqe = par_ ? xq2_ : xq_;
             pscope(true);   // the embedding branch follows the fork
             if (const NativeEmbed* ne = native_embed()) {   // the GGUF-form table
-                ne->gather_dev(tok_, T, emb_, ce);
+                ne->gather_dev(tok_, T, emb_, ce, m_adapter_rows_);
             } else {
                 const auto* codes = (const uint8_t*) we->data;
                 const auto* scales = (const float*) (codes + we->codes_bytes);
@@ -141,7 +141,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             if (!q8_done) native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
             // K/V on the second stream, beside Q (a round's catch-up: beside the draft row's query, joined before its
             // attention)
-            kv_side = kv_par || (kv_defer_ && !full && par_ && kv_fused);
+            kv_side = kv_par || (kv_defer_ && !full && par_ && kv_fused && !st_.kv_rot);
             if (kv_side) fork(cs);
             const cudaStream_t ckv = kv_side ? cs2_ : cs;
             pscope(true);   // the K/V branch follows the fork
@@ -152,14 +152,15 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                 kp.kcur = kcur_; kp.vcur = vcur_; kp.pos_k = pos; kp.pos_stride = (int) NH;
                 kp.k_norm = f32("self_attn.k_norm.weight"); kp.steps = step;
                 kp.k_q = st_.k_q; kp.v_q = st_.v_q; kp.k_scale = st_.k_scale; kp.v_scale = st_.v_scale;
-                kp.page_table = st_.page_table; kp.host = st_.host; kp.eps = EPS;
+                kp.page_table = st_.page_table; kp.host = st_.host; kp.eps = EPS; kp.hadamard = st_.kv_rot;
+                kp.value_hadamard_width = value_width;
                 qsa_dec_kv_post(kp, T, s, rope_scaling(), ckv);
             } else
             for (int t = 0; t < T; ++t) {
                 norm_rope(kcur_ + t * NKV * HD, f32("self_attn.k_norm.weight"), (int) NKV, (int) HD, pos + t * NH);
                 if (st_.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8
                     fwht256_inplace_cuda(kcur_ + t * NKV * HD, NKV, cs);
-                    fwht256_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs);
+                    fwht_value_inplace_cuda(vcur_ + t * NKV * HD, NKV, cs, value_width);
                 }
                 // stored in the state's own format (rotated INT8 K/V are not appended as Q4_0)
                 if (st_.kv_q4)
@@ -183,9 +184,9 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
                                     (int) (NH * 2 * HD), cs);
         else
             native_mmvq(GGML_Q8_0, q8("self_attn.q_proj.weight"), xq_, qfull_, (int) N, (int) (NH * 2 * HD), T, cs);
-        if (!st_.kv_rot && qsa_dec_fused_supported(s)) {
+        if ((!st_.kv_rot || kv_fused) && qsa_dec_fused_supported(s)) {
             QsaDecQPost qp;   // the query split, norm and RoPE in one launch
-            qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos; qp.q_norm = f32("self_attn.q_norm.weight"); qp.eps = EPS;
+            qp.q_full = qfull_; qp.qcur = qcur_; qp.pos_q = pos; qp.q_norm = f32("self_attn.q_norm.weight"); qp.eps = EPS; qp.hadamard = st_.kv_rot;
             qsa_dec_q_post(qp, T, s, rope_scaling(), cs);
         } else
         for (int t = 0; t < T; ++t) {
@@ -208,8 +209,12 @@ bool MtpDrafter::record_forward(int T, int step_row0, cudaStream_t cs, std::stri
             aq_done = true;
             qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs, qfull_, attn32_, (void*) xq_);
         } else {
-            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
-            if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
+            // Wide one-row INT8 drafts also support rotated Q/K/V. Apply the inverse transform before gating.
+            if (st_.kv_rot && st_.kv_int8 && T == 1 && cap_ >= 8192 && qsa_dec_attn_supported(pools, s))
+                qsa_dec_attn(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+            else
+                qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+            if (st_.kv_rot) fwht_value_inplace_cuda(attn_, (int64_t) T * NH, cs, value_width);
             for (int t = 0; t < T; ++t)
                 native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD, (int) NH,
                                       (int) HD, cs);

@@ -33,6 +33,12 @@ protected:
     int64_t req_gprompt{};
     std::string req_grammar_text{};   // grammar=<compact ASCII JSON, spaces as \u0020>: the request's grammar (--grammar on)
     int req_cvec{};
+    bool req_atomic_lora{};
+    bool req_swift_lora{};
+    bool req_group_prefill = false;
+    int req_rope_profile = -1;
+    unsigned request_adapter() const { return unsigned(req_atomic_lora) | (unsigned(req_swift_lora) << 1); }
+    int32_t req_think_close = -1;
     float req_relax{};
     int req_ppl{};
     int req_ppl_t{};
@@ -113,22 +119,39 @@ protected:
     bool part_checkpoint(int64_t to) const { return to == turn_at || to == root_at || to == media_at; }
     int64_t at{};
     int64_t fold_p0{};
+    std::vector<int32_t> deferred_prompt;
     double prompt_ms{};
     bool starts_with(const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs);
     Flow restore();
+    virtual bool slot_prefix_compatible(int, int64_t = 0) const { return true; }
     Flow parse();
     Flow prepare_prompt();
     virtual Flow prepare_image() = 0;
+    virtual Flow check_prepared_capacity(int64_t) { return Flow::proceed; }
     /// `ppl=K`: opens chunk K of the gate's base, with at most `most_rows` scored per window.
     Flow begin_quality_gate(const std::string& base, const std::string& out, int most_rows);
     Flow read_prompt();
     virtual Flow decode() = 0;
     Flow complete();
     template <class B> Flow decode_loop(B& b);
+    /// Bind the context profile before adapter selection, prompt preparation and cache lookup.
+    virtual Flow bind_context_profile() {
+        if (req_rope_profile < 0) return Flow::proceed;
+        std::printf("ERR requested RoPE context profile is unavailable\n");
+        return Flow::next;
+    }
+    virtual int64_t limit_context(int64_t context) const { return context; }
     virtual bool parse_begin() { return true; }
+    /// Select an adapter before preparing the prompt or inspecting cached session state.
+    virtual Flow bind_atomic_lora() {
+        if (!request_adapter()) return Flow::proceed;
+        std::printf("ERR requested LoRA is unavailable\n");
+        return Flow::next;
+    }
     virtual float default_relax() const { return 0.0f; }
     // ---- the end of a request
     virtual Flow complete_begin() { return Flow::proceed; }
+    virtual bool settle_unadmitted_slot(int) { return true; }
     virtual DoneCounts done_counts() { return {}; }
     virtual bool tiers_settle() { return true; }
     virtual bool admit_draft() { return true; }
@@ -146,6 +169,7 @@ protected:
     virtual void limit_parts() {}
     virtual void prompt_parts_begin() {}
     virtual Flow read_to(int64_t to) = 0;
+    virtual bool defer_short_text() const { return false; }
     virtual Flow prompt_end() { return Flow::proceed; }
     /// A template whose turn token opens the user's turn: the turn's checkpoint sits before the prompt's last token.
     virtual bool turn_checkpoint_at_last_token() const { return false; }

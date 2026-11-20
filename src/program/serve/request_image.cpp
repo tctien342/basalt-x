@@ -21,18 +21,19 @@ Flow Request::begin_quality_gate(const std::string& base, const std::string& out
 
 Flow Request::prepare_prompt() {
     if (const Flow flow = prepare_image(); flow != Flow::proceed) return flow;
+    const int64_t engine_ctx = limit_context(runtime_.o.max_context);
     if (from_text && req_clip && runtime_.admit_slot < 0) {
-        const long long room = (long long) (runtime_.o.max_context - 8 - n);
+        const long long room = (long long) (engine_ctx - 8 - n);
         if (room < 1) {
-            basalt::protocol::emit_text(basalt::protocol::context_no_room_line((long long) n, (long long) runtime_.o.max_context));
+            basalt::protocol::emit_text(basalt::protocol::context_no_room_line((long long) n, (long long) engine_ctx));
             return Flow::next;
         }
         max_new = std::min(max_new, room);
     }
     {
-        const int64_t ctx = runtime_.admit_slot >= 0 ? runtime_.slot_context(runtime_.admit_slot) : runtime_.o.max_context;
+        const int64_t ctx = runtime_.admit_slot >= 0 ? limit_context(runtime_.slot_context(runtime_.admit_slot)) : engine_ctx;
         const long long want = runtime_.admit_slot >= 0 ? runtime_.admit_max_new : (long long) max_new;   // a slot's request: its own max_new
-        if (n + want + 8 > ctx) {
+        if (ctx < 8 || n > ctx - 8 || want > ctx - 8 - n) {
             basalt::protocol::emit_text(basalt::protocol::context_overflow_line((long long) n, want, (long long) ctx,
                                                                                 runtime_.admit_slot));
             runtime_.admit_slot = -1;
@@ -44,7 +45,8 @@ Flow Request::prepare_prompt() {
     for (int64_t t : ids) bad = bad || t < 0 || t >= runtime_.n_vocab;
     if (bad) { std::printf("ERR a token id is outside the vocabulary\n"); return Flow::next; }
 
-    return Flow::proceed;
+    const int64_t want = runtime_.admit_slot >= 0 ? runtime_.admit_max_new : max_new;
+    return check_prepared_capacity(n + want + 8);
 }
 
 }  // namespace basalt::program::serve

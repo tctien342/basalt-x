@@ -11,6 +11,8 @@
 
 namespace basalt::core {
 
+inline constexpr int kCpuWarmMaxK = 23;
+
 // The CPU tier's cache warm-up.  After layer l's doorbell the parked pool workers score layer l + 1's router on layer
 // l's FFN input (the ring's q8_1 rows; the router in 4-bit with one scale per 32 values, a prediction only: half the
 // bytes of an 8-bit copy, so the scoring leaves more of the gap to the read), take every token's top k, rank the

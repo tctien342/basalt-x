@@ -1,3 +1,5 @@
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/core/diag.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
@@ -36,11 +38,24 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         const OnDevice on(dm_->pdev);
         basalt::kernels::DmPeerArgs pa;
         pa.rings_m = dm_->h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
-        pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->h_rows;
-        pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
+        pa.seq_m = dm_->h_w + 0; pa.done_m = dm_->h_w + 16; pa.rows_m = dm_->peer_device_rows ? dm_->peer_device_rows : dm_->h_rows;
+        pa.rows_fp16 = dm_->peer_device_rows && basalt::core::exp_flag("decode_peer_fp16") != 0;
+        pa.ptr = dm_->ptab; pa.lay = dm_->lay; pa.n_expert = (int) g_->n_expert; pa.k = routed_k_; pa.first_wide_layer = first_wide_layer_;
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = dm_->pscr; pa.arrive = dm_->parr; pa.diag_m = dm_->h_w + 32;
         pa.rq = dm_->rq; pa.rs = dm_->rs;
+        if (peer_lora_) {
+            pa.lora_routed = peer_lora_->routed_factors();
+            pa.lora_b = peer_lora_->output_factor();
+            pa.lora_scale = peer_lora_->scale();
+            if (last_batch_) {
+                const auto status = cudaHostGetDevicePointer((void**) &pa.lora_rows, h_adapter_scale_, 0);
+                if (status != cudaSuccess) {
+                    err = std::string("verify: mapping peer adapter scales: ") + cudaGetErrorString(status);
+                    return false;
+                }
+            }
+        }
         if (gs_nk0_ > 0) {
             pa.mix = gs_mix_; pa.mseq_m = dm_->h_w + 48; pa.mdone_m = dm_->h_w + 52;
             pa.mxq_m = gs_h_xq_; pa.mxq = gs_pxq_;
@@ -60,7 +75,7 @@ bool Verifier::dm_begin(std::string& err, DecodeGaps* gm) {
         basalt::kernels::DmPeerArgs pa;
         pa.rings_m = x.h_ring; pa.xq_m = dm_->h_xq; pa.xq_stride = dm_->xq_stride;
         pa.seq_m = x.h_w + 0; pa.done_m = x.h_w + 16; pa.rows_m = dm_->h_rows;
-        pa.ptr = x.ptab; pa.lay = x.lay; pa.n_expert = (int) g_->n_expert; pa.k = (int) ss_->k;
+        pa.ptr = x.ptab; pa.lay = x.lay; pa.n_expert = (int) g_->n_expert; pa.k = routed_k_; pa.first_wide_layer = first_wide_layer_;
         pa.n_embd = (int) g_->n_embd; pa.n_ff = (int) basalt::kernels::cpu::expert_layout().fmt[0].n_ff;
         pa.steps = (int) dm_->rings; pa.scratch = x.pscr; pa.arrive = x.parr; pa.diag_m = x.h_w + 32;
         pa.rq = x.rq; pa.rs = x.rs;

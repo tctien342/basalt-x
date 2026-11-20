@@ -4,6 +4,7 @@
 namespace basalt::models::qwen4exp::generate {
 
 int token_path(Context& context) {
+    const auto started = Clock::now();
     auto& o = *context.o;
     auto& multi_gpu = *context.multi_gpu;
     auto& err = *context.err;
@@ -332,6 +333,7 @@ int token_path(Context& context) {
     context.ms_readback = &ms_readback;
     context.ms_sample = &ms_sample;
     context.phase_tokens = &phase_tokens;
+    log_expert_load_phase(context, "token path", started);
     return resident_plan(context);
 }
 

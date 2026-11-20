@@ -177,7 +177,12 @@ __device__ __forceinline__ void attn_chunk_dev(const AttnArgs& a, int chunk, int
     if (t < CHUNK) {
         long long r = -1;
         if (t < n_here) {
-            const long long page = (long long) pools.page_table[cell / a.page_size];
+            int logical = cell / a.page_size;
+            if constexpr (SEG) {
+                if (a.tab.shared_residency)
+                    logical = a.tab.slots[a.tab.rows[qi].slot].host.fp16_host_pages[logical];
+            }
+            const long long page = pools.page_table[pools.physical_pages ? pools.physical_pages[logical] : logical];
             if (page >= 0) r = (page * a.n_kv_heads + kvh) * a.page_size + (cell % a.page_size);
         }
         sm.row[t] = r;

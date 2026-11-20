@@ -135,10 +135,12 @@ bool Verifier::run_begin(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     set_head_keep(head_keep());
     if (!hs_launch(T, err)) return false;
-    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+    const auto index = solo_graph_index(T);
+    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[index] : exec_[index], cs_);
     if (next_ == nullptr) dev.record(DecodeEvents::kVerifyPost, cs_);
     ms_launch += ms_since(tl);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    last_rope_context_ = basalt::kernels::rope_context_index();
     lz_pending_ = false;   // the window applies the lazy layers (lazy_on) before their GDN kernels
     // a sampled or penalized request's head sampling queued behind the window now, not after a sync
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
@@ -258,10 +260,10 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             const basalt::kernels::DmRing& R = dm_->h_ring[k];
             sink_.ext_kind = R.kind;
             if (pool != nullptr)
-                pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, n, ss.k, h_ymiss_, l);
+                pool(user, dm_->h_x + (size_t) k * dm_->x_stride, R.ids, n, layer_k(l), h_ymiss_, l);
             sink_.ext_kind = nullptr;
         } else if (pool != nullptr)
-            pool(user, h_x_, h_ids_, n, ss.k,
+            pool(user, h_x_, h_ids_, n, layer_k(l),
                  h_ymiss_, l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -292,6 +294,7 @@ int Verifier::serve_poll(PoolMultiFn pool, void* user, std::string& err) {
             CpuWarm& w = *dm_->warm;
             warm_pool_->idle_stop();
             w.layer = (int) (l + 1);
+            w.k = layer_k(w.layer);
             w.n_tok = std::min(n, (int) kVerifyMaxT);
             w.xq = dm_->h_xq + (size_t) k * dm_->xq_stride;
             w.res0 = dm_->shadow0.data() + (size_t) (l + 1) * g.n_expert;
@@ -333,6 +336,22 @@ bool Verifier::ar_plan_intact(std::string& err) {
     return false;
 }
 
+void Verifier::report_dm_wait(int rows) {
+    using namespace basalt::kernels;
+    constexpr int64_t wstat_every = 200;   // windows per report
+    if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += rows, ++dm_->wstat_windows == wstat_every)) {
+        // --wait-stats: the last wstat_every windows' counters
+        std::vector<unsigned long long> w((size_t) kDmStatWords);
+        cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
+        cudaMemset(dm_->wstat, 0, w.size() * 8);
+        const double nw = (double) dm_->wstat_windows;
+        basalt::log::raw("basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
+                     dm_->wstat_t / nw, basalt::kernels::dec_moe_stats_text(w.data(), nw).c_str());
+        dm_->wstat_windows = 0;
+        dm_->wstat_t = 0;
+    }
+}
+
 // The window's end: the GPU's finish, the profile, and on the last stage the head's picks.
 bool Verifier::run_end(int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -357,18 +376,7 @@ bool Verifier::run_end(int32_t* out, std::string& err) {
     }
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (!ar_plan_intact(err)) return false;
-    constexpr int64_t wstat_every = 200;   // windows per report
-    if (dm_ != nullptr && dm_->wstat != nullptr && (dm_->wstat_t += T, ++dm_->wstat_windows == wstat_every)) {
-        // --wait-stats: the last wstat_every windows' counters
-        std::vector<unsigned long long> w((size_t) kDmStatWords);
-        cudaMemcpy(w.data(), dm_->wstat, w.size() * 8, cudaMemcpyDeviceToHost);
-        cudaMemset(dm_->wstat, 0, w.size() * 8);
-        const double nw = (double) dm_->wstat_windows;
-        basalt::log::raw("basalt verify: dm_wait over %lld windows (avg T %.2f):\n%s", (long long) dm_->wstat_windows,
-                     dm_->wstat_t / nw, basalt::kernels::dec_moe_stats_text(w.data(), nw).c_str());
-        dm_->wstat_windows = 0;
-        dm_->wstat_t = 0;
-    }
+    report_dm_wait(T);
     // the window does not retire the commit: whoever reads the session from the host or another stream calls wait_commit(),
     // and a finished event is noticed here at no cost
     if (commit_pending_ && cudaEventQuery(commit_done_) == cudaSuccess) commit_pending_ = false;

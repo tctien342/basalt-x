@@ -3,6 +3,34 @@
 
 namespace basalt::models::qwen4exp::generate {
 
+namespace {
+int vision_device(const Options& o) {
+    return std::getenv("BASALT_ADAPTIVE_VISION") && o.peer_device >= 1 ? o.peer_device : 0;
+}
+}
+
+std::future<VisionStaging> stage_vision(Context& context) {
+    const auto& o = *context.o;
+    const bool enabled = o.vision_in_engine && o.serve;
+    const bool parallel = enabled && basalt::core::exp_flag("startup_parallel_vision", 0) != 0;
+    return std::async(parallel ? std::launch::async : std::launch::deferred,
+                      [enabled, device = vision_device(o), source = context.srcs->vision, model = o.model] {
+        VisionStaging result{std::make_unique<basalt::vision::CudaEncoder>(), {}, 0};
+        if (!enabled) return result;
+        const auto start = Clock::now();
+        const basalt::core::OnDevice on(device);
+        basalt::vision::Mmproj mp;
+        if (source.empty()) {
+            result.error = model + " has no vision/mmproj section";
+        } else if (mp.open(source, result.error)) {
+            result.encoder->stage(mp, true, result.error);
+        }
+        mp.release();
+        result.seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        return result;
+    });
+}
+
 int vision(Context& context) {
     auto& o = *context.o;
     auto& multi_gpu = *context.multi_gpu;
@@ -124,43 +152,79 @@ int vision(Context& context) {
     }
 
     // ---- --vision: the image encoder's weights staged in pinned host memory, its stream and product handle made,
-    // and one full-size encode run in a temporary region (the product library loads its kernels on first use), all
+    // and one encode run in a temporary full-size region (the product library loads its kernels on first use), all
     // before the expert cache is sized: afterwards the encoder holds no VRAM until an ENC borrows cache slots
-    basalt::vision::CudaEncoder vis_enc;
-    const int vis_max_tokens = basalt::vision::Geometry{}.max_tokens;
-    if (o.vision_in_engine && o.serve) {
+    const bool adaptive_vision = std::getenv("BASALT_ADAPTIVE_VISION") != nullptr;
+    const int vision_dev = vision_device(o);
+    const auto stage_wait_start = Clock::now();
+    auto staged_weights = context.vision_staging->get();
+    const auto stage_wait_end = Clock::now();
+    void* vision_arena = nullptr;
+    auto close_vision = [vision_dev, &vision_arena](basalt::vision::CudaEncoder* enc) {
+        const basalt::core::OnDevice on(vision_dev);
+        delete enc;
+        if (vision_arena) cudaFree(vision_arena);
+    };
+    std::unique_ptr<basalt::vision::CudaEncoder, decltype(close_vision)> vision_owner(
+        staged_weights.encoder.release(), close_vision);
+    auto& vis_enc = *vision_owner;
+    basalt::vision::Geometry geo;
+    if (adaptive_vision) geo.max_tokens = 2048;
+    const int vis_max_tokens = geo.max_tokens;
+    auto warmup = [&]() -> int {
+        const basalt::core::OnDevice on(vision_dev);
         const auto t0 = Clock::now();
-        std::string verr;
-        basalt::vision::Mmproj mp;
-        if (context.srcs->vision.empty()) verr = o.model + " has no vision/mmproj section";
-        if (!verr.empty() || !mp.open(context.srcs->vision, verr) || !vis_enc.stage(mp, true, verr) || !vis_enc.create(verr)) {
+        auto& verr = staged_weights.error;
+        if (!verr.empty() || !vis_enc.create(verr)) {
             basalt::log::error("basalt generate", "the image encoder: %s", verr.c_str());
             return 1;
         }
-        mp.release();
-        void* tmp = nullptr;
+        const auto created = Clock::now();
         const size_t tmp_bytes = vis_enc.arena_bytes(vis_max_tokens);
-        if (cudaMalloc(&tmp, tmp_bytes) != cudaSuccess || !vis_enc.attach(tmp, tmp_bytes, vis_max_tokens, verr)) {
+        if (cudaMalloc(&vision_arena, tmp_bytes) != cudaSuccess || !vis_enc.attach(vision_arena, tmp_bytes, vis_max_tokens, verr)) {
             basalt::log::error("basalt generate", "the image encoder warm-up: %s", verr.empty() ? "out of device memory" : verr.c_str());
             return 1;
         }
-        const basalt::vision::Image gray{2048, 2048, std::vector<uint8_t>((size_t) 2048 * 2048 * 3, 128)};
-        const basalt::vision::Geometry geo;
+        const auto attached = Clock::now();
+        const bool compact = adaptive_vision && basalt::core::exp_flag("startup_vision_warmup_512", 0) != 0;
+        const int side = compact ? 512 : 2048;
+        const basalt::vision::Image gray{side, side, std::vector<uint8_t>((size_t) side * side * 3, 128)};
         const basalt::vision::Size sz = basalt::vision::fit_size(gray.w, gray.h, geo);
+        basalt::log::info("basalt startup", "vision warm-up canvas %dx%d, attached capacity %d", sz.w, sz.h, vis_max_tokens);
         std::vector<float> planar, patches, out;
         basalt::vision::normalize_planar(basalt::vision::to_canvas(gray, sz), planar);
         basalt::vision::patchify(planar, sz, geo, patches);
+        const auto preprocessed = Clock::now();
         const bool warm = vis_enc.encode(patches, sz, out);
+        const auto encoded = Clock::now();
+        // Expert placement starts with the whole peer cache available.
         vis_enc.detach();
-        cudaFree(tmp);
+        cudaFree(vision_arena);
+        vision_arena = nullptr;
         if (!warm) {
             basalt::log::error("basalt generate", "the image encoder warm-up failed: %s", vis_enc.last_error().c_str());
             return 1;
         }
+        using Seconds = std::chrono::duration<double>;
+        basalt::log::info("basalt startup", "vision: host stage %.3f s (wait %.3f s), create %.3f s, attach %.3f s, preprocess %.3f s, encode %.3f s, detach %.3f s",
+                         staged_weights.seconds, Seconds(stage_wait_end - stage_wait_start).count(),
+                         Seconds(created - t0).count(), Seconds(attached - created).count(), Seconds(preprocessed - attached).count(),
+                         Seconds(encoded - preprocessed).count(), Seconds(Clock::now() - encoded).count());
         basalt::log::info("basalt serve", "image encoder staged: %.0f MiB of weights in pinned memory, an image borrows up "
                              "to %.2f GiB of expert-cache slots while it is read (%.1f s)",
                      (double) vis_enc.weights_bytes() / 1048576.0, (double) tmp_bytes / 1073741824.0,
-                     std::chrono::duration<double>(Clock::now() - t0).count());
+                     staged_weights.seconds + Seconds(Clock::now() - t0).count());
+        return 0;
+    };
+    std::future<int> peer_warmup;
+    if (o.vision_in_engine && o.serve) {
+        // Only CUDA0 builds the text session along this path. Join before sizing either expert cache.
+        if (vision_dev > 0 && !multi_gpu && basalt::core::exp_flag("startup_parallel_peer_warmup", 0) != 0) {
+            peer_warmup = std::async(std::launch::async, warmup);
+            context.vision_warmup = &peer_warmup;
+        } else if (const int status = warmup(); status != 0) {
+            return status;
+        }
     }
 
     float* d_parts = nullptr;

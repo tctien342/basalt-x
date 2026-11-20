@@ -3,21 +3,20 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Basalt</title>
+<title>BASALT-X</title>
 <link rel="icon" type="image/svg+xml" href="web/mark.svg">
 <link rel="preload" href="fonts/geist-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="fonts/geist-mono-latin-wght.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="stylesheet" href="web/app.css">
-<script defer src="web/app.js"></script>
+<link rel="stylesheet" href="web/app-basalt-x-d86fcaaedb61.css">
+<script defer src="web/app-basalt-x-12258939fe27.js"></script>
 </head>
 <body>
 
 <header class="bar">
-  <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">Basalt</span></div>
+  <div class="brand"><img src="web/mark.svg" alt=""><span class="wordmark">BASALT<span class="brand-x">-X</span></span></div>
   <div class="crumb">
-    <span class="crumb-sep" id="crumb-sep" hidden>/</span>
     <span class="model" id="model"></span>
-    <div class="ms" id="models" hidden></div>
+    <span class="loras" id="loras" aria-label="LoRA usage" hidden></span>
   </div>
   <span class="grow"></span>
   <span class="sp">
@@ -42,42 +41,63 @@
       <div class="sb-h">System<span id="cpu-name"></span></div>
       <div class="sb-body" id="sys"></div>
     </div>
-    <div class="sb-exp">
-      <div class="sb-h">Experts<span id="exp-note">Last request</span></div>
-      <div class="sb-body" id="experts"></div>
-    </div>
   </aside>
 
-  <section class="a-hero card" aria-label="Speed">
-    <div class="hd"><b>Speed</b><span>Last 60 s</span></div>
-    <div class="trio">
-      <div class="dec">
-        <div class="k" id="dec-k">Decode</div>
-        <div class="v big" id="dec-v">-</div>
-        <div class="ch" id="chips" hidden></div>
-        <div class="cw" id="dec-chart"></div>
-      </div>
-      <div class="pre">
-        <div class="k" id="pre-k">Prefill</div>
-        <div class="v mid" id="pre-v">-</div>
-        <div class="pcw" id="pre-chart"></div>
-        <div class="pst">
-          <div><span>Last prompt</span><span id="pre-last">-</span></div>
-          <div><span>Prefix cache hit</span><b id="pre-hit">-</b></div>
+  <section class="a-hero card" aria-label="Tuner and throughput">
+    <div class="hd flight-title"><b>Engine telemetry</b><span>Speed · last 60 s</span></div>
+    <div class="flight-body">
+      <section class="tuner" id="tuner" data-mode="idle" aria-label="Adaptive tuner">
+        <canvas id="tuner-cube" aria-hidden="true"></canvas>
+        <div class="tuner-top">
+          <div>
+            <div class="tuner-label">Adaptive tuner</div>
+            <h1 id="tuner-phase">Connecting</h1>
+            <p id="tuner-decision"></p>
+          </div>
+          <button id="tuner-motion" type="button" aria-pressed="false" aria-label="Pause cube motion" title="Pause cube motion">Ⅱ</button>
+        </div>
+        <div class="tuner-overlay">
+          <section class="expert-hud" aria-label="Expert routing">
+            <div class="expert-hud-head"><b>Experts</b><span id="exp-note">Awaiting data</span></div>
+            <div id="experts"></div>
+          </section>
+          <dl class="tuner-readout">
+            <div><dt>Active slots</dt><dd id="tuner-slots">—</dd></div>
+            <div><dt title="GPU0 resident expert cache lookups per second">GPU0 hits/s</dt><dd id="tuner-hits">—</dd></div>
+            <div><dt>Prefill chunk</dt><dd id="tuner-chunk">—</dd></div>
+            <div><dt>Decode quantum</dt><dd id="tuner-quantum">—</dd></div>
+          </dl>
+        </div>
+      </section>
+      <div class="trio">
+        <div class="dec">
+          <div class="k" id="dec-k">Decode</div>
+          <div class="v big" id="dec-v">-</div>
+          <div class="ch" id="chips" hidden></div>
+          <div class="cw" id="dec-chart"></div>
+        </div>
+        <div class="pre">
+          <div class="k" id="pre-k">Prefill</div>
+          <div class="v mid" id="pre-v">-</div>
+          <div class="pcw" id="pre-chart"></div>
+          <div class="pst">
+            <div><span>Last prompt</span><span id="pre-last">-</span></div>
+            <div><span>Prefix cache hit</span><b id="pre-hit">-</b></div>
+          </div>
         </div>
       </div>
     </div>
     <div class="hfoot"><div id="foot-dec"></div><div id="foot-pre"></div></div>
   </section>
 
-  <section class="a-main card" aria-label="Slots and requests">
+  <section class="a-main card" aria-label="Slots, requests and scheduler">
     <div class="tabs" role="tablist" id="tabs"></div>
     <div class="pane" id="pane" role="tabpanel"></div>
     <div class="tot" id="totals"></div>
   </section>
 
   <section class="a-logs card" aria-label="Logs">
-    <div class="hd lh"><b>Logs</b><span id="log-count"></span></div>
+    <div class="hd lh"><b><span class="log-prompt" aria-hidden="true">&gt;_</span> Logs</b><span id="log-count"></span></div>
     <div class="logs" id="log" role="log" aria-live="off" tabindex="0"></div>
   </section>
 </main>

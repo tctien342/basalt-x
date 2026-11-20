@@ -132,7 +132,8 @@ uint64_t PeerExperts::device_overhead_bytes(int64_t n_embd, int64_t n_ff) {
 
 bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
                        ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
-                       int64_t max_slots, std::string& err, bool exclusive) {
+                       int64_t max_slots, std::string& err, bool exclusive,
+                       const std::function<void()>& before_upload) {
     if (!prepare(device, src, n_layers, n_expert, n_embd, n_ff, err)) return false;
     // the pairs the primary does not hold, in rank order, as many as fit
     On on(device);
@@ -150,7 +151,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         used += b256;
         pick.push_back(pr);
     }
-    return fill(pick, err, exclusive);
+    return fill(pick, err, exclusive, before_upload);
 }
 
 uint64_t PeerExperts::slot_bytes(int64_t layer) {
@@ -287,7 +288,8 @@ bool PeerExperts::read_until(int64_t m, std::string& err) {
     return ck(cudaEventSynchronize(marks_[(size_t) (m % (int64_t) marks_.size())]), "reading experts", err);
 }
 
-bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive) {
+bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive,
+                       const std::function<void()>& before_upload) {
     const auto& lay = basalt::kernels::cpu::expert_layout();
     const int device = device_;
     const int64_t n_layers = n_layers_, n_expert = n_expert_;
@@ -320,6 +322,7 @@ bool PeerExperts::fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std
         pick_slots[i] = slot;
         res_[(size_t) (pr.first * n_expert + pr.second)] = slot;
     }
+    if (before_upload) before_upload();
     if (!fill_cache_slots(src, cache_, device, pick.data(), pick_slots.data(), (int64_t) pick.size(),
                           [&](uint64_t bytes) { progress.add(bytes); }, err)) {
         err = "peer experts: fill failed: " + err;

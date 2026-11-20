@@ -11,6 +11,7 @@
 //   * the gate's `sqrt` and `sigmoid` are f32.
 //
 // ple_value is the single-token BF16/F32 MMVF, and the post-projection arithmetic is `native_ple_postops`.
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "basalt/models/qwen4exp/kernels/ple.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/f16_bits.hpp"
@@ -30,6 +31,14 @@
 #include "basalt/log.hpp"
 
 namespace basalt::kernels {
+
+void ple_value_lora(const PleWeights& w, const float* input, float* value, int rows, int width, void* stream,
+                    const float* adapter_rows) {
+    if (!w.value_lora_scale) return;
+    atomic_lora_project(input, w.value_lora_a, w.value_lora_b, nullptr, rows, width, width,
+                        adapter_rows ? adapter_rows : w.value_lora_scale, value, stream, adapter_rows != nullptr);
+}
+
 namespace {
 
 constexpr int THREADS = 256;
@@ -156,6 +165,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
         s2_gemv_q8(d_act, w.key_codes, w.key_scales, d_key, n_embd, hc_dim, 8, st);
     }
     bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, stream);
+    ple_value_lora(w, emb, d_value, 1, n_embd, stream);
 
     // The key norm has a distinct destination; temporary query storage is reused for the normalized gated values
     // after the gate consumes it.

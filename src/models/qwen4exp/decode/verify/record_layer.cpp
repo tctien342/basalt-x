@@ -1,14 +1,18 @@
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "common.hpp"
 #include "record.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/models/qwen4exp/decode/verify.hpp"
+#include "basalt/models/qwen4exp/decode/dflash2.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/models/qwen4exp/kernels/native_router.hpp"
+#include "basalt/models/qwen4exp/kernels/router_top10.hpp"
 #include "basalt/kernels/elementwise.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
@@ -51,6 +55,8 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     // the previous layer's FFN write, folded into this layer's first read (a control vector after it has
     // already applied it)
     bool pending = l > 0 && !cvec().covers(l - 1);
+    if (auto* draft = active_dflash2())
+        draft->capture_verify(l - 1, Rt(0), v_.bo_, v_.inj2_, pending, T, cs);
     if (l == 1 && ple_on) {
         if (!ple_side) {
             if (v_.ar_on() || dm) wait_flag_ge(v_.m_flag_, 1, cs);
@@ -76,6 +82,8 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
                 if (ple_fork) cudaStreamWaitEvent(cs, v_.ev_join_, 0);
                 else bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16,
                                                v_.z_, N, N, N, n, cs);
+                ple_value_lora(ss.ple.w, v_.ple_, v_.z_, n, (int) N, cs,
+                               v_.batch_rec_ ? v_.m_adapter_scale_ : nullptr);
             } catch (const std::exception& e) {
                 err = std::string("verify PLE multi: ") + e.what();
                 return false;
@@ -121,16 +129,22 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     };
     const bool read_q8 = dec_hc && hc_fused_q8_rows_ok();
     const WeightRef* w_router = v.get("ffn_gate_inp.weight");
-    const bool router_multi = w_router != nullptr && NE == 512 && K == 10;
+    const int64_t K = v_.layer_k(l);
+    const bool router_multi = w_router != nullptr && NE == 512 && K >= 10 && K <= 23;
+    const bool router_fused = router_multi && (K == 10 || K == 23);
     // the GDN mixer split by key head: the layer's q8_1 rows and a doorbell for the peer's key heads; in a batch
     // window CUDA0 runs the whole layer and the doorbell only passes
     const bool gs_ring = dm && v_.gs_nk0_ > 0 && !is_qsa_layer(g, l);
     const bool gs_split = gs_ring && !v_.batch_rec_;
+    if (gs_split && (v_.lora_ || v_.swift_lora_)) {
+        err = "verify: LoRA is unavailable for split GDN projection";
+        return false;
+    }
     // a GDN layer's middle as one persistent kernel (mid_chain.hpp) between the layer's two hc reads: the qkv + z pair,
     // the recurrence and the output projection, bitwise the kernels it replaces
     bool mid_ok = false;
     MidChainArgs ma;
-    if (dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !v_.prof_on_ && !v_.batch_rec_ && !gs_split &&
+    if (!use_swift && dec_hc && read_q8 && router_multi && !is_qsa_layer(g, l) && !v_.prof_on_ && !v_.batch_rec_ && !gs_split &&
         n <= v_.mid_max_t_ && N == 2560 && dec_gdnf_mode() != 0 && (dense_tc_mask() & 4)) {
         const WeightRef *wqkv = v.get("attn_qkv.weight"), *wg = v.get("attn_gate.weight"),
                         *wout = v.get("ssm_out.weight"), *wa = v.get("ssm_alpha.weight"),
@@ -153,6 +167,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             ra.gamma = (const float*) wnm->data; ra.h = v_.h_L_ + (size_t) gi * MT * C;
             ra.gate = v_.gate_L_ + (size_t) gi * MT * HV; ra.beta = v_.beta_L_ + (size_t) gi * MT * HV; ra.yq = v_.xq_;
             ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
+            if (v_.lora_) ra.y = v_.y_;
             ma.bo = v_.bo_;
             mid_ok = mid_chain_supported(ma);
         }
@@ -212,6 +227,17 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         } else {
             if (!qsa(l, v, read_q8)) return false;
         }
+        if (const auto* adapter = v_.lora_) {
+            const bool attention = is_qsa_layer(g, l);
+            const float* a = adapter->input_factor(v.name(attention ? "attn_output.weight" : "ssm_out.weight"));
+            PdlScope lp(false);
+            atomic_lora_project(attention ? v_.attn32_ : v_.y_, a, adapter->output_factor(), nullptr, n,
+                                (int) (attention ? NH * HD : ZV), (int) N,
+                                v_.batch_rec_ ? v_.m_adapter_scale_ : adapter->scale(), v_.bo_, cs, v_.batch_rec_);
+        }
+        const bool attention = is_qsa_layer(g, l);
+        swift_project(v, attention ? "attn_output.weight" : "ssm_out.weight",
+                      attention ? v_.attn32_ : v_.y_, v_.bo_, attention ? NH * HD : ZV, N);
     } catch (const std::exception& e) {
         err = "verify layer " + std::to_string(l) + ": " + e.what();
         return false;
@@ -231,7 +257,7 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     ring_fork = pk_ring;
     // the read writes the q8_1 rows, post's gate/up launch plans CUDA0's share
     glue_on = false;
-    if (pk_ring && v_.dm_->ptab0 != nullptr && dec_hc && router_multi && hc_fused_q8_rows_ok()) {
+    if (pk_ring && v_.dm_->ptab0 != nullptr && dec_hc && router_fused && hc_fused_q8_rows_ok()) {
         const auto& f = basalt::kernels::cpu::expert_layout().fmt[(size_t) l];
         glue_on = v_.dm_->vram < 0 && dec_moe_glue_ok(native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, 0.0f, f.up_type));
         if (!glue_on) note_fallback("glue off for the layer's experts", f.gu_type, f.d_type);
@@ -244,8 +270,9 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         PdlScope ps(pdl);   // after the out projection's kernel
         if (dec_hc) {
             HcFusedArgs h = hc_args(1, true, v_.inj_, v_.inj2_);
-            if (router_multi) {
+            if (router_fused) {
                 h.w_router = (const uint16_t*) w_router->data;
+                h.router_k = (int) K;
                 h.logits = v_.logits_; h.ids = v_.ids_; h.weights = v_.w_;
                 if (glue_on) {   // the ring's block starts with the read and follows its counts
                     h.xq = v_.nat_xq_;
@@ -276,13 +303,18 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
     // the window's rows routed in 2 launches (one router GEMV reading the weight once, one top-10) instead of 2
     // per token; every row's arithmetic is the single-token call's
     if (routed) {
-    } else if (router_multi) {
+    } else if (router_multi && K == 10) {
         try {
             PdlScope ps(pdl);   // after the hc read's last kernel (the fork adds no node on this stream)
             bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) w_router->data, v_.logits_, NE, N,
                                       NE, n, cs);
             native_router_top10_multi(v_.logits_, v_.ids_, v_.w_, n, cs);
         } catch (const std::exception& e) { err = "verify router: " + std::string(e.what()); return false; }
+    } else if (router_multi) {
+        PdlScope ps(false);   // the generic selector is an ordinary stream launch
+        bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) w_router->data, v_.logits_, NE, N,
+                                  NE, n, cs);
+        router_top10(v_.logits_, n, (int) NE, (int) K, v_.ids_, v_.w_, cs);
     } else
     for (int t = 0; t < T; ++t) {
         MoEBuffers mb = ss.moe;
@@ -296,8 +328,8 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         for (const DecMoe::XPeer& x : v_.dm_->xp) held.add(x.res + l * g.n_expert);
         PdlScope pt(false);
         try {
-            if (v_.route_prior_ > 0.0f && NE == 512 && K == 10)   // the selection again, biased toward the held experts
-                route_prior_top10(v_.logits_, held, v_.route_prior_, v_.ids_, v_.w_, n, v_.dm_->route_counts, cs);
+            if (v_.route_prior_ > 0.0f && router_multi)   // the selection again, biased toward the held experts
+                route_prior_topk(v_.logits_, held, v_.route_prior_, v_.ids_, v_.w_, n, (int) K, v_.dm_->route_counts, cs);
         } catch (const std::exception& e) { err = "verify route-prior: " + std::string(e.what()); return false; }
         if (v_.route_tail_skip_ > 0)   // then drop the tail experts no GPU holds
             route_tail_skip(v_.ids_, v_.w_, held, n * (int) K, (int) K, v_.route_tail_skip_, (int) g.n_expert,
@@ -323,12 +355,13 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             ra.xseq_m[q] = x.m_w;
         }
         ra.ring = (uint32_t) (r + 1); ra.ctr = v_.dm_->ctr;
-        ra.stats = v_.dm_->wstat;
+        ra.stage_timing = v_.batch_rec_ && v_.batch_pcie_timing_;
+        ra.stats = ra.stage_timing ? v_.dm_->m_stage_timing + l * DmPcieTimingWords : v_.dm_->wstat;
         ra.peer_cap = 0;
         ra.rows = v_.dm_->rq != nullptr || v_.dm_->warm != nullptr;
-        if (v_.dm_->stage_src != nullptr && v_.batch_rec_) {   // batch windows: many rows, many misses
+        if (v_.dm_->stage_src != nullptr && v_.batch_rec_ && (!v_.dm_->stage_tune || v_.batch_pcie_active_)) {
             ra.stage_src = v_.dm_->stage_src + l * g.n_expert;
-            ra.stage_k = v_.dm_->stage_k;
+            ra.stage_k = v_.dm_->stage_k + (v_.dm_->stage_tune ? l * (kDmCap + 1) : 0);
         }
         PdlScope pr(false);   // after the router's kernel: a plain launch
         if (glue_on) {   // the ring's work inside post's gate/up launch, released by the read's counts
@@ -353,8 +386,12 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
             cudaEventRecord(v_.dm_->st_fork, cs);
             cudaStreamWaitEvent(v_.dm_->st_s, v_.dm_->st_fork, 0);
             PdlScope pst(false);
+            const int stat = kDmStatStage + kDmStageStatPerLayer * (int) l;
+            auto* stats = l < kDmStatLayers ? v_.dm_->wstat : nullptr;
+            if (stats != nullptr) gpu_stamp(stats, stat, v_.dm_->st_s);
             dec_moe_stage(ra, v_.staging_, v_.dm_->stage_stride,
                           (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(l), v_.dm_->stage_blocks, v_.dm_->st_s);
+            if (stats != nullptr) gpu_stamp(stats, stat + 1, v_.dm_->st_s);
             cudaEventRecord(v_.dm_->st_join, v_.dm_->st_s);
         }
     } else if (v_.ar_on()) {
@@ -385,8 +422,26 @@ bool Verifier::WindowRecorder::pre(int64_t l) {
         nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
         nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
         nsw.q8_1 = sh_fork ? v_.sh_xq_ : v_.xq_;
+        if (const auto* adapter = v_.lora_) {
+            nsw.down_lora_a = adapter->input_factor(v.name("ffn_down_shexp.weight"));
+            nsw.down_lora_b = adapter->output_factor();
+            nsw.down_lora_scale = v_.batch_rec_ ? v_.m_adapter_scale_ : adapter->scale();
+            nsw.down_lora_per_row = v_.batch_rec_;
+        }
         {
         try {
+            if (use_swift) {
+                const auto* adapter = v_.swift_lora_;
+                nsw.swift_gate = adapter->find(v.name("ffn_gate_shexp.weight"));
+                nsw.swift_up = adapter->find(v.name("ffn_up_shexp.weight"));
+                nsw.swift_down = adapter->find(v.name("ffn_down_shexp.weight"));
+                if (!nsw.swift_gate || !nsw.swift_up || !nsw.swift_down)
+                    throw std::runtime_error("missing Swift shared-expert projection");
+                nsw.swift_input = xm;
+                nsw.swift_scale = swift_scale();
+                nsw.swift_per_row = v_.batch_rec_;
+                nsw.swift_scratch = v_.swift_shared_scratch_;
+            }
             PdlScope psh(false);   // the side chain's kernels follow each other
             if (sh_read)
                 shared_expert_multi_rows(n, nsw, v_.sh_gate_, v_.sh_up_, v_.shared_, N, g.n_ff, sh_stream, v_.sh_hi2_,

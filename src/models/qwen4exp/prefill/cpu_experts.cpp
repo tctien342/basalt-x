@@ -1,4 +1,13 @@
 #include "experts.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/prefill/kernels.hpp"
+#include "cpu_q8_k.cuh"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/log.hpp"
+#include <atomic>
+#include <cmath>
+#include <cstring>
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/progress.hpp"
@@ -7,10 +16,8 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/prefill/moe_fp4.hpp"
 #include "basalt/core/peer_experts.hpp"
-#include "basalt/log.hpp"
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <utility>
 #include <vector>
 #include <future>
@@ -18,14 +25,20 @@
 namespace basalt::prefill {
 using namespace detail;
 
+static bool packed_cpu_input(const basalt::kernels::cpu::NativeFmt& fmt) {
+    return fmt.gu_act == GGML_TYPE_Q8_K && !basalt::kernels::cpu::q2_native_kernels(fmt.gu_type) &&
+           core::exp_flag("cpu_prefill_q8k") != 0;
+}
+
 bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
     if (cpu_maybe) {
+        const bool packed = packed_cpu_input(lay.fmt[(size_t) l]);
         const size_t want = (size_t) T * N;
         if (m.cpu_x_n < want) {
             if (m.cpu_x) cudaFreeHost(m.cpu_x);
             m.cpu_x = nullptr;
             m.cpu_x_n = 0;
-            if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+            if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocMapped) != cudaSuccess) {
                 err = "prefill: cannot allocate the CPU experts' activations";
                 return false;
             }
@@ -40,7 +53,19 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_download() {
         }
         cudaEventRecord(m.cpu_ev_in, m.cs);
         cudaStreamWaitEvent(m.cpu_s, m.cpu_ev_in, 0);
-        cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cpu_s);
+        if (packed) {
+            void* mapped = nullptr;
+            if (cudaHostGetDevicePointer(&mapped, m.cpu_x, 0) != cudaSuccess) {
+                err = "prefill: CPU activation buffer is not mapped";
+                return false;
+            }
+            quantize_cpu_q8k(m.mixed, mapped, (int64_t) want, m.cpu_s);
+            static std::atomic<bool> noted{false};
+            if (!noted.exchange(true))
+                basalt::log::info("basalt prefill", "CPU input Q8_K (%zu bytes)", want / kQ8KBlock * sizeof(CpuQ8K));
+        } else {
+            cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cpu_s);
+        }
         cudaEventRecord(m.cpu_ev_x, m.cpu_s);
     }
     return true;
@@ -102,12 +127,19 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
         // the jobs are built here: the source's blob() is not for two threads at once
         m.cpu_need.assign((size_t) T, 0);   // the tokens the CPU's experts read
         m.cpu_jobs.clear();
+        const bool adapted = m.cpu_lora && m.cpu_lora_scale != 0;
+        const float* lora_a = adapted ? m.cpu_lora->input_factor(
+            "blk." + std::to_string(l) + ".ffn_down_exps.weight").data() : nullptr;
+        const float* lora_b = adapted ? m.cpu_lora->output_factor().data() : nullptr;
         for (int32_t e = 0; e < m.g->n_expert; ++e) {
             if (!on_cpu[(size_t) e]) continue;
             kc::ExpertJobMulti j;
             j.blob = m.src->blob(l, e);
             if (j.blob == nullptr) { err = "prefill: expert source has no blob"; return false; }
             j.nt = m.cnt[(size_t) e];
+            j.lora_a = lora_a ? lora_a + (size_t) e * cf.n_ff : nullptr;
+            j.lora_b = lora_b;
+            j.lora_scale = m.cpu_lora_scale;
             for (int r = 0; r < j.nt; ++r) {
                 const int64_t pr = (int64_t) m.off[(size_t) e] + r;
                 const int32_t tk = src_h[(size_t) pr];
@@ -120,10 +152,29 @@ bool Prefill::Run::Chunk::Experts::Group::cpu_start() {
         }
         cpu_fut = std::async(std::launch::async, [&m = m, &cf, &cpu_ms = cpu_ms, q2, T = T, &owner = owner]() -> bool {
             const auto t0 = Clock::now();
-            cudaEventSynchronize(m.cpu_ev_x);   // the activations are on the host
+            if (cudaEventSynchronize(m.cpu_ev_x) != cudaSuccess) return false;
+            bool packed = packed_cpu_input(cf);
+            constexpr size_t blocks = N / kQ8KBlock;
+            const auto* blocks_in = reinterpret_cast<const CpuQ8K*>(m.cpu_x);
+            if (packed) {
+                for (int64_t t = 0; t < T && packed; ++t) {
+                    if (!m.cpu_need[(size_t) t]) continue;
+                    for (size_t b = 0; b < blocks; ++b)
+                        packed &= std::isfinite(blocks_in[t * blocks + b].d);
+                }
+                if (!packed) {
+                    const core::OnDevice on(m.device);
+                    if (cudaMemcpyAsync(m.cpu_x, m.mixed, (size_t) T * N * sizeof(float),
+                                        cudaMemcpyDeviceToHost, m.cpu_s) != cudaSuccess ||
+                        cudaStreamSynchronize(m.cpu_s) != cudaSuccess) return false;
+                }
+            }
             for (int64_t t = 0; t < T; ++t) {
                 if (!m.cpu_need[(size_t) t]) continue;
-                if (q2) kc::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
+                if (packed)
+                    std::memcpy(m.cpu_nact.data() + (size_t) t * kc::kNativeActBytes, blocks_in + t * blocks,
+                                blocks * sizeof(CpuQ8K));
+                else if (q2) kc::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
                 else kc::native_quant_act(cf, m.cpu_x + (size_t) t * N, m.cpu_nact.data() + (size_t) t * kc::kNativeActBytes);
             }
             owner.cpu_pool_->run_split_multi_native(cf, m.cpu_jobs.data(), (int) m.cpu_jobs.size());

@@ -18,7 +18,13 @@ bool Prefill::Run::Chunk::Experts::finish() {
     }
     if (peer_now && !ppc->share->join(m.cs, err)) return false;   // multi-GPU: the peer's rows are in Dm
     if (!(l == 0 && ple_on)) copy_ahead(l + 1);   // layer 1's upload of its PLE rows goes first
-    moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
+    const int64_t packed_rows = peer_now ? ppc->share->results_fp16_rows() : 0;
+    if (packed_rows > 0) {
+        const int64_t peer_begin = T * K - rows_cpu - packed_rows;
+        moe_combine_peer_fp16(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, peer_begin, packed_rows, m.cs);
+    }
+    else
+        moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
     return true;
 }
 

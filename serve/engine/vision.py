@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -66,14 +67,76 @@ def model_plan(engine_bin: str, path: str, value, words: list[str]) -> dict:
     return plan
 
 
-def flag_refused(engine_bin: str, path: str, group: list[str]) -> bool:
+def flag_refused(engine_bin: str, path: str, group: list[str], *, parse_only: bool = False,
+                 on_accept=None) -> bool:
     """Whether the model in the file `path` has no such flag; `group` is the flag and its values."""
+    args = [engine_bin, "--model", path, *group]
+    if parse_only:
+        args.insert(1, "--check-model-flags")
+    else:
+        args.append("--gpu-plan")
     try:
-        run = subprocess.run([engine_bin, "--model", path, *group, "--gpu-plan"], capture_output=True, text=True,
+        run = subprocess.run(args, capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
-    return f"unknown argument: {group[0]}" in run.stderr
+    refused = f"unknown argument: {group[0]}" in run.stderr
+    if on_accept is not None and run.returncode == 0 and not refused:
+        on_accept()
+    return refused
+
+
+def cached_flag_probe(engine_bin: str, cache_file: Path):
+    """Reuse successful parser-only checks across bridge starts."""
+    limit = 256
+    try:
+        with cache_file.open(encoding="ascii") as stream:
+            previous = stream.read(limit * 65 + 1).splitlines()[:limit]
+        cached = {key for key in previous if len(key) == 64 and all(c in "0123456789abcdef" for c in key)}
+    except (OSError, UnicodeError):
+        cached = set()
+    accepted = set()
+
+    def identity(path):
+        value = os.stat(path)
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+    def probe(path, group):
+        if "--model" in group:
+            return flag_refused(engine_bin, path, group, parse_only=True)
+        try:
+            before = identity(engine_bin), identity(path)
+        except OSError:
+            return flag_refused(engine_bin, path, group, parse_only=True)
+        words = ["basalt-parser-probe-v1", os.path.abspath(engine_bin), os.path.abspath(path), before, group]
+        key = hashlib.sha256(json.dumps(words, separators=(",", ":")).encode()).hexdigest()
+        if key in cached:
+            return False
+
+        def accept():
+            try:
+                if before == (identity(engine_bin), identity(path)):
+                    accepted.add(key)
+            except OSError:
+                pass
+
+        return flag_refused(engine_bin, path, group, parse_only=True, on_accept=accept)
+
+    def publish():
+        # model_settings has joined all checkers by the time the caller publishes.
+        if not accepted:
+            return
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="ascii", dir=cache_file.parent, delete=False) as out:
+                temporary = Path(out.name)
+                out.write("\n".join(sorted(cached | accepted)[-limit:]) + "\n")
+            os.replace(temporary, cache_file)
+        except OSError:
+            if temporary is not None:
+                _unlink_quietly(temporary)
+
+    return probe, publish
 
 
 class VideoRows(NamedTuple):
@@ -351,6 +414,37 @@ class Vision:
     def _encode_pinned(self, images: list[bytes], pins: list[str]) -> list[tuple[Path, int, int]]:
         return [self._encode_one(data, pins) for data in images]
 
+    def _encode_native(self, images: list[bytes], pins: list[str], engine, prefer=None):
+        """Every image not cached yet goes to the engine in one ENC, so it borrows its slots once."""
+        keys, datas = [], {}
+        for data in images:
+            key = hashlib.sha256(data).hexdigest()[:32]
+            keys.append(key)
+            datas[key] = data
+        with self.lock:
+            todo = [k for k in dict.fromkeys(keys) if k not in self.cache]
+            if todo and prefer is not None and not prefer([datas[k] for k in todo]):
+                return None
+            for k in keys:
+                self._pin(k, pins)
+            tag = uuid.uuid4().hex[:8]
+            jobs = [(self.dir / f"{k}-{tag}.img", self.dir / f"{k}-{tag}.part") for k in todo]
+            try:
+                for (img, _), k in zip(jobs, todo):
+                    img.write_bytes(datas[k])
+                if jobs:
+                    lines = engine.encode_images(jobs)
+                    for k, (_, part), line in zip(todo, jobs, lines):
+                        n = int(line.split()[1])
+                        out = self.dir / f"{k}.sve"
+                        os.replace(part, out)
+                        self._remember(k, out, n)
+            finally:
+                for img, part in jobs:
+                    _unlink_quietly(img)
+                    _unlink_quietly(part)
+            return [self.cache[k] for k in keys]
+
     def _encode_one(self, data: bytes, pins: list[str]) -> tuple[Path, int, int]:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
@@ -450,34 +544,37 @@ class EngineVision(Vision):
         pass
 
     def _encode_pinned(self, images: list[bytes], pins: list[str]) -> list[tuple[Path, int, int]]:
-        """Every image not cached yet goes to the engine in one ENC, so it borrows its slots once."""
-        keys, datas = [], {}
-        for data in images:
-            key = hashlib.sha256(data).hexdigest()[:32]
-            keys.append(key)
-            datas[key] = data
-        with self.lock:
-            for k in keys:
-                self._pin(k, pins)
-            todo = [k for k in dict.fromkeys(keys) if k not in self.cache]
-            # per attempt, as on the sidecar path: the engine holds an image while it reads it
-            tag = uuid.uuid4().hex[:8]
-            jobs = [(self.dir / f"{k}-{tag}.img", self.dir / f"{k}-{tag}.part") for k in todo]
-            try:
-                for (img, _), k in zip(jobs, todo):
-                    img.write_bytes(datas[k])
-                if jobs:
-                    lines = self.engine.encode_images(jobs)
-                    for k, (_, part), line in zip(todo, jobs, lines):
-                        n = int(line.split()[1])              # an ERR line raises here, as it did before
-                        out = self.dir / f"{k}.sve"
-                        os.replace(part, out)                 # published whole: a reader never sees half of it
-                        self._remember(k, out, n)
-            finally:
-                for img, part in jobs:
-                    _unlink_quietly(img)
-                    _unlink_quietly(part)
-            return [self.cache[k] for k in keys]
+        return self._encode_native(images, pins, self.engine)
+
+
+class AdaptiveVision(Vision):
+    """Use one CPU/peer image cache. Borrow peer slots for larger uncached work."""
+
+    def attach(self, engine) -> None:
+        self.engine = engine
+
+    @property
+    def allows_overlap(self) -> bool:
+        engine = getattr(self, "engine", None)
+        return bool(getattr(engine, "info", {}).get("vision_overlap") and engine.alive() and not engine.asleep)
+
+    @staticmethod
+    def prefer_peer(images: list[bytes]) -> bool:
+        if len(images) > 1:
+            return True
+        from PIL import Image
+        with Image.open(io.BytesIO(images[0])) as image:
+            return image.width * image.height >= 1024 * 32 * 32
+
+    def _encode_pinned(self, images: list[bytes], pins: list[str]) -> list[tuple[Path, int, int]]:
+        try:
+            result = self._encode_native(images, pins, self.engine, self.prefer_peer)
+            if result is not None:
+                return result
+        except ValueError as err:
+            # The engine has answered ENC ERR and restored its loan. A dead engine still propagates.
+            print(tagged("vision", f"peer refused the image batch; trying the CPU sidecar ({err})"), flush=True)
+        return super()._encode_pinned(images, pins)
 
 
 def gpu_text(value) -> str:
@@ -524,13 +621,17 @@ def engine_args(cfg: dict) -> list[str]:
 def child_env(cfg: dict) -> dict:
     """The engine environment: only the --gpu cards are visible."""
     env = dict(os.environ)
+    if (cfg.get("vision") or {}).get("mode") == "adaptive":
+        env["BASALT_ADAPTIVE_VISION"] = "1"
+    else:
+        env.pop("BASALT_ADAPTIVE_VISION", None)
     if gpu_list(cfg):                              # number cards as nvidia-smi does
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # CUDA's default order differs
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     return env
 
 
-VISION_MODES = ("off", "dynamic", "cpu")
+VISION_MODES = ("off", "dynamic", "cpu", "adaptive")
 VISION_USAGE = "vision: use one of " + ", ".join(VISION_MODES) + " or a GPU number, as nvidia-smi numbers them"
 
 
@@ -583,6 +684,8 @@ def vision_item(vision: dict | None, cfg: dict) -> str | None:
     gpu = vision_card(vision.get("mode") or "cpu")
     if gpu is not None:
         return f"vision=gpu{gpu}"
+    if vision.get("mode") == "adaptive":
+        return "vision=adaptive (CPU/peer)"
     if vision.get("mode") == "dynamic":
         listed = gpu_list(cfg)
         return f"vision=gpu{listed[0] if listed else 0}"

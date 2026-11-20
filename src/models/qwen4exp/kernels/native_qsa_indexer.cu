@@ -130,7 +130,7 @@ __global__ void __launch_bounds__(THREADS) commit_layers(QsaCommitLayers a, floa
     }
 }
 // commit_layers per (layer, segment): block (l, j) restores its slot's tail from the slot's snapshot, then appends
-// the segment's rows in order at pos[slot * pos_stride + t]
+// the segment's rows in order at pos[j * pos_stride + t]
 template <bool TAB>
 __global__ void __launch_bounds__(THREADS) commit_seg(QsaSegCommit a, float theta_scale, float freq_scale,
                                                       float corr_low, float corr_high, float ext_factor, float mscale,
@@ -142,7 +142,7 @@ __global__ void __launch_bounds__(THREADS) commit_seg(QsaSegCommit a, float thet
     for (int i = threadIdx.x; i < (R - 1) * D; i += THREADS) sl.tail[i] = ((const volatile float*) sl.tail_snap)[i];
     __syncthreads();
     for (int t = 0; t < sg.len; ++t) {
-        append_one<TAB>(L.raw + (size_t) (sg.first + t) * D, a.pos + (size_t) sg.slot * a.pos_stride + t, 0, L.gamma,
+        append_one<TAB>(L.raw + (size_t) (sg.first + t) * D, a.pos + (size_t) blockIdx.y * a.pos_stride + t, 0, L.gamma,
                         a.epsilon, sl.tail, sl.dead, sl.pooled, sl.block_pos, sl.max_cells, theta_scale, freq_scale,
                         corr_low, corr_high, ext_factor, mscale, mtab, rt);
         __syncthreads();

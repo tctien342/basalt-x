@@ -165,8 +165,7 @@ __global__ void __launch_bounds__(kDmThreads) dm_route_kernel(DmRouteArgs a) {
     }
 }
 
-// The staged share's copy and plan (dec_moe_stage): every block derives the layer's kinds (the ring's on a card without
-// peers) and the split, then copies its part of each staged blob from host RAM into its staging slot, whole 128-byte
+// The staged share's copy and plan (dec_moe_stage): every block derives the layer's kinds (the ring's with no peer-cap overflow) and the split, then copies its part of each staged blob from host RAM into its staging slot, whole 128-byte
 // lines (a blob starts 16-byte aligned: its first line holds the bytes before it); block 0 writes the staged groups.
 constexpr int kDmStageUnroll = 4;
 __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uint8_t* staging, long long stride,
@@ -182,12 +181,14 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
         const int32_t e = s_ids[tid];
         bool ok = e >= 0 && e < a.n_expert;
         for (int j = tid - tid % a.k; ok && j < tid; ++j) ok = s_ids[j] != e;
-        s_kind[tid] = ok && a.res0[e] >= 0 ? 0 : -1;
+        s_kind[tid] = ok ? dm_tier(a, e) : -1;
     }
     __syncthreads();
     dm_stage_split(a, s_ids, s_kind, n, tid, s_first);
     dm_group(s_ids, s_kind, n, 1, tid, s_first, s_cnt, s_gstart, s_gidx, s_pos, s_start, &s_ng, &s_ne);
     const int ng = min(s_ng, kDmStageMax);
+    if (ng > 0 && a.stage_timing && threadIdx.x == 0 && blockIdx.x < 8)
+        a.stats[DmPcieCopyBegin + blockIdx.x] = dm_clock();
     if (tid < n && s_first[tid] && s_gidx[tid] < kDmStageMax) s_src[s_gidx[tid]] = a.stage_src[s_ids[tid]];
     __syncthreads();
     if (blockIdx.x == 0) {
@@ -219,10 +220,15 @@ __global__ void __launch_bounds__(kDmThreads) dm_stage_kernel(DmRouteArgs a, uin
         }
         for (; i < chunks; i += step) d[i] = __ldcv(s + i);
     }
+    if (ng > 0 && a.stage_timing && blockIdx.x < 8) {
+        __syncthreads();
+        if (tid == 0) a.stats[DmPcieCopyEnd + blockIdx.x] = dm_clock();
+    }
 }
 
 __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer_done, const volatile uint32_t* host_flag,
-                               uint32_t ring, unsigned long long* stats, int layer, int trigger) {
+                               uint32_t ring, unsigned long long* stats, int layer, int trigger,
+                               unsigned long long* pcie_timing) {
     if ((trigger & 1) != 0) pdl_trigger();
     if (stats != nullptr) {
         stats[1] = dm_clock();
@@ -231,7 +237,12 @@ __global__ void dm_wait_kernel(const DmPlan* plan, const volatile uint32_t* peer
         dm_stat_record(stats, plan, layer);
         return;
     }
-    if (plan->counts[2] > 0 && (trigger & 2) == 0) while (*peer_done < ring) spin_pause();
+    // The plain wait starts after local work; a staged window already stamped local completion before the copy join.
+    if (pcie_timing != nullptr && pcie_timing[DmPcieLocal] == 0) pcie_timing[DmPcieLocal] = dm_clock();
+    if (plan->counts[2] > 0 && (trigger & 2) == 0) {
+        while (*peer_done < ring) spin_pause();
+        if (pcie_timing != nullptr) pcie_timing[DmPciePeer] = dm_clock();
+    }
     if (plan->counts[3] > 0) while (*host_flag < ring) spin_pause();
     __threadfence_system();
     pdl_wait();   // started during the down kernel: its rows are complete once this returns

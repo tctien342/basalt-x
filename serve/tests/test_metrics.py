@@ -12,11 +12,13 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from serve.util import telemetry
 from serve.frontend import ChatTemplate
 from serve.util.logbuf import LogBuffer
 from serve.engine.mock import MockEngine
+from serve.engine.overlap_learning import OverlapLearning
 from serve.engine.process import ProcessEngine
 from serve.handler import serve
 from serve.service import RATE_SAMPLES, REQUESTS_SHOWN, Service
@@ -76,7 +78,8 @@ class Http(unittest.TestCase):
         code, m = self.call("/metrics")
         self.assertEqual(code, 200)
         self.assertEqual(set(m), {"engine", "live", "requests", "best", "totals", "conversation", "hardware", "hardware_static",
-                                 "history", "models", "swap"})
+                                 "history", "models", "swap", "scheduler", "startup_memory", "scheduler_learning"})
+        self.assertIsNone(m["scheduler_learning"])
         self.assertEqual(m["best"], {})
         self.assertEqual((m["engine"]["model"], m["engine"]["max_context"]), (self.svc.model, 16384))
         self.assertEqual((m["engine"]["version"], m["engine"]["kv"], m["engine"]["expert_slots"]), ("1.2.3", "fp8", 100))
@@ -89,6 +92,52 @@ class Http(unittest.TestCase):
         self.assertIsInstance(m["hardware"]["gpus"], list)
         self.assertEqual(set(m["hardware_static"]), {"gpus", "cpu_name", "cores", "threads", "driver", "cuda"})
         self.assertEqual(set(m["history"]), {"tok_s", "prefill_tok_s_mean", "slot_tok_s", "gpus"})
+
+    def test_overlap_learning_reports_inflight_write_and_storage_error(self):
+        scope = "1234abcd00001111"
+        with tempfile.TemporaryDirectory() as directory:
+            learner = OverlapLearning(Path(directory) / "state.json")
+            self.engine.info["scheduler_queue"] = 1
+            self.engine.scheduler_stats = {"phase": "overlap", "decision": "overlap_probe"}
+            self.engine.overlap_learning = learner
+            started, finish = threading.Event(), threading.Event()
+            write = learner._write
+
+            def delayed(rows):
+                started.set()
+                if not finish.wait(5):
+                    raise OSError("test writer timed out")
+                write(rows)
+
+            with patch.object(learner, "_write", delayed):
+                try:
+                    learner.observe(scope, 1280, True)
+                    self.assertTrue(started.wait(5))
+                    self.assertIsNone(learner.pending)   # already writing this revision
+                    m = self.call("/metrics")[1]
+                    self.assertEqual(m["scheduler"]["decision"], "overlap_probe")
+                    self.assertEqual(m["scheduler_learning"]["provisional_scopes"], 1)
+                    self.assertEqual(m["scheduler_learning"]["store_state"], "pending")
+                    learner.observe(scope, 1280, True)
+                    m = self.call("/metrics")[1]["scheduler_learning"]
+                    self.assertEqual(m["qualified_scopes"], 1)
+                    self.assertEqual(m["store_state"], "pending")
+                    self.assertEqual(m["last_outcome"]["chunk_tokens"], 1280)
+                    self.assertNotIn(directory, str(m))
+                finally:
+                    finish.set()
+                    writer = learner.writer
+                    if writer:
+                        writer.join(5)
+            self.assertEqual(learner.snapshot()["store_state"], "synced")
+            with patch.object(learner, "_write", side_effect=OSError("write refused")):
+                learner.observe(scope, 1280, False)
+                writer = learner.writer
+                if writer:
+                    writer.join(5)
+            m = self.call("/metrics")[1]["scheduler_learning"]
+            self.assertEqual((m["qualified_scopes"], m["store_state"]), (0, "error"))
+            self.assertEqual(m["last_outcome"]["outcome"], "revoked")
 
     def test_the_expert_total_is_reported_with_or_without_spill(self):
         self.engine.info = {"expert_slots": 24576, "spill_experts": 0, "spill_total": 24576, "spill_bytes": 0}

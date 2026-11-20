@@ -339,18 +339,32 @@ void ExpertPool::native_down_range(int e, int r0, int r1) {
         const ActQ* a2[MAXT];
         for (int t = 0; t < j.nt; ++t) a2[t] = &sb.a2[t];
         q2_rows_any(j.blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2, j.nt, j.out, r0, r1);
-        return;
+    } else {
+        const void* hq[MAXT];
+        for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
+        native_down_rows(*nfmt_, j.blob, hq, j.nt, j.out, r0, r1);
     }
-    const void* hq[MAXT];
-    for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
-    native_down_rows(*nfmt_, j.blob, hq, j.nt, j.out, r0, r1);
+    if (j.lora_a)
+        for (int t = 0; t < j.nt; ++t) {
+            if (j.adapter_scale(t) == 0) continue;
+            for (int r = r0; r < r1; ++r)
+                j.out[t][r] = std::fma(sb.lora_gain[t], j.lora_b[r], j.out[t][r]);
+        }
 }
 
 void ExpertPool::native_quantize(int e) {
     SplitBufMulti& sb = split_multi_[(size_t) e];
-    for (int t = 0; t < mjobs_[e].nt; ++t)
+    const auto& j = mjobs_[e];
+    for (int t = 0; t < j.nt; ++t) {
+        const float scale = j.adapter_scale(t);
+        if (j.lora_a && scale != 0) {
+            float dot = 0;
+            for (int i = 0; i < nfmt_->n_ff; ++i) dot = std::fma(j.lora_a[i], sb.ff[t][i], dot);
+            sb.lora_gain[t] = scale * dot;
+        }
         if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], (int) nfmt_->n_ff, sb.a2[t]);
         else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+    }
 }
 
 int ExpertPool::set_active_workers(int k) {
@@ -408,7 +422,14 @@ int ExpertPool::split_multi_batch(const NativeFmt& f, ExpertJobMulti* jobs, int 
     mjobs_ = jobs;
     nfmt_ = &f;
     const int threads = active_.load(std::memory_order_relaxed) + 1;
-    const int tpt = cpu_avx512_ok() ? kTasksPerThread : kTasksPerThreadAvx2;
+    static const int avx2_tasks = [] {
+        const char* value = std::getenv("BASALT_CPU_AVX2_TASKS");
+        if (!value) return kTasksPerThreadAvx2;
+        char* end = nullptr;
+        const long parsed = std::strtol(value, &end, 10);
+        return (*end == '\0' && (parsed == 4 || parsed == 12)) ? (int) parsed : kTasksPerThreadAvx2;
+    }();
+    const int tpt = cpu_avx512_ok() ? kTasksPerThread : avx2_tasks;
     // One batch for the whole layer: an expert's down rows start once its own gate/up rows are done and quantized,
     // so there is no barrier between the three steps and the cores' speed differences cost one tail, not two.
     // The share of tasks follows the share of bytes of the two projections.

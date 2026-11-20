@@ -15,6 +15,9 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from serve.mini_batch import OPEN as BATCH_OPEN, CLOSE as BATCH_CLOSE, MAX_BODY as BATCH_BODY
+from serve.mini_batch import TOOL as BATCH_TOOL, TOOL_NAME as BATCH_TOOL_NAME
+
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
@@ -63,12 +66,13 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+AUDIO_PARTS = ("input_audio", "audio_url")
 VIDEO_PARTS = ("video_url", "input_video", "video")
 VIDEO_OPTIONS = ("fps", "max_frames")         # a video part's own sampling, as vLLM takes them
 
 # client spellings of a thinking level -> low, medium, high, max or none; a dialect says what its template takes for each
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-          "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+          "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "max", "maximum": "xhigh"}
 
 
 def effort_kwargs(value) -> dict:
@@ -121,7 +125,7 @@ def preserve_kwargs(value) -> dict:
 
 
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS + AUDIO_PARTS
                                              for p in content)
 
 
@@ -173,6 +177,24 @@ def _video_item(part: dict) -> dict:
     return item
 
 
+def _audio_item(part: dict) -> dict:
+    source = part.get("audio_url")
+    if isinstance(source, dict):
+        source = source.get("url")
+    if part.get("type") == "input_audio":
+        inline = part.get("input_audio", part)
+        if isinstance(inline, str) and inline.startswith("data:"):
+            source = inline
+        elif isinstance(inline, dict):
+            data = inline.get("data")
+            fmt = inline.get("format")
+            if isinstance(data, str) and data and fmt in ("wav", "mp3", "flac", "ogg", "m4a", "aac", "webm"):
+                source = f"data:audio/{fmt};base64,{data}"
+    if not isinstance(source, str) or not source.startswith(("data:", "http://", "https://")):
+        raise ValueError("audio requires inline data or an HTTP(S) audio_url")
+    return {"type": "audio", "source": source}
+
+
 def _parts_of(content):
     """The one form of message and tool result content in every API: a string without images or videos, else its list
     of text, image and video items. Documents become their text and page images first."""
@@ -190,6 +212,8 @@ def _parts_of(content):
             items.append({"type": "image", "source": _image_source(part)})
         elif part.get("type") in VIDEO_PARTS:
             items.append(_video_item(part))
+        elif part.get("type") in AUDIO_PARTS:
+            items.append(_audio_item(part))
         elif part.get("type") in ("text", "input_text", None) and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -536,7 +560,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         parts, reasoning, calls = [], [], []
         for block in content or []:
             kind = block.get("type")
-            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS or kind in VIDEO_PARTS or kind == "document":
+            if kind in ("text", "input_text", None) or kind in IMAGE_PARTS or kind in VIDEO_PARTS or kind in AUDIO_PARTS or kind == "document":
                 parts.append(block)
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
@@ -845,6 +869,9 @@ class OutputParser:
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
+        self.mini_batch = False
+        self.batch_oversized = False
+        self.batch_boundary = False  # one post-thinking batch before any client call
         self.rtail = ""              # last reasoning character sent
         self.schemas = {t.get("name"): t for t in tools or []}
         # stream_tools: also report a call while it is written ("tool_start", "tool_args" pieces) before "tool_call"
@@ -992,6 +1019,8 @@ class OutputParser:
     def _reasoning(self, text: str) -> Event:
         """A reasoning event for text going out; remembers its last character for the quote check."""
         self.rtail = text[-1:] or self.rtail
+        if self.mini_batch:
+            self._track(text)
         return Event("reasoning", text)
 
     def _quoted_think_end(self, i: int) -> bool | None:
@@ -1019,10 +1048,108 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
+            if self.state == "mini_native_discard":
+                end = self.buf.find(CALL_END)
+                if end < 0:
+                    keep = self._hold(self.buf, (CALL_END,))
+                    self.buf = self.buf[-keep:] if keep and not final else ""
+                    return out
+                self.buf = self.buf[end + len(CALL_END):]
+                self.state = self.mini_native_return
+                continue
+            if self.mini_batch and self.state in ("reasoning", "content"):
+                at = self.buf.find(CALL_START)
+                close = self.buf.find(THINK_END) if self.state == "reasoning" else -1
+                legacy = self.buf.find(BATCH_OPEN)
+                if at >= 0 and (close < 0 or at < close) and (legacy < 0 or at < legacy):
+                    body = self.buf[at + len(CALL_START):]
+                    header = body.lstrip()
+                    target = FUNC_START + BATCH_TOOL_NAME + ">"
+                    if (target.startswith(header) and len(header) < len(target)
+                            and len(body) < BATCH_BODY and not final):
+                        return out
+                    if header.startswith(target):
+                        reasoning = self.state == "reasoning"
+                        emit = self._reasoning if reasoning else lambda value: Event("content", self._track(value))
+                        if at:
+                            out.append(emit(self.buf[:at]))
+                            self.buf = self.buf[at:]
+                        if self.line.strip() or self._in_code():
+                            out.append(emit(CALL_START))
+                            self.buf = body
+                            continue
+                        end = call_end(body, final=final)
+                        if end < 0:
+                            if final:
+                                self.buf = ""
+                            elif len(body) > BATCH_BODY:
+                                self.mini_native_return = self.state
+                                self.state = "mini_native_discard"
+                                self.buf = body
+                                if not reasoning:
+                                    self.batch_boundary = False
+                                continue
+                            return out
+                        self.buf = body[end + len(CALL_END):]
+                        allowed = reasoning or self.batch_boundary
+                        if not reasoning:
+                            self.batch_boundary = False
+                        self.line = ""
+                        if not allowed:
+                            continue
+                        value = ""
+                        if end <= BATCH_BODY and body[:end].rstrip().endswith(FUNC_END):
+                            try:
+                                args = parse_tool_call(body[:end], BATCH_TOOL).arguments
+                                value = json.dumps(args)
+                            except ValueError:
+                                pass
+                        self.buf = ""
+                        out.append(Event("mini_native_batch", value))
+                        return out
+            if self.state in ("mini_batch", "mini_batch_boundary", "mini_batch_ignored"):
+                active = self.state != "mini_batch_ignored"
+                end = self.buf.find(BATCH_CLOSE)
+                close = self.buf.find(THINK_END)
+                if self.state == "mini_batch" and close >= 0 and (end < 0 or close < end):
+                    self.buf = self.buf[close:]
+                    self.state = "reasoning"
+                    continue
+                if end < 0:
+                    if len(self.buf) > BATCH_BODY:
+                        self.batch_oversized = True
+                        keep = self._hold(self.buf, (BATCH_CLOSE, THINK_END))
+                        self.buf = self.buf[-keep:] if keep else ""
+                    return out
+                body = "" if self.batch_oversized or end > BATCH_BODY else self.buf[:end]
+                if active:
+                    self.buf = ""
+                    if self.state == "mini_batch_boundary":
+                        self.state, self.lead = "content", True
+                    else:
+                        self.state = "reasoning"
+                    out.append(Event("mini_batch", body))
+                    return out
+                self.buf = self.buf[end + len(BATCH_CLOSE):]
+                self.state, self.lead = "content", True
+                continue
             if self.state == "reasoning":
                 i = self.buf.find(THINK_END)
+                if self.mini_batch:
+                    j = self.buf.find(BATCH_OPEN)
+                    if j >= 0 and (i < 0 or j < i):
+                        if j:
+                            out.append(self._reasoning(self.buf[:j]))
+                        line_call = not self.line.strip() and not self._in_code()
+                        self.buf = self.buf[j + len(BATCH_OPEN):]
+                        if line_call:
+                            self.state = "mini_batch"
+                            self.batch_oversized = False
+                        else:
+                            out.append(self._reasoning(BATCH_OPEN))
+                        continue
                 if i < 0:
-                    keep = self._hold(self.buf, (THINK_END,))
+                    keep = self._hold(self.buf, (THINK_END, BATCH_OPEN, CALL_START) if self.mini_batch else (THINK_END,))
                     if len(self.buf) > keep:
                         out.append(self._reasoning(self.buf[:len(self.buf) - keep]))
                         self.buf = self.buf[len(self.buf) - keep:]
@@ -1042,6 +1169,7 @@ class OutputParser:
                 self.buf = self.buf[i + len(THINK_END):]
                 self.state, self.lead = "content", True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
+                self.batch_boundary = self.mini_batch
             elif self.state == "content":
                 if self.lead:                                   # newlines after </think> or a call
                     stripped = self.buf.lstrip("\n")
@@ -1050,9 +1178,25 @@ class OutputParser:
                         return out
                     self.buf, self.lead = stripped, False
                 i = self.buf.find(CALL_START)
+                if self.mini_batch:
+                    j = self.buf.find(BATCH_OPEN)
+                    if j >= 0 and (i < 0 or j < i):
+                        if j:
+                            out.append(Event("content", self._track(self.buf[:j])))
+                        line_call = not self.line.strip() and not self._in_code()
+                        self.buf = self.buf[j + len(BATCH_OPEN):]
+                        if line_call:
+                            # Some replies introduce the private batch in visible text first.
+                            self.state = "mini_batch_boundary" if self.batch_boundary else "mini_batch_ignored"
+                            self.batch_boundary = False
+                            self.batch_oversized = False
+                        else:
+                            out.append(Event("content", self._track(BATCH_OPEN)))
+                        continue
                 if i < 0:
                     # hold a partial tag and the newlines before it: a following tool call drops them
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START,))
+                    tags = (CALL_START, BATCH_OPEN) if self.mini_batch else (CALL_START,)
+                    j = len(self.buf) - self._hold(self.buf, tags)
                     while j > 0 and self.buf[j - 1] == "\n":
                         j -= 1
                     if j > 0:
@@ -1072,6 +1216,7 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self.batch_boundary = False
             else:
                 i = call_end(self.buf, final=final)
                 if self.stream_tools:
@@ -1093,11 +1238,16 @@ class OutputParser:
                 out.append(Event("tool_call", call=call))
                 self._reset_scan()
                 self.state, self.lead = "content", True
+                if self.mini_batch:
+                    self.line = ""  # standalone private frames start on a new line after a call
 
     def finish(self) -> list[Event]:
         """End of generation: flush what is held (an unterminated call becomes content; an announced one is left
         unfinished with no "tool_call")."""
         out = self.feed("", final=True)
+        if self.state in ("mini_batch", "mini_batch_boundary", "mini_batch_ignored"):
+            self.buf = ""
+            return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
             if self.ss == "done":               # only </tool_call> is missing
                 out.append(Event("tool_call", call=self.scall))

@@ -1,4 +1,6 @@
 #include "experts.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
@@ -112,16 +114,29 @@ bool Prefill::Run::Chunk::Experts::Group::compute_mmq(size_t j, const uint8_t* b
     }
     m.mmq_ctx->run(gu, m.cs);
     const bool scaled = lay.native && lay.fmt[(size_t) l].tail != 0;
-    mmq::swiglu(m.GU + r0 * 1280, m.H + r0 * 640, nr, 640, !lay.native, m.cs,
-                scaled ? grp_scales(m.grp_d) : nullptr,
-                m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1), ngx);
-    mmq::quantize(m.H + r0 * 640, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+    mmq::swiglu_quantize(m.GU + r0 * 1280, m.Hq, mmq_dt, nr, 640, !lay.native, m.cs,
+                         scaled ? grp_scales(m.grp_d) : nullptr,
+                         m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1), ngx);
     mmq::Product dn;
     dn.w = m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
     dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
     dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
     dn.ld_dst = N;
     m.mmq_ctx->run(dn, m.cs);
+    if (const auto* adapter = m.gemm.lora()) {
+        const auto name = core::LayerView(*m.wt, l).name("ffn_down_exps.weight");
+        const float* a = adapter->input_factor(name);
+        mmq::swiglu(m.GU + r0 * 1280, m.H, nr, 640, !lay.native, m.cs,
+                    scaled ? grp_scales(m.grp_d) : nullptr, dn.bounds, ngx);
+        for (size_t i = j0; i <= j; ++i) {
+            const int32_t expert = order[i];
+            const int64_t first = m.off[(size_t) expert];
+            const int rows = m.cnt[(size_t) expert];
+            basalt::kernels::atomic_lora_project(m.H + (first - r0) * 640,
+                a + (size_t) expert * 640, adapter->output_factor(), nullptr, rows, 640,
+                (int) N, adapter->scale(), m.Dm + first * N, m.cs);
+        }
+    }
     return true;
 
 }

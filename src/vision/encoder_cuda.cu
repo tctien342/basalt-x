@@ -269,11 +269,12 @@ struct CudaEncoder::Impl {
         return true;
     }
 
-    void detach() {
-        if (stream) cudaStreamSynchronize(stream);
+    bool detach() {
+        const auto status = stream ? cudaStreamSynchronize(stream) : cudaSuccess;
         arena = nullptr;
         arena_size = 0;
         nmax = 0;
+        return status == cudaSuccess;
     }
 
     bool init(const Mmproj& m, int max_tokens, std::string& e) {
@@ -368,7 +369,7 @@ bool CudaEncoder::attach(void* arena, size_t bytes, int max_tokens, std::string&
     if (err.empty()) err = impl_->err;
     return false;
 }
-void CudaEncoder::detach() { impl_->detach(); }
+bool CudaEncoder::detach() { return impl_->detach(); }
 size_t CudaEncoder::device_bytes() const { return impl_->arena_size; }
 std::string CudaEncoder::last_error() const { return impl_->err; }
 

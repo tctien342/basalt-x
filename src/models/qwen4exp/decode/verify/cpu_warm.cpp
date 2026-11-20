@@ -56,12 +56,12 @@ BASALT_TARGET_AVX2_FMA_F16C void warm_logits(CpuWarm& c, int e0, int e1, const s
 
 // every token's top k (softmax weights over them), summed per predicted expert only the CPU holds; the likeliest
 void warm_select(CpuWarm& c) {
-    const int NE = c.n_expert, K = std::min(c.k, 16);
+    const int NE = c.n_expert, K = c.k;
     float score[512] = {};
     for (int t = 0; t < c.n_tok; ++t) {
         const float* lg = c.logits.data() + (size_t) t * NE;
-        int top[16];
-        float val[16];
+        int top[kCpuWarmMaxK];
+        float val[kCpuWarmMaxK];
         int m = 0;
         for (int e = 0; e < NE; ++e) {
             const float v = lg[e];
@@ -71,7 +71,7 @@ void warm_select(CpuWarm& c) {
             val[j] = v;
             top[j] = e;
         }
-        float w[16], sum = 0.0f;
+        float w[kCpuWarmMaxK], sum = 0.0f;
         for (int j = 0; j < m; ++j) sum += (w[j] = std::exp(val[j] - val[0]));
         for (int j = 0; j < m; ++j) {
             const int e = top[j];

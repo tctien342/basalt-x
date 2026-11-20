@@ -37,22 +37,31 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     if (!native_of(wq, v.name("attn_q.weight"), err) || !native_of(wk, v.name("attn_k.weight"), err) ||
         !native_of(wv, v.name("attn_v.weight"), err) || !native_of(wo, v.name("attn_output.weight"), err))
         return false;
-    auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
-        native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, cs);
-        native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, cs);
+    auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos, cudaStream_t stream) {
+        native_qsa_rms_norm_weighted(data, (const float*) norm->data, data, cols, rows, EPS, stream);
+        native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, stream);
     };
     float* idx_raw = v_.idx_raw_L_ + (size_t) qi * MT * ID;
     // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the window's rows each
     // - row-wise identical arithmetic
     const bool qb = n > 1 && !st.kv_q4;
+    const int value_width = kv_value_rotation_width(st.kv_rot && st.kv_int8 && !st.kv_q4);
+    const bool rotated_batch = v_.batch_rec_ && st.kv_rot;
+    const bool rotated_int8 = st.kv_rot && st.kv_int8 && qsa_dec_fused_supported(s);
+    if (rotated_batch && (!st.kv_int8 || !qsa_dec_fused_supported(s))) {
+        err = "verify: rotated batch requires supported INT8 QSA geometry";
+        return false;
+    }
     // the K norm + RoPE, the INT8 appends, the tail snapshot and the indexer appends of the group's rows in
     // one launch, the same bits
-    const bool fused_pre = st.kv_int8 && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
+    const bool fused_pre = (st.kv_int8 || v_.batch_rec_) && !st.kv_rot && !st.kv_hybrid && !st.kv_q4 &&
                            qsa_dec_fused_supported(s);
+    const bool fused_q = fused_pre || rotated_int8;
     auto kv_post_args = [&] {
         QsaDecKvPost kp;
         kp.kcur = v_.kcur_; kp.vcur = v_.vcur_; kp.pos_k = pos_k;
         kp.k_norm = (const float*) wkn->data; kp.steps = v_.step_;
+        kp.k_pool = st.k_pool; kp.v_pool = st.v_pool;
         kp.k_q = st.k_q; kp.v_q = st.v_q; kp.k_scale = st.k_scale; kp.v_scale = st.v_scale;
         kp.page_table = st.page_table; kp.host = st.host;
         kp.idx_raw = idx_raw; kp.idx_k_norm = (const float*) wikn->data;
@@ -62,7 +71,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         return kp;
     };
     // a batch window's rows are different sequences: the per-slot pointers come from the layer's table
-    const QsaSegTable seg_tab{v_.batch_rec_ ? v_.d_qslots_[(size_t) qi] : nullptr, v_.d_qrows_, v_.d_qsegs_, (int) n, (int) n};
+    const QsaSegTable seg_tab{v_.batch_rec_ ? v_.d_qslots_[(size_t) qi] : nullptr, v_.d_qrows_, v_.d_qsegs_, (int) n, (int) n, v_.batch_shared_residency_};
     auto kv_post = [&](const QsaDecKvPost& a, cudaStream_t q) {
         if (v_.batch_rec_) qsa_dec_kv_post_seg(a, seg_tab, (int) n, s, rope_scaling(), q);
         else qsa_dec_kv_post(a, n, s, rope_scaling(), q);
@@ -76,7 +85,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     };
     // K, V and the indexer key/query each on a branch of their own, beside the query (one row: the
     // multi-row GEMV is the one-row one)
-    const bool qsaf_wide = fused_pre && (qb || n == 1) && v_.qs_[0] != nullptr;
+    const bool rotated_wide = rotated_batch && rotated_int8 && qb;
+    const bool qsaf_wide = !use_swift && (fused_pre || rotated_wide) && (qb || n == 1) && v_.qs_[0] != nullptr;
     // the query projection's query rows first; its gate rows, which only the merge reads, beside the selection and the
     // attention chunks
     const bool qhalf = qsaf_wide && !v_.batch_rec_ && N == 2560 &&
@@ -95,6 +105,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
             dense_proj(32, wv->native_type, wv->native_data, v_.xq_, v_.vcur_, (int) N, (int) (NKV * HD),
                        n, v_.qs_[1]);
         }
+        if (rotated_wide)
+            fwht_value_inplace_cuda(v_.vcur_, (int64_t) n * NKV, v_.qs_[1], value_width);
         cudaEventRecord(v_.qev_[1], v_.qs_[1]);
         {
             PdlScope pz(pdl, true);
@@ -117,10 +129,15 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
             dense_proj(32, wk->native_type, wk->native_data, v_.xq_, v_.kcur_, (int) N, (int) (NKV * HD),
                        n, v_.qs_[0]);
         }
+        if (rotated_wide) {
+            norm_rope(v_.kcur_, wkn, (int) (n * NKV), (int) HD, pos_k, v_.qs_[0]);
+            fwht256_inplace_cuda(v_.kcur_, (int64_t) n * NKV, v_.qs_[0]);
+        }
         cudaStreamWaitEvent(v_.qs_[0], v_.qev_[1], 0);
         {
             QsaDecKvPost ka = kv_post_args();
             ka.part = 1;
+            ka.k_prepared = rotated_wide;
             kv_post(ka, v_.qs_[0]);
         }
         cudaEventRecord(v_.qev_[3], v_.qs_[0]);
@@ -136,6 +153,8 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         cudaStreamWaitEvent(cs, v_.qev_[4], 0);
         for (int i = 7; i <= 9; ++i) stamp(l, i);
         qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+        if (rotated_wide)
+            fwht256_inplace_cuda(v_.qcur_, (int64_t) n * NH, cs);
         if (qhalf) {   // the gate rows on the indexer key's branch, its appends done; the merge waits for them
             cudaEventRecord(v_.qev_[0], cs);
             cudaStreamWaitEvent(v_.qs_[2], v_.qev_[0], 0);
@@ -159,42 +178,50 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         dense_proj(32, wk->native_type, wk->native_data, v_.xq_, v_.kcur_, (int) N, (int) (NKV * HD), n, cs);
         dense_proj(32, wv->native_type, wv->native_data, v_.xq_, v_.vcur_, (int) N, (int) (NKV * HD), n, cs);
     }
+    swift_project(v, "attn_k.weight", xm, v_.kcur_, N, NKV * HD);
+    swift_project(v, "attn_v.weight", xm, v_.vcur_, N, NKV * HD);
     if (fused_pre) {
         kv_post(kv_post_args(), cs);
         stamp(l, 8);
     } else {
-        if (qb) norm_rope(v_.kcur_, wkn, (int) (n * NKV), (int) HD, pos_k);
-        else for (int t = 0; t < T; ++t) norm_rope(v_.kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, v_.pos_ + t * NH);
+        if (qb) norm_rope(v_.kcur_, wkn, (int) (n * NKV), (int) HD, pos_k, cs);
+        else for (int t = 0; t < T; ++t) norm_rope(v_.kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, v_.pos_ + t * NH, cs);
         if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
             fwht256_inplace_cuda(v_.kcur_, (int64_t) n * NKV, cs);
-            fwht256_inplace_cuda(v_.vcur_, (int64_t) n * NKV, cs);
+            fwht_value_inplace_cuda(v_.vcur_, (int64_t) n * NKV, cs, value_width);
         } else if (st.kv_hybrid) {   // K8V4: only V is rotated
             fwht256_inplace_cuda(v_.vcur_, (int64_t) n * NKV, cs);
         }
         stamp(l, 8);
-        copy_from_mapped(v_.tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
-        for (int t = 0; t < T; ++t) {
-                                    const int32_t* step_t = v_.step_ + t * kStepCount;
-            if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
-                kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
-                                  v_.kcur_ + t * NKV * HD, v_.kcur_ + t * NKV * HD, s, cs, nullptr);
-                kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, v_.vcur_ + t * NKV * HD,
-                                  v_.vcur_ + t * NKV * HD, s, cs, nullptr);
-            } else if (st.kv_q4)
-                kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
-                                  v_.vcur_ + t * NKV * HD, s, cs, &st.host);
-            else if (st.kv_int8)
-                kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
-                                  v_.kcur_ + t * NKV * HD, v_.vcur_ + t * NKV * HD, s, cs, &st.host);
-            else
-                kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
-                               v_.vcur_ + t * NKV * HD, s, cs, &st.host);
-        }
-        for (int t = 0; t < T; ++t) {
-            const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-            native_qsa_indexer_append(idx_raw + t * ID, v_.step_ + t * kStepCount + kStepPos, 0,
-                                      (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                      rope_scaling(), cs);
+        if (rotated_int8) {
+            QsaDecKvPost kp = kv_post_args();
+            kp.k_prepared = true;  // normalized, RoPE-applied and Hadamard-rotated above
+            kv_post(kp, cs);
+        } else {
+            copy_from_mapped(v_.tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+            for (int t = 0; t < T; ++t) {
+                const int32_t* step_t = v_.step_ + t * kStepCount;
+                if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                    kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
+                                      v_.kcur_ + t * NKV * HD, v_.kcur_ + t * NKV * HD, s, cs, nullptr);
+                    kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, v_.vcur_ + t * NKV * HD,
+                                      v_.vcur_ + t * NKV * HD, s, cs, nullptr);
+                } else if (st.kv_q4)
+                    kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
+                                      v_.vcur_ + t * NKV * HD, s, cs, &st.host);
+                else if (st.kv_int8)
+                    kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t,
+                                      v_.kcur_ + t * NKV * HD, v_.vcur_ + t * NKV * HD, s, cs, &st.host);
+                else
+                    kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, v_.kcur_ + t * NKV * HD,
+                                   v_.vcur_ + t * NKV * HD, s, cs, &st.host);
+            }
+            for (int t = 0; t < T; ++t) {
+                const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
+                native_qsa_indexer_append(idx_raw + t * ID, v_.step_ + t * kStepCount + kStepPos, 0,
+                                          (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                          rope_scaling(), cs);
+            }
         }
     }
     stamp(l, 9);
@@ -202,27 +229,29 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         PdlScope pq(pdl2 && fused_pre && qb);   // PDL2: after the K/V post kernel
         dense_proj(8, wq->native_type, wq->native_data, v_.xq_, v_.qfull_, (int) N,
                    (int) (NH * 2 * HD), n, cs);
-        if (fused_pre && qb)
+        if (fused_q && qb)
             bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) wiq->data, v_.qidx_,
                                       IQ * ID, N, IQ * ID, n, cs);
     }
-    if (fused_pre) {   // the query split, norms and RoPEs in one launch
+    swift_project(v, "attn_q.weight", xm, v_.qfull_, N, 2 * NH * HD);
+    if (fused_q) {   // the query split, norms and RoPEs in one launch
         if (qb) {}   // the indexer query projection ran above
         else for (int t = 0; t < T; ++t)
             bf16_gemv_fp32_mmvf(v_.mixed_ + t * N, (const uint16_t*) wiq->data, v_.qidx_ + t * IQ * ID, (int) N,
                                 (int) (IQ * ID), cs);
         qsa_dec_q_post(q_post_args(), n, s, rope_scaling(), cs);
+        if (rotated_int8) fwht256_inplace_cuda(v_.qcur_, (int64_t) n * NH, cs);
     } else if (qb) {
         if (cudaMemcpy2DAsync(v_.qcur_, (size_t) HD * 4, v_.qfull_, (size_t) HD * 2 * 4,
                               (size_t) HD * 4, (size_t) (n * NH), cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
             err = "verify: the q/gate split failed";
             return false;
         }
-        norm_rope(v_.qcur_, wqn, (int) (n * NH), (int) HD, v_.pos_);
+        norm_rope(v_.qcur_, wqn, (int) (n * NH), (int) HD, v_.pos_, cs);
         if (st.kv_rot) fwht256_inplace_cuda(v_.qcur_, (int64_t) n * NH, cs);   // <Hq, Hk> = <q, k>
         bf16_gemv_fp32_mmvf_multi(v_.mixed_, N, (const uint16_t*) wiq->data, v_.qidx_, IQ * ID,
                                   N, IQ * ID, n, cs);
-        norm_rope(v_.qidx_, wiqn, (int) (n * IQ), (int) ID, pos_i);
+        norm_rope(v_.qidx_, wiqn, (int) (n * IQ), (int) ID, pos_i, cs);
     } else {
     for (int t = 0; t < T; ++t) {
         float* qc = v_.qcur_ + t * NH * HD;
@@ -231,13 +260,13 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
             err = "verify: the q/gate split failed";
             return false;
         }
-        norm_rope(qc, wqn, (int) NH, (int) HD, v_.pos_ + t * NH);
+        norm_rope(qc, wqn, (int) NH, (int) HD, v_.pos_ + t * NH, cs);
         if (st.kv_rot) fwht256_inplace_cuda(qc, NH, cs);   // <Hq, Hk> = <q, k>
     }
     for (int t = 0; t < T; ++t) {
         float* qx = v_.qidx_ + t * IQ * ID;
         bf16_gemv_fp32_mmvf(v_.mixed_ + t * N, (const uint16_t*) wiq->data, qx, (int) N, (int) (IQ * ID), cs);
-        norm_rope(qx, wiqn, (int) IQ, (int) ID, v_.pos_ + t * NH);
+        norm_rope(qx, wiqn, (int) IQ, (int) ID, v_.pos_ + t * NH, cs);
     }
     }
     }
@@ -251,10 +280,12 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         // KV streaming: each streamed slot's selections resident in its own pool (device-side, in the graph)
         if (v_.batch_stream_) kv_stream_resolve_seg(seg_tab, v_.sel_, v_.step_, v_.cap_, s, cs);
         stamp(l, 12);
-        fused_gate = true;
-        attn_q8 = true;
-        qsa_dec_attn_seg(v_.qcur_, seg_tab, true, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs, v_.qfull_,
-                         v_.attn32_, v_.xq_);
+        // The gate operates in the original basis, after the inverse Hadamard below.
+        fused_gate = !rotated_batch;
+        attn_q8 = fused_gate;
+        qsa_dec_attn_seg(v_.qcur_, seg_tab, st.kv_int8, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_,
+                         v_.attn_, n, cs, fused_gate ? v_.qfull_ : nullptr,
+                         fused_gate ? v_.attn32_ : nullptr, attn_q8 ? v_.xq_ : nullptr);
     } else {
     {
         {
@@ -280,13 +311,19 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
         qsa_dec_attn(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_, s,
                      v_.attn_scratch_, v_.attn_, n, cs,
                      v_.qfull_, v_.attn32_, attn_q8 ? v_.xq_ : nullptr, qhalf ? (void*) v_.qev_[1] : nullptr);
+    else if (rotated_int8 && (n != 1 || v_.cap_ < 8192) && qsa_dec_attn_supported(pools, s))
+        qsa_dec_attn(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_, s, v_.attn_scratch_, v_.attn_, n, cs);
     else
-    qsa_decode_attn_batch(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_,
-                          s, v_.attn_scratch_, v_.attn_, n, cs);
+        qsa_decode_attn_batch(v_.qcur_, pools, v_.sel_, v_.step_, v_.cap_,
+                              s, v_.attn_scratch_, v_.attn_, n, cs);
     }
     stamp(l, 13);
-    if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(v_.attn_, (int64_t) n * NH, cs);   // back: H^-1 = H
     if (qhalf && !fused_gate) cudaStreamWaitEvent(cs, v_.qev_[1], 0);
+    if (rotated_int8) {
+        fwht256_gate_q8_cuda(v_.attn_, v_.qfull_, v_.xq_, (int64_t) n * NH, cs, value_width);
+        attn_q8 = true;
+    } else {
+    if (st.kv_rot || st.kv_hybrid) fwht_value_inplace_cuda(v_.attn_, (int64_t) n * NH, cs, value_width);
     if (fused_gate) {}   // the merge wrote attn32_
     else if (qb) native_qsa_gate_apply(v_.attn_, v_.qfull_, v_.attn32_,
                                   (int) (n * NH), (int) HD, cs);
@@ -294,6 +331,7 @@ bool Verifier::WindowRecorder::qsa(int64_t l, const LayerView& v, bool read_q8) 
     for (int t = 0; t < T; ++t) {
         native_qsa_gate_apply(v_.attn_ + t * NH * HD, v_.qfull_ + t * NH * 2 * HD, v_.attn32_ + t * NH * HD,
                               (int) NH, (int) HD, cs);
+    }
     }
     stamp(l, 14);
     PdlScope ps(pdl);   // after the gate kernel

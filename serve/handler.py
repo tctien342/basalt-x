@@ -18,12 +18,17 @@ from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
 from serve.api.documents import sources as document_sources
+from concurrent.futures import TimeoutError as FutureTimeout
+
+from serve.engine.image_source import AUDIO, VIDEO, load_image
+from serve.engine.stt import SpeechBusy, decode_audio
+from serve.engine.vision import IMAGE_WAITING_BYTES, VIDEO_REQUEST_BYTES
 from serve.engine.errors import ClientGone, EngineDied, EngineError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, checked as checked_bias
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, checked as checked_logprobs
 from serve.config import checked_sampling
-from serve.frontend import anthropic_to_messages, forced_call, openai_to_messages
+from serve.frontend import anthropic_to_messages, forced_call, media_of, openai_to_messages
 from serve.api.openai import openai_chunks, openai_collect
 from serve.api.responses import ResponsesError
 from serve.prompt import primed
@@ -195,6 +200,80 @@ def make_handler(target: Service | Router):
                 self.cancel = threading.Event()
                 self._watch_client(self.cancel)
             return self.cancel
+
+        def _speech_content(self, messages):
+            speech = getattr(router, "speech", None)
+            video_enabled = speech is not None and router.speech_video
+            if video_enabled:
+                selected = [item for item in media_of(messages) if item["type"] == "video"]
+                if selected:
+                    self.svc._check_videos(selected)
+            videos = {}
+            self.svc.request_ctx.stt_videos = videos
+            total_video = 0
+            video_transcripts = {}
+            for message in messages:
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                parts = []
+                for item in content:
+                    kind = item.get("type")
+                    if kind != "audio":
+                        parts.append(item)
+                    if kind != "audio" and not (kind == "video" and video_enabled):
+                        continue
+                    if speech is None:
+                        raise ValueError("audio input requires --stt-model")
+                    source = item["source"]
+                    if kind == "video" and source in videos:
+                        total_video += len(videos[source])
+                        if total_video > VIDEO_REQUEST_BYTES:
+                            raise ValueError("request videos exceed the video byte limit")
+                        if video_transcripts[source]:
+                            parts.append({"type": "text", "text": "Audio transcript:\n" + video_transcripts[source]})
+                        continue
+                    access = self._image_access()
+                    cancel = self._client_cancel()
+
+                    fetched = []
+
+                    def prepare(source=source, kind=kind, access=access, fetched=fetched,
+                                remaining=VIDEO_REQUEST_BYTES - total_video):
+                        if cancel.is_set():
+                            return b""
+                        data = load_image(source, access, VIDEO if kind == "video" else AUDIO)
+                        if kind == "video":
+                            if len(data) > remaining:
+                                raise ValueError("request videos exceed the video byte limit")
+                            fetched.append(data)
+                        return b"" if cancel.is_set() else decode_audio(data, video=kind == "video")
+
+                    try:
+                        job = speech.submit(prepare, router.speech_language)
+                    except SpeechBusy as e:
+                        raise ModelBusy(str(e)) from None
+                    while True:
+                        if cancel.is_set():
+                            raise ClientGone
+                        try:
+                            transcript = job.result(timeout=0.25)
+                            break
+                        except FutureTimeout:
+                            continue
+                    if fetched:
+                        data = fetched[0]
+                        total_video += len(data)
+                        if source not in videos:
+                            try:
+                                speech.retain_video(len(data), IMAGE_WAITING_BYTES)
+                            except SpeechBusy as e:
+                                raise ModelBusy(str(e)) from None
+                            videos[source] = data
+                            video_transcripts[source] = transcript
+                    if transcript:
+                        parts.append({"type": "text", "text": "Audio transcript:\n" + transcript})
+                message["content"] = parts
 
         def _take_turn(self, stream: bool = False) -> None:
             """Wait for this request's model to be loaded and its turn to come, which may take a swap. A stream gets
@@ -487,7 +566,7 @@ def make_handler(target: Service | Router):
                     self._unknown_model(path, requested)
                     return
                 self.svc.request_ctx.path = path
-                self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
+                self.svc.request_ctx.model = self.svc.canonical_model(requested)
                 with document_sources(self._image_access()):   # a document by URL or path follows the image rules
                     if path == "/v1/responses":
                         self._responses(req)
@@ -528,6 +607,11 @@ def make_handler(target: Service | Router):
                 self._end_request()
 
         def _end_request(self) -> None:
+            if self.svc is not None and hasattr(self.svc.request_ctx, "stt_videos"):
+                videos = self.svc.request_ctx.stt_videos
+                del self.svc.request_ctx.stt_videos
+                if videos:
+                    router.speech.release_video(sum(map(len, videos.values())))
             if self.turn is not None:
                 router.leave(self.turn)
                 self.turn = None
@@ -557,7 +641,7 @@ def make_handler(target: Service | Router):
                                "presence_penalty", "frequency_penalty", "penalty_last_n")}
             params["n_predict"] = -1
             props = {"default_generation_settings": {"n_ctx": svc.engine.max_context, "params": params},
-                     "total_slots": svc.slot_stats()["total"], "model_alias": svc.model, "chat_template": svc.template.source,
+                     "total_slots": svc.slot_stats()["total"], "model_alias": svc.canonical_model(name), "chat_template": svc.template.source,
                      "modalities": {"vision": svc.vision is not None, "video": svc.video_on()},
                      "models_autoload": hasattr(svc.engine, "restart"),
                      "is_sleeping": not svc.loaded(), "chat_template_caps": dict(svc.dialect.caps)}
@@ -657,21 +741,25 @@ def make_handler(target: Service | Router):
         def _openai(self, req):
             messages, tools, kw = openai_to_messages(req)
             tools, force = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # a bad choice is a 400 before streaming
+            self.svc.configure_mini_tools(req, tools, kw)
             check_format(req.get("response_format"))
             self.svc.require_grammar(req.get("response_format"))
             checked_sampling(req)                             # a sampling value out of range is a 400 likewise
+            self._speech_content(messages)
             self._open_live("chatcmpl-" + uuid.uuid4().hex[:24], req)
             req[LOGPROBS_KEY] = checked_logprobs(req)         # and a bad logprobs / top_logprobs
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             req[BIAS_KEY] = checked_bias(req, self.svc.engine)     # a bad logit_bias is a 400 before streaming
             req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               req.get("response_format"))
+                                               req.get("response_format"), req["_mini_tools_enabled"])
             max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest of the context
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             stop_strings(req)                                 # likewise a bad stop
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
                                                  image_access=self._image_access())
+            req["_thinking_max"] = kw.get("reasoning_effort") == "max"
+            req["_monitor_effort"] = (kw.get("reasoning_effort") or "default") if thinking else "off"
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             chunks = primed(openai_chunks(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,
@@ -789,6 +877,10 @@ def make_handler(target: Service | Router):
                 raise ResponsesError(str(e), "tool_choice") from None
             kw = responses_api.template_kwargs(req)
             try:
+                self.svc.configure_mini_tools(req, tools, kw)
+            except ValueError as e:
+                raise ResponsesError(str(e), "tools") from None
+            try:
                 check_format(responses_api.text_format(req))
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
@@ -797,7 +889,7 @@ def make_handler(target: Service | Router):
             except ValueError as e:
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"),
-                                               responses_api.text_format(req))
+                                               responses_api.text_format(req), req["_mini_tools_enabled"])
             noted = self.svc.__dict__.setdefault("hosted_tools_noted", set())   # once per tool
             if set(skipped) - noted:
                 print(f"[server] warning: /v1/responses ignores hosted tools {', '.join(sorted(set(skipped) - noted))}", flush=True)
@@ -815,6 +907,7 @@ def make_handler(target: Service | Router):
                 stop_strings(req)
             except ValueError as e:
                 raise ResponsesError(str(e), "stop") from None
+            self._speech_content(messages)
             self._open_live(responses_api.new_id("resp"), req)
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
@@ -826,9 +919,11 @@ def make_handler(target: Service | Router):
             except ValueError as e:                          # too long for the context, or an image without vision
                 raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
                     from None
+            req["_thinking_max"] = kw.get("reasoning_effort") == "max"
+            req["_monitor_effort"] = (kw.get("reasoning_effort") or "default") if thinking else "off"
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             include = req.get("include") if isinstance(req.get("include"), list) else []
-            asm = responses_api.Assembler(req, self.svc.model, len(ids), names,
+            asm = responses_api.Assembler(req, self.svc.response_model(), len(ids), names,
                                           "reasoning.encrypted_content" in include, rid=self.live.id)
             return ids, thinking, tools, max_new, asm, req, force
 
@@ -836,28 +931,35 @@ def make_handler(target: Service | Router):
             """Anthropic's token count: the rendered, tokenized prompt, without running the model."""
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
             tools, _ = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # same 400 as the request itself ("none": no tools)
+            self.svc.configure_mini_tools(req, tools, kw)
             stop_strings(req)                                 # same 400 as the request itself
+            self._speech_content(messages)
             self._json(200, {"input_tokens": len(self.svc.encode_prompt(messages, tools, kw))})
 
         def _anthropic(self, req):
             messages, tools, kw = anthropic_to_messages(req, self.svc.anthropic_think_unasked)
             tools, force = forced_call(req.get("tool_choice"), tools, self.svc.dialect.forced_opening)   # "any" / {"type": "tool", "name": N}
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+            self.svc.configure_mini_tools(req, tools, kw)
             response_format = anthropic_format(req)            # structured outputs
             try:
                 self.svc.require_grammar(response_format)
             except ValueError as e:
                 raise ValueError(str(e).replace("response_format json_schema and json_object", "output_config.format json_schema")) from None
-            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format)
+            req[GRAMMAR_KEY] = self.svc.grammar_for(tools, req.get("tool_choice"), req.get("tools"), response_format,
+                                                        req["_mini_tools_enabled"])
             self.svc.reasoning_budget(req)                         # a bad value is a 400 before streaming
             checked_sampling(req)                             # likewise a sampling value out of range
             req[LOGPROBS_KEY] = checked_logprobs(req)         # Basalt's logprobs, as Chat Completions takes them
             stop_strings(req)                                 # likewise a bad stop
+            self._speech_content(messages)
             self._open_live("msg_" + uuid.uuid4().hex[:24], req)
             self._take_turn(bool(req.get("stream")))
             self.svc.load()
             ids, thinking, max_new = self.svc.prepare(messages, tools, kw, max_new, force=force,
                                                  image_access=self._image_access())
+            req["_thinking_max"] = kw.get("reasoning_effort") == "max"
+            req["_monitor_effort"] = (kw.get("reasoning_effort") or "default") if thinking else "off"
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = self._client_cancel()
             events = primed(anthropic_events(self.svc, req, ids, thinking, tools, max_new, cancel, force=force,

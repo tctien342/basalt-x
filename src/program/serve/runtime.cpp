@@ -24,8 +24,8 @@ void Runtime::shed_if_low() {
         const size_t freed = conversations->clear();
         size_t to_disk = 0;
         for (auto& sc : conversations->take_spilled())
-            if (disk.enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
-                disk.put(std::move(sc), kDiskQueueCap))
+            if (disk_store().enabled() && !disk_has(sc.live.ids, sc.live.imgs, sc.checkpoints, sc.cvec) &&
+                disk_store().put(std::move(sc), kDiskQueueCap))
                 ++to_disk;
         if (freed > 0)
             basalt::log::info("basalt serve", "RAM guard: %zu parked conversations (%zu MiB) leave RAM, %zu of them "
@@ -64,25 +64,25 @@ int Runtime::run_requests() {
     }
 }
 
-// Whether the disk tier needs no new copy of a conversation: it is short (below the disk's minimum, or below
-// --conversation-cache-min-tokens when that is higher), or a stored prefix of it reaches within
-// kDiskStaleTokens of the chain's deepest checkpoint (the point its next turn goes on from; a restore
-// from that copy reads the rest again).  Each turn of a growing conversation is not written again in full.
-bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec) {
+// Whether the snapshot tier needs no new copy of a conversation: it is below the minimum, the store
+// already holds the exact live image, or a stored prefix is within kDiskStaleTokens of the deepest checkpoint.
+bool Runtime::disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec, basalt::core::ConversationStore* store) {
     if ((int64_t) ids.size() < std::max<int64_t>(disk_min_tokens(), o.conversation_cache_min_tokens)) return true;
     int64_t deepest = 0;
     for (const ConvCheckpoint& c : cks) deepest = std::max<int64_t>(deepest, (int64_t) c.ids.size());
     if (deepest <= 0) deepest = (int64_t) ids.size();
-    const auto m = disk.best(ids.data(), ids.size(), imgs, cvec);
-    return m.tokens > 0 && m.tokens + kDiskStaleTokens >= deepest;
+    auto& dest = store ? *store : disk_store();
+    const auto m = dest.best(ids.data(), ids.size(), imgs, cvec);
+    // Restore leaves one token to evaluate, so it can miss a complete image with no earlier checkpoint.
+    return (m.tokens > 0 && m.tokens + kDiskStaleTokens >= deepest) || dest.holds(ids, imgs, cvec);
 }
 
 int Runtime::shutdown() {
     // the conversations this process holds go to the disk tier before it ends
-    if (disk.enabled()) {
+    if (disk_store().enabled()) {
         const auto t0 = Clock::now();
         const size_t written = spill_to_disk(true, SIZE_MAX);
-        const auto st = disk.stats();
+        const auto st = disk_store().stats();
         basalt::log::info("basalt serve", "conversation cache: %zu conversations written to disk at exit in %.0f ms; "
                           "on disk %zu (%.2f GiB); since the start written %zu (%.2f GiB, %.2f GiB with the shared "
                           "files they reuse), read back %zu (%.2f GiB), evicted %zu, dropped %zu", written,

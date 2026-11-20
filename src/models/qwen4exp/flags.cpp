@@ -61,6 +61,23 @@ bool parse_flag(const std::string& a, model::FlagArgs& args, Options& o, int& co
     else if (a == "--spec") { o.spec = std::atoi(args.next("--spec")); o.spec_given = true; }
     else if (a == "--spec-oracle") o.spec_oracle = args.next("--spec-oracle");
     else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(args.next("--spec-corrupt"));
+    else if (a == "--no-mtp") o.no_mtp = true;
+    else if (a == "--atomic-lora") o.atomic_lora = args.next("--atomic-lora");
+    else if (a == "--swift-lora") o.swift_lora = args.next("--swift-lora");
+    else if (a == "--target-k-thinking-num" || a == "--target-k-last-layer-num") {
+        const bool experts = a == "--target-k-thinking-num";
+        const char* value = args.next(a.c_str());
+        char* end = nullptr;
+        const long number = std::strtol(value, &end, 10);
+        const int low = experts ? 10 : 1, high = experts ? 23 : 48;
+        if (end == value || *end != '\0' || number < low || number > high) {
+            basalt::log::error("basalt", "%s: expected an integer in %d..%d", a.c_str(), low, high);
+            code = 2;
+            return true;
+        }
+        (experts ? o.target_k_thinking_num : o.target_k_last_layer_num) = (int) number;
+    }
+    else if (a == "--dflash2") { o.dflash2 = args.next("--dflash2"); o.no_mtp = true; }
     else if (a == "--mtp-window") o.mtp_window = std::atoll(args.next("--mtp-window"));
     else if (a == "--adapt-every") { o.adapt_every = std::atoi(args.next("--adapt-every")); o.adapt_every_given = true; }
     else if (a == "--adapt-decay") { o.adapt_decay = (float) std::atof(args.next("--adapt-decay")); o.adapt_decay_set = true; }

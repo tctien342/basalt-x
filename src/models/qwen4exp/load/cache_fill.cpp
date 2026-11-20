@@ -24,23 +24,19 @@ int cache_fill(Context& context) {
     auto& xcache = *context.xcache;
 
     // ---- fill the tier from the profile.  This is the only place the plan is applied, and it runs
-    // ONCE: with `slots` pairs and `slots` slots the cache is full when this returns, so the decode-time
+    // ONCE: with `slots` pairs and `slots` slots the cache is full before dispatch, so the decode-time
     // admission finds no room and every non-profiled expert stays a CPU miss.  That is what makes the profile
     // the policy rather than a hint.
-    int64_t prefilled = 0;
     uint64_t cache_fill_bytes = 0;   // what the GPU cache took from the profile (counted by its load phase)
     // The model's bytes against what the tiers will hold, from the same quantities the loader uses: the primary card
     // keeps its weights and the cache just sized, the peer card its free memory less its buffers and reserve, and the
     // RAM copy the room past the headroom.  With the file-backed modes the rest is read from the SSD (the default
     // arena mode was checked against the RAM above).
     // what the peer card can hold of experts: its free memory less its buffers and reserve, capped by --peer-slots
-    // what the verify window's splits (the head by vocabulary, the GDN mixer by key head) load on the peer after its
-    // expert tier is filled, when the GDN mixer split is taken; without it the head's peer rows fit in what the tier
-    // leaves free
+    // Budget each verifier split independently before filling the peer tier.
     auto peer_split_bytes = [&](int dev0) -> int64_t {
         const int64_t gs = basalt::core::Verifier::gs_peer_bytes(wt, g, dev0, o.peer_device);
-        if (gs == 0) return 0;
-        const int64_t hs = native_head.loaded()
+        const int64_t hs = native_head.loaded() && native_head.vproxy() == nullptr
             ? basalt::core::Verifier::hs_peer_bytes(native_head.row_bytes(), native_head.type(), n_vocab, g.n_embd,
                                                     std::max({o.spec, o.batch, 2}), dev0, o.peer_device) : 0;
         return hs + gs;
@@ -126,7 +122,6 @@ int cache_fill(Context& context) {
                 basalt::core::LoadProgress::plan("cuda0", fill_total, true);
             }
         }
-        basalt::core::LoadProgress fill_progress(basalt::core::LoadProgress::cuda(0), fill_total, srcp != &src);
         // the slots are handed out in profile order, then the blobs are read and copied together
         std::vector<std::pair<int32_t, int32_t>> fill_pairs;
         std::vector<int32_t> fill_slots;
@@ -140,27 +135,44 @@ int cache_fill(Context& context) {
             fill_slots.push_back(slot);
             fill_bytes += basalt::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
         }
-        if (!basalt::core::fill_cache_slots(*srcp, xcache, 0, fill_pairs.data(), fill_slots.data(),
-                                            (int64_t) fill_pairs.size(),
-                                            [&](uint64_t bytes) { fill_progress.add(bytes); }, err)) {
-            basalt::log::error("basalt generate", "the profile fill failed: %s", err.c_str());
-            return 1;
+        auto fill = [&xcache, source = srcp, copy = srcp != &src, fill_total, fill_bytes,
+                     expected = per_layer ? xcache.slots() : want,
+                     pairs = std::move(fill_pairs), slots = std::move(fill_slots)]() -> int {
+            const auto started = Clock::now();
+            const basalt::core::OnDevice on(0);
+            std::string fill_error;
+            basalt::core::LoadProgress progress(basalt::core::LoadProgress::cuda(0), fill_total, copy);
+            if (!basalt::core::fill_cache_slots(*source, xcache, 0, pairs.data(), slots.data(), (int64_t) pairs.size(),
+                                                [&](uint64_t bytes) { progress.add(bytes); }, fill_error)) {
+                basalt::log::error("basalt generate", "the profile fill failed: %s", fill_error.c_str());
+                return 1;
+            }
+            progress.finish();
+            const double seconds = std::chrono::duration<double>(Clock::now() - started).count();
+            // Verify the first admitted expert before any CUDA consumer uses the published residency map.
+            if (!pairs.empty()) {
+                const auto [layer, expert] = pairs.front();
+                if (!xcache.verify_slot(slots.front(), source->blob(layer, expert), fill_error,
+                                        (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(layer))) {
+                    return fatal_start_error(fill_error);
+                }
+            }
+            basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
+                              "slot 0 verified", (long long) pairs.size(), (long long) expected, seconds,
+                              seconds > 0 ? (double) fill_bytes / 1e6 / seconds : 0.0);
+            return 0;
+        };
+        // A single peer can choose its experts from the primary slot map. Both uploads then read the same
+        // immutable arena and write separate caches. File-backed and exclusive placement keep the original order.
+        const bool pair = o.serve && !multi_gpu && o.peer_device >= 1 && o.peer_devices.size() <= 1 &&
+                          !o.peer_exclusive && !o.resident_cpu_experts && srcp == context.arena_src &&
+                          !o.shared_expert_arena.empty();
+        if (pair) context.expert_fill_started = fill_t0;
+        if (pair && basalt::core::exp_flag("startup_parallel_expert_banks", 0) != 0) {
+            context.primary_expert_fill = std::move(fill);
+        } else if (const int status = fill(); status != 0) {
+            return status;
         }
-        prefilled += (int64_t) fill_pairs.size();
-        fill_progress.finish();
-        const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
-        // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
-        // about bytes produces a plausible token, which is this project's most expensive failure mode; the
-        // cache's own `verify_slot` is the check and it costs one blob-sized D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                srcp->blob(profile[0].first, profile[0].second), err,
-                                (int64_t) basalt::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
-            return fatal_start_error(err);
-        }
-        basalt::log::info("basalt generate", "pre-filled %lld of %lld slots from the profile in %.1f s (%.0f MB/s); "
-                             "slot 0 verified",
-                     (long long) prefilled, (long long) (per_layer ? xcache.slots() : want), fill_s,
-                     fill_s > 0 ? (double) fill_bytes / 1e6 / fill_s : 0.0);
     }
 
     for (auto& stp : stages) {

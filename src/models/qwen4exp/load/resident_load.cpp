@@ -4,6 +4,7 @@
 namespace basalt::models::qwen4exp::generate {
 
 int resident_load(Context& context) {
+    const auto started = Clock::now();
     auto& o = *context.o;
     auto& err = *context.err;
     auto& g = *context.g;
@@ -155,6 +156,7 @@ int resident_load(Context& context) {
     }
     // the peer's swaps keep their experts in RAM or on a GPU, never only in the file
     if (o.peer_exclusive && peer.valid() && srcp == &src && src.complement_ready()) peer.set_exclusive(&src);
+    log_expert_load_phase(context, "resident load", started);
     return prompt_split(context);
 }
 

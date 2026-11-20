@@ -50,6 +50,13 @@ struct DmPlan {
 /// Staged groups a layer takes at most (the staging slots).
 constexpr int kDmStageMax = 16;
 
+enum DmPcieTiming {
+    DmPcieRoute, DmPcieLocal, DmPciePeer, DmPcieGrouped,
+    DmPcieCopyBegin,
+    DmPcieCopyEnd = DmPcieCopyBegin + 8,
+    DmPcieTimingWords = DmPcieCopyEnd + 8
+};
+
 struct DmRouteArgs {
     const int32_t* ids = nullptr;    ///< device: n_tok * k routed experts
     const float* x = nullptr;        ///< device: n_tok * n_embd FFN input
@@ -95,6 +102,7 @@ struct DmRouteArgs {
     /// and per count of the layer's distinct CPU misses the staged ones (kDmCap + 1 entries, device); null: none
     const unsigned long long* stage_src = nullptr;
     const int32_t* stage_k = nullptr;
+    bool stage_timing = false;       ///< stats points to this layer's mapped timing words
 };
 /// Blocks dec_moe_route launches for `n_tok` rows (the arrival counter advances by this much).
 int dec_moe_route_blocks(int n_tok, int n_embd);
@@ -153,10 +161,16 @@ struct DmPeerArgs {
                                                  ///< tokens, bit 28 set when it has peer entries, bit 29 when its q8_1
                                                  ///< rows were published anyway (the warm-up's input); UINT32_MAX: stop
     uint32_t* done_m = nullptr;                  ///< mapped: the last ring whose rows have landed
-    float* rows_m = nullptr;                     ///< mapped: entry i's row at rows_m + i * n_embd
+    float* rows_m = nullptr;                     ///< entry i's row at rows_m + i * n_embd
+    bool rows_fp16 = false;                      ///< only a direct peer-write arena can hold FP16 rows
+    const float* const* lora_routed = nullptr;   ///< peer device: A tables by absolute layer
+    const float* lora_b = nullptr;               ///< peer device: common output factor
+    const float* lora_scale = nullptr;           ///< peer device: request scale
+    const float* lora_rows = nullptr;            ///< optional mapped batch scales by token row
     const unsigned long long* ptr = nullptr;     ///< peer device: [n_layers * n_expert] blob address or 0
     const NativeExpertLayout* lay = nullptr;     ///< peer device: per layer
     int n_expert = 0, k = 0, n_embd = 0, n_ff = 0, steps = 0;
+    int first_wide_layer = 0;                    ///< preceding layers use top-10
     void* scratch = nullptr;                     ///< peer device: dec_moe_peer_scratch_bytes
     unsigned int* arrive = nullptr;              ///< peer device: 16 words zeroed before the launch (arrivals, barrier,
                                                  ///< abort, the warm-up's words)
@@ -234,16 +248,18 @@ bool dec_moe_table_load(void* stream);
 /// work done, 6 ns from the doorbell to the peer's rows, 7 layers with peer entries; then per CPU-entry count.
 constexpr int kDmStatBucket = 8, kDmStatLayer = kDmStatBucket + 16 * 8, kDmStatLayers = 64, kDmStatPerLayer = 8;
 constexpr int kDmStatCpu = kDmStatLayer + kDmStatPerLayer * kDmStatLayers;   ///< + 2 min(CPU entries, 7): layers, ns to landed
-constexpr int kDmStatWords = kDmStatCpu + 16;
+constexpr int kDmStatStage = kDmStatCpu + 16, kDmStageStatPerLayer = 4;   ///< last staged copy and compute stamps
+constexpr int kDmStatWords = kDmStatStage + kDmStageStatPerLayer * kDmStatLayers;
 /// One line per peer-entry count and two per-layer lines from the counters (host copy).
 std::string dec_moe_stats_text(const unsigned long long* w, double windows);
 
 /// CUDA0's spin until the tiers this layer uses have landed (the combine waits by itself; this one is for profiles).
 /// `trigger`: the next launch (a programmatic dependent) may start while this one waits.  `skip_peer`: the peer's
-/// rows are polled by the combine (its tag_done), so only the CPU pool's word is waited for.
+/// rows are polled by the combine (its tag_done), so only the CPU pool's word is waited for. A plain direct-peer
+/// launch can supply this layer's mapped PCIe timing words when legacy wait statistics are disabled.
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
                   uint32_t ring, void* stream, unsigned long long* stats = nullptr, int layer = 0, bool trigger = false,
-                  bool skip_peer = false);
+                  bool skip_peer = false, unsigned long long* pcie_timing = nullptr);
 
 /// CUDA0's VRAM share of the plan in one launch (gate/up, SwiGLU, down; native_expert_grouped's rows bit for bit):
 /// entry e's row into row plan->dst[e] of `out`.  `sync`: kDmCap + 1 zeroed device words, left zeroed.
@@ -280,6 +296,7 @@ void dec_moe_combine(const float* parts, const float* peer_rows_m, const float* 
                      const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m, uint32_t ring,
                      void* stream, bool dep = false, const volatile uint32_t* tag_done = nullptr,
                      const volatile uint32_t* cpu_done = nullptr, unsigned int* cpu_seen = nullptr,
-                     const float* shared_gate = nullptr);
+                     const float* shared_gate = nullptr, bool peer_fp16 = false,
+                     unsigned long long* pcie_timing = nullptr);
 
 }  // namespace basalt::kernels

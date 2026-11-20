@@ -3,6 +3,7 @@
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/prefill/moe_mmq.hpp"
@@ -59,8 +60,8 @@ static PeerShare::Dims share_dims(int64_t Tp, int64_t G, int64_t tf, const MmqPl
     d.n_expert = (int) NE;
     d.launch_experts = MMQ_GROUP;
     d.launch_rows = G;
-    // one group buffer, as many as its own gathers had: the group's gather follows the last group's products
-    d.stage_bufs = 1;
+    // Cold MMQ copies can stage the next group while the current one computes.
+    d.stage_bufs = core::exp_flag("peer_cold_mmq") != 0 ? 2 : 1;
     d.bufs = 2;
     return d;
 }

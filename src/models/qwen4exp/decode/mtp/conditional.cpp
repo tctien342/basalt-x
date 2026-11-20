@@ -25,8 +25,8 @@ bool MtpDrafter::prewarm(std::string& err) {
 }
 
 bool MtpDrafter::capture_cond(int T, int steps) {
-    cudaGraphExec_t& exec = cond_exec_[tier_][T];
-    if (exec && cond_steps_[tier_][T] == steps) return true;
+    cudaGraphExec_t& exec = cond_exec_[basalt::kernels::rope_context_index()][tier_][T];
+    if (exec && cond_steps_[basalt::kernels::rope_context_index()][tier_][T] == steps) return true;
     if (exec) {
         cudaGraphExecDestroy(exec);
         exec = nullptr;
@@ -101,7 +101,7 @@ bool MtpDrafter::capture_cond(int T, int steps) {
         cond_off_ = true;
         return false;
     }
-    cond_steps_[tier_][T] = steps;
+    cond_steps_[basalt::kernels::rope_context_index()][tier_][T] = steps;
     return true;
 }
 

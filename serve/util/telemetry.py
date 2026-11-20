@@ -9,11 +9,37 @@ import collections
 import ctypes
 import os
 import platform
+from pathlib import Path
+import re
 import sys
 import threading
 import time
 
 HISTORY = 60
+_PCI_BDF = re.compile(r"[0-9a-f]{4,}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+_PCIE_CODING = {2.5: 8 / 10, 5.0: 8 / 10, 8.0: 128 / 130, 16.0: 128 / 130, 32.0: 128 / 130}
+
+
+def _pcie_path_ceiling_mbps(device: Path):
+    """Shared capability of both ends of a direct PCIe link, before packet overhead."""
+    try:
+        device = device.resolve(strict=True)
+        caps = []
+        for hop in (device, *device.parents):
+            if not _PCI_BDF.fullmatch(hop.name):
+                break
+            speed = float((hop / "max_link_speed").read_text().split()[0])
+            width = int((hop / "max_link_width").read_text())
+            if width <= 0:
+                return None
+            caps.append((speed, width))
+        if len(caps) != 2:
+            return None
+        speed = min(generation for generation, _ in caps)
+        width = min(width for _, width in caps)
+        return speed * _PCIE_CODING[speed] * width * 1000 / 8
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
 
 
 # ------------------------------------------------------------------------------------------------ NVML
@@ -24,8 +50,15 @@ class _Nvml:
     class Mem(ctypes.Structure):
         _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong), ("used", ctypes.c_ulonglong)]
 
+    class PciInfo(ctypes.Structure):
+        _fields_ = [
+            ("legacy_bus_id", ctypes.c_char * 16), ("domain", ctypes.c_uint),
+            ("bus", ctypes.c_uint), ("device", ctypes.c_uint), ("id", ctypes.c_uint),
+            ("subsystem", ctypes.c_uint), ("bus_id", ctypes.c_char * 32),
+        ]
+
     def __init__(self, index=0):
-        self.lib = self.dev = None
+        self.lib = self.dev = self.pcie_path_mbps = None
         names = ["libnvidia-ml.so.1", "libnvidia-ml.so"]
         if sys.platform == "win32":
             # Windows ships NVML as nvml.dll (System32); the .so names never load there, which left
@@ -55,6 +88,8 @@ class _Nvml:
             self.dev = h
         except (AttributeError, OSError):
             self.lib = None
+        if self.ok() and sys.platform == "linux":
+            self.pcie_path_mbps = self._path_ceiling()
 
     def ok(self):
         return self.lib is not None and self.dev is not None
@@ -65,6 +100,19 @@ class _Nvml:
             return v.value if getattr(self.lib, fn)(self.dev, *args, ctypes.byref(v)) == 0 else None
         except (AttributeError, OSError):
             return None
+
+    def _path_ceiling(self):
+        info = self.PciInfo()
+        try:
+            if self.lib.nvmlDeviceGetPciInfo_v3(self.dev, ctypes.byref(info)) == 0:
+                bus_id = info.bus_id.decode("ascii").lower()
+                if _PCI_BDF.fullmatch(bus_id):
+                    _, bus, device = bus_id.split(":")
+                    bdf = f"{info.domain:04x}:{bus}:{device}"
+                    return _pcie_path_ceiling_mbps(Path("/sys/bus/pci/devices") / bdf)
+        except (AttributeError, OSError, UnicodeDecodeError):
+            pass
+        return None
 
     def name(self):
         buf = ctypes.create_string_buffer(96)
@@ -117,6 +165,7 @@ class _Nvml:
         out["pcie_gen"] = self._uint("nvmlDeviceGetCurrPcieLinkGeneration")        # drops at idle
         out["pcie_gen_max"] = self._uint("nvmlDeviceGetMaxPcieLinkGeneration")
         out["pcie_width"] = self._uint("nvmlDeviceGetCurrPcieLinkWidth")
+        out["pcie_path_ceiling_mbps"] = self.pcie_path_mbps
         rx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(1))                 # NVML_PCIE_UTIL_RX_BYTES, KB/s
         tx = self._uint("nvmlDeviceGetPcieThroughput", ctypes.c_uint(0))
         out["pcie_rx_mb"] = rx / 1024.0 if rx is not None else None
@@ -171,7 +220,7 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 GPU_KEYS = ("util", "mem_used", "mem_total", "temp", "power", "power_limit", "pcie_gen", "pcie_gen_max", "pcie_width",
-            "pcie_rx_mb", "pcie_tx_mb")
+            "pcie_rx_mb", "pcie_tx_mb", "pcie_path_ceiling_mbps")
 SERIES = ("tok_s", "prefill_tok_s_mean")      # series kept as history
 GPU_SERIES = ("util", "power", "temp")         # per-card series kept as history
 

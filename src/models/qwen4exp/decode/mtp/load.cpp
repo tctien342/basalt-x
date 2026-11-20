@@ -164,15 +164,12 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
             const int64_t ring_pages = store_ring > 0 ? store_ring : st_.n_pages;
             store_ring_.assign((size_t) n_stores_ + 1, 0);
             for (size_t id = 0; id < stores_.size(); ++id) store_ring_[id] = std::min(store_pages_[id], ring_pages);
-            for (size_t id = 0; id < stores_.size(); ++id)
-                for (int i = 0; i < na; ++i) {
-                    auto& st = stores_[id];
-                    const uint64_t bytes = (uint64_t) store_ring_[id] * lay[i].page_bytes;
-                    if (cudaMalloc(&st[(size_t) i], bytes) != cudaSuccess) { err = "mtp: the slots' K/V do not fit"; return false; }
-                    cudaMemset(st[(size_t) i], 0, bytes);
-                    vram_ += bytes;
-                    draft_kv_bytes += bytes;
-                }
+            if (!lazy_stores_) {
+                const auto before = vram_;
+                for (size_t id = 0; id < stores_.size(); ++id)
+                    if (!ensure_store((int) id, lay, na, err)) return false;
+                draft_kv_bytes += vram_ - before;
+            }
         }
     }
     uint64_t draft_kv_max = draft_kv_bytes;
@@ -189,7 +186,9 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t R2 = 2 * T;   // step/pos rows: T catch-up rows + up to T-2 chain steps
-    bool ok = mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_) &&
+    if (lazy_stores_) store_adapter_scale_.assign((size_t) n_stores_ + 1, 0.0f);
+    bool ok = (!lazy_stores_ || mapped(T * sizeof(float), (void**) &h_adapter_rows_, (void**) &m_adapter_rows_)) &&
+              mapped(T * 4 + 64, (void**) &h_tok_, (void**) &m_tok_) &&
               mapped(R2 * 4 * 4 + 64, (void**) &h_step_, (void**) &m_step_) &&
               mapped(R2 * NH * 4 + 64, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped(64, (void**) &h_row_, (void**) &m_row_) &&
@@ -241,7 +240,7 @@ bool MtpDrafter::load(const MtpFiles& files, const ModelGeometry& g, SessionStat
         pend_R_.assign((size_t) n_stores_ + 1, nullptr);
         pend_tok_.assign((size_t) n_stores_ + 1, std::vector<int32_t>{});
         pend_cell0_.assign((size_t) n_stores_ + 1, 0);
-        for (float*& r : pend_R_) {
+        if (!lazy_stores_) for (float*& r : pend_R_) {
             if (cudaMalloc((void**) &r, (size_t) kPendRows * HC * N * sizeof(float)) != cudaSuccess) { err = "mtp: row staging"; return false; }
             vram_ += (uint64_t) kPendRows * HC * N * sizeof(float);
         }

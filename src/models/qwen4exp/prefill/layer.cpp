@@ -1,6 +1,7 @@
 #include "run.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
+#include "basalt/models/qwen4exp/decode/dflash2.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/models/qwen4exp/decode/layout.hpp"
 #include "basalt/models/qwen4exp/kernels/cvec.hpp"
@@ -69,6 +70,7 @@ bool Prefill::Run::Chunk::layer(int64_t l) {
         if (half == 1 && basalt::kernels::cvec().covers(l))   // --control-vector-scaled
             basalt::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
     }
+    if (auto* draft = core::active_dflash2()) draft->capture_prefill(l, m.R, T, p0, m.cs);
     return true;
 }
 

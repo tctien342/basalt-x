@@ -146,13 +146,11 @@ __device__ __forceinline__ void dm_group_keys(const int32_t* s_key, int n, int t
     rank_out = rank;
 }
 
-// The staged share (a card without peers): of the layer's distinct CPU misses (an entry of kind -1 that is its expert's
-// first such entry), the last stage_k[m] in routing order whose blob has a host-RAM address go to kind 1 with every
-// entry of theirs (m: the layer's distinct CPU misses).  Every thread of the block calls it; q is kDmCap words of
-// block scratch.  The ring's kinds and the staged copy (dm_stage_kernel) make the same split from the same ids and
-// residency.
+// Select up to stage_k[m] distinct CPU misses with an aligned mapped host address. Peer staging favors
+// experts reused by more rows, with reverse router order as the tie-breaker and legacy single-card order.
+// The ring and copy kernel call this with the same IDs and residency. Every thread participates; q has kDmCap words.
 __device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32_t* s_kind, int n, int tid, int32_t* q) {
-    if (a.stage_src == nullptr) return;
+    if (a.stage_src == nullptr || (a.res1 != nullptr && a.stage_k[0] == 0)) return;
     const bool in = tid < n;
     const int32_t e = in ? s_ids[tid] : -1;
     const bool miss = in && s_kind[tid] < 0 && e >= 0 && e < a.n_expert;
@@ -169,16 +167,32 @@ __device__ void dm_stage_split(const DmRouteArgs& a, const int32_t* s_ids, int32
         return;
     }
     bool el = first && a.stage_src[e] != 0ull;
-    for (int j = 0; el && j < n; ++j)   // a group holds one entry per token
-        if (j != tid && s_ids[j] == e && j / a.k == tid / a.k) el = false;
+    int reuse = 0, prior_row = -1;
+    for (int j = 0; el && j < n; ++j) {
+        if (s_ids[j] != e) continue;
+        const int row = j / a.k;
+        // Peer staging favors experts used by more rows. Keep legacy single-card ordering.
+        if (a.res1 != nullptr) {
+            el = row != prior_row;
+            prior_row = row;
+            ++reuse;
+        } else if (j != tid && row == tid / a.k) {
+            el = false;
+        }
+    }
+    const int score = el ? max(1, reuse) : 0;
     __syncthreads();
-    if (tid < kDmCap) q[tid] = el;
+    if (tid < kDmCap) q[tid] = score;
     __syncthreads();
     bool st = false;
     if (el) {
-        int after = 0;
-        for (int j = tid + 1; j < n; ++j) after += q[j];
-        st = after < k;
+        int ahead = 0;
+        if (a.res1 != nullptr) {
+            for (int j = 0; j < n; ++j) ahead += q[j] > score || (q[j] == score && j > tid);
+        } else {
+            for (int j = tid + 1; j < n; ++j) ahead += q[j];
+        }
+        st = ahead < k;
     }
     __syncthreads();
     if (tid < kDmCap) q[tid] = st;
@@ -906,6 +920,7 @@ struct DmShared {
     alignas(16) uint32_t grid[2048];                       // the format's codebook grid (stage_iq_grid)
     alignas(16) block_q8_1 hq[kDmMaxEnt * 20];             // one group's SwiGLU rows (n_ff == 640)
     alignas(16) float out[kDmMaxEnt * kDmSpan];            // one item's rows per entry
+    float lora_gain[kDmMaxEnt];
     int32_t ids[kDmCap], kind[kDmCap], first[kDmCap], cnt[kDmCap], gstart[kDmCap], gidx[kDmCap], pos[kDmCap];
     int32_t start[kDmCap + 1], tok[kDmCap], dst[kDmCap];
     unsigned long long gptr[kDmCap];
@@ -982,6 +997,30 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
     return true;
 }
 
+// Compute one scalar per routed row, using the FP32 activation before the down quantizer.
+__device__ __noinline__ void dm_lora_gains(DmShared& sm, const float* gate, const float* up,
+                                          const float* layer_a, float scale, const float* scales, int e0, int e1, int width) {
+    const int lane = threadIdx.x & 31;
+    for (int e = e0 + (threadIdx.x >> 5); e < e1; e += kDmThreads / 32) {
+        const float strength = scales ? scales[sm.tok[e]] : scale;
+        if (strength == 0) {
+            if (lane == 0) sm.lora_gain[e - e0] = 0;
+            continue;
+        }
+        const float* a = layer_a + (size_t) sm.ids[sm.dst[e]] * width;
+        float dot = 0;
+        for (int j = lane; j < width; j += 32) {
+            const size_t k = (size_t) e * width + j;
+            const float g = __ldcg(gate + k);
+            const float h = __fmul_rn(g / (1.0f + __expf(-g)), __ldcg(up + k));
+            dot = fmaf(h, a[j], dot);
+        }
+        for (int shift = 16; shift > 0; shift >>= 1)
+            dot += __shfl_down_sync(0xffffffffu, dot, shift);
+        if (lane == 0) sm.lora_gain[e - e0] = strength * dot;
+    }
+}
+
 // The grouped experts of sm's lists (ng groups: blob gptr[g], entries [start[g], start[g+1]) reading q8_1 row tok[e]
 // and writing row dst[e] of `out`): block b of nb takes gate/up items (group, 8 rows) b, b + nb, ..., each one
 // counted in done[g] when finished, then down items (group, kDmSpan rows) the same way, a group's first down item
@@ -990,7 +1029,8 @@ __device__ __forceinline__ bool dm_wait_ge(const DmWatch& w, const DmShared* sm,
 template<int TG, int TD, bool Q2 = false, int TU = TG>
 __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, const NativeExpertLayout& L, float* gate,
                            float* up, float* out, unsigned int* done, int b, int nb, bool gu2 = false,
-                           const DmWatch* watch = nullptr) {
+                           const DmWatch* watch = nullptr, bool out_fp16 = false, const float* lora_a = nullptr,
+                           const float* lora_b = nullptr, float lora_scale = 0, const float* lora_rows = nullptr) {
     const int tid = threadIdx.x;
     if (tid == 0) sm.stop = 0;
     constexpr bool SG = kStageIqGrid<TG>;
@@ -1043,6 +1083,8 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
             __syncthreads();
             if (sm.stop) return;
             dm_swiglu_q8(gate, up, e0, e1, (int) L.n_ff, sm.hq, tid);
+            if (lora_a && (lora_rows || lora_scale != 0))
+                dm_lora_gains(sm, gate, up, lora_a, lora_scale, lora_rows, e0, e1, (int) L.n_ff);
             g_staged = g;
             __syncthreads();
         }
@@ -1055,8 +1097,24 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
         for (int i = tid; i < nq; i += kDmThreads) {
             const int e = i / q, c = i - e * q;
             const int r0 = sp * kDmSpan + c * 4;
-            if (r0 < L.n_embd)
-                *(float4*) (out + (size_t) sm.dst[e0 + e] * L.n_embd + r0) = *(const float4*) &sm.out[e * kDmSpan + c * 4];
+            if (r0 < L.n_embd) {
+                const size_t off = (size_t) sm.dst[e0 + e] * L.n_embd + r0;
+                auto v = *(const float4*) &sm.out[e * kDmSpan + c * 4];
+                if (lora_a && (lora_rows || lora_scale != 0) && sm.lora_gain[e] != 0) {
+                    const float gain = sm.lora_gain[e];
+                    v.x = fmaf(gain, lora_b[r0], v.x);
+                    v.y = fmaf(gain, lora_b[r0 + 1], v.y);
+                    v.z = fmaf(gain, lora_b[r0 + 2], v.z);
+                    v.w = fmaf(gain, lora_b[r0 + 3], v.w);
+                }
+                if (out_fp16) {
+                    auto* dst = reinterpret_cast<__half2*>(out) + off / 2;
+                    dst[0] = __floats2half2_rn(v.x, v.y);
+                    dst[1] = __floats2half2_rn(v.z, v.w);
+                } else {
+                    *reinterpret_cast<float4*>(out + off) = v;
+                }
+            }
         }
     }
 }
@@ -1074,11 +1132,12 @@ __device__ void dm_experts(DmShared& sm, const block_q8_1* __restrict__ xq, cons
 template<bool Q2 = false>
 __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeExpertLayout& L, float* gate, float* up,
                                float* out, unsigned int* done, int b, int nb, bool gu2 = false,
-                               const DmWatch* watch = nullptr) {
+                               const DmWatch* watch = nullptr, bool out_fp16 = false,
+                               const float* lora_a = nullptr, const float* lora_b = nullptr, float lora_scale = 0, const float* lora_rows = nullptr) {
     if (L.up_type != L.gu_type) {
         switch ((L.gu_type * 100 + L.up_type) * 100 + L.d_type) {
 #define DM_MIX_CASE(TG, TU, TD) \
-            case (TG * 100 + TU) * 100 + TD: dm_experts<TG, TD, Q2, TU>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
+            case (TG * 100 + TU) * 100 + TD: dm_experts<TG, TD, Q2, TU>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch, out_fp16, lora_a, lora_b, lora_scale, lora_rows); break;
             DM_MIX(DM_MIX_CASE)
 #undef DM_MIX_CASE
             default: break;
@@ -1087,7 +1146,7 @@ __device__ void dm_experts_any(DmShared& sm, const block_q8_1* xq, const NativeE
     }
     switch (L.gu_type * 100 + L.d_type) {
 #define DM_CASE(TG, TD) \
-        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch); break;
+        case TG * 100 + TD: dm_experts<TG, TD, Q2>(sm, xq, L, gate, up, out, done, b, nb, gu2, watch, out_fp16, lora_a, lora_b, lora_scale, lora_rows); break;
         DM_PAIRS(DM_CASE)
 #undef DM_CASE
         default: break;
@@ -1160,7 +1219,8 @@ __device__ __noinline__ void dm_warm(DmPeerArgs a, DmShared& sm, const block_q8_
     constexpr int WB = kDmThreads / 32;
     const int nw = (int) (gridDim.x - 1) * WB, gw = (int) (blockIdx.x - 1) * WB + warp;
     const int ne = a.n_expert, nblk = a.n_embd / 32, l1 = layer + 1;
-    const bool on = n_tok > 0 && ne <= kDmPredExperts && a.k <= 32 && n_tok * a.k <= kDmCap;
+    const int k = l1 < a.first_wide_layer ? 10 : a.k;
+    const bool on = n_tok > 0 && ne <= kDmPredExperts && k <= 32 && n_tok * k <= kDmCap;
     if (tid == 0) {
         if (on && ring_arrivals != 0u)   // the router pass waits until every block has left the ring
             while (dm_ld(a.arrive) < ring_arrivals && dm_ld(go) < next && dm_ld(a.arrive + 2) == 0u) __nanosleep(100);
@@ -1223,7 +1283,7 @@ __device__ __noinline__ void dm_warm(DmPeerArgs a, DmShared& sm, const block_q8_
     if (s_last && on && !s_go) {   // the last to arrive: the list
         int32_t* first = (int32_t*) sm.grid;   // restaged by the next ring's experts
         for (int i = tid; i < kDmPredExperts; i += kDmThreads) first[i] = INT32_MAX;
-        const int k = a.k, n = pt * k;
+        const int n = pt * k;
         if (warp < pt) {
             float v[kDmPredExperts / 32];
 #pragma unroll

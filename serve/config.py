@@ -6,6 +6,7 @@ import json
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -23,7 +24,7 @@ CONFIG_PATHS = ("model", "tokenizer", "image-dir")       # relative to the confi
 # a model entry's own, and what it may also inherit from the top-level "engine"; other server options are the server's
 ENTRY_OPTIONS = frozenset({"model", "alias"})
 MODEL_OPTIONS = frozenset({
-    "gpu", "vision", "parallel", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
+    "gpu", "vision", "parallel", "shared-kv-pool", "context-profiles", "slot-full-context", "idle-sleep", "idle-unload", "min-free-vram-mib", "fit-max-tokens",
     "grammar", "reasoning-budget-tokens", "thinking-loop-tokens", "answer-room", "temperature", "top-p", "top-k", "min-p",
     "presence-penalty", "frequency-penalty", "repetition-penalty", "penalty-last-n", "seed", "video-max-tokens"})
 GRAMMAR_DEFAULT = True                      # the `grammar` option when neither the file nor the command line sets it
@@ -36,7 +37,9 @@ def engine_flags_of(engine_bin: str) -> set[str] | None:
             data = f.read()
     except OSError:
         return None
-    return {m.decode() for m in re.findall(rb"(?<![\x21-\x7e])--[a-z0-9][a-z0-9-]*(?![\x21-\x7e])", data)}
+    # A literal prefix lets the regex skip directly to possible flags in a large binary.
+    matches = re.finditer(rb"--[a-z0-9][a-z0-9-]*(?![\x21-\x7e])", data)
+    return {m[0].decode() for m in matches if m.start() == 0 or not 0x21 <= data[m.start() - 1] <= 0x7e}
 
 
 def server_options(ap: argparse.ArgumentParser) -> dict:
@@ -223,10 +226,11 @@ def load_config_file(path: str, ap: argparse.ArgumentParser) -> ConfigFile:
     return ConfigFile(server_argv, models)
 
 
-def model_settings(ap: argparse.ArgumentParser, cli: list[str], refused=None) -> list[tuple]:
+def model_settings(ap: argparse.ArgumentParser, cli: list[str], refused=None, *, parallel_probes=False) -> list[tuple]:
     """parse_settings() for each model the server runs: the --config file's entries, else the command line's one.
     `refused(path, group)` says a model has no such engine flag; a top-level setting it refuses is left out of that model's
-    words and named in `a.skipped`. With --config the command line's settings apply to every entry."""
+    words and named in `a.skipped`. `parallel_probes` requires independent parser-only calls. With --config the command
+    line's settings apply to every entry."""
     a_cli = ap.parse_known_args(cli)[0]
     if not a_cli.config:
         return [parse_settings(ap, cli)]
@@ -238,8 +242,14 @@ def model_settings(ap: argparse.ArgumentParser, cli: list[str], refused=None) ->
     out = []
     for entry in cfg.models:
         kept, skipped = [], []
-        for group in engine_groups(entry.shared_words):
-            if refused is not None and refused(entry.path, group):
+        groups = engine_groups(entry.shared_words)
+        if parallel_probes and refused is not None and len(groups) > 1:
+            with ThreadPoolExecutor(max_workers=4) as probes:
+                rejections = list(probes.map(lambda group: refused(entry.path, group), groups))
+        else:
+            rejections = [refused is not None and refused(entry.path, group) for group in groups]
+        for group, rejected in zip(groups, rejections):
+            if rejected:
                 skipped.append(group[0])
             else:
                 kept += group
@@ -265,12 +275,22 @@ def parse_settings(ap: argparse.ArgumentParser, cli: list[str], server_argv=(), 
     for act in ap._actions:                                # a repeatable command-line option replaces the file's
         if isinstance(act, argparse._AppendAction) and getattr(a_cli, act.dest) != act.default:
             setattr(a, act.dest, getattr(a_cli, act.dest))
-    if a.parallel and a.parallel > 1:
+    if a.context_profiles:
+        a.shared_kv_pool = True
+        (cli_words if a_cli.context_profiles else file_words).extend(["--exp", "rope_context_profiles=1"])
+    if a.shared_kv_pool:
+        a.parallel = a.parallel or 1
+        if a.slot_full_context:
+            raise ValueError("shared-kv-pool and slot-full-context cannot be combined")
+        (cli_words if a_cli.shared_kv_pool or a_cli.context_profiles else file_words).extend(["--exp", "shared_kv_pool=1"])
+    elif a.parallel and a.parallel > PARALLEL_MAX:
+        ap.error(f"expected parallel 1..{PARALLEL_MAX}, not {a.parallel}")
+    if a.shared_kv_pool or (a.parallel and a.parallel > 1):
         for flag in ("--batch", "--slots"):
             if flag in file_words or flag in cli_words:
                 raise ValueError(f"parallel and engine {flag} both set: use parallel")
         (cli_words if a_cli.parallel else file_words).extend(["--batch", str(a.parallel)])
-        if not a.slot_full_context:
+        if not (a.slot_full_context or a.shared_kv_pool):
             # --max-context is shared by the slots, as in llama.cpp: each holds an equal part (the solo path, used while
             # a request is alone, has the same length, so a request never outgrows its slot). Without the flag the
             # engine's default is shared, once the server has asked the engine for it (split_default).
@@ -471,13 +491,13 @@ def image_url_host(text: str) -> str:
 
 
 def parallel_count(text: str) -> int:
-    """argparse type: a whole number of request slots, 1..PARALLEL_MAX."""
+    """Parse a positive logical slot count that fits the native integer."""
     try:
         n = int(text)
     except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a whole number 1..{PARALLEL_MAX}, not {text!r}") from None
-    if not 1 <= n <= PARALLEL_MAX:
-        raise argparse.ArgumentTypeError(f"expected 1..{PARALLEL_MAX}, not {n}")
+        raise argparse.ArgumentTypeError(f"expected a positive whole number, not {text!r}") from None
+    if not 1 <= n <= 2147483647:
+        raise argparse.ArgumentTypeError(f"parallel count out of range: {n}")
     return n
 
 
@@ -529,6 +549,10 @@ def build_parser() -> argparse.ArgumentParser:
                          "their turn. --max-context is shared: each slot holds that divided by N (so 4 slots of 262144 "
                          "need --max-context 1048576, or --slot-full-context). The slots' KV cache comes out of the "
                          "expert cache")
+    ap.add_argument("--shared-kv-pool", action="store_true",
+                    help="streamed FP16 or INT8: share total context across logical slots")
+    ap.add_argument("--context-profiles", action="store_true",
+                    help="use native RoPE for base aliases and YaRN ×2 for -512k aliases")
     ap.add_argument("--slot-full-context", action="store_true",
                     help="with --parallel, give every slot the whole --max-context instead of an equal part: N slots "
                          "cost N times the KV cache")
@@ -567,6 +591,13 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request with 400")
+    ap.add_argument("--stt-model", help="Nemotron GGUF for CPU audio transcription")
+    ap.add_argument("--stt-threads", type=int, default=8, help="CPU threads for speech transcription")
+    ap.add_argument("--stt-video", action=argparse.BooleanOptionalAction, default=True,
+                    help="transcribe video audio when STT is configured")
+    ap.add_argument("--stt-language", default="vi-VN", help="Nemotron transcription locale")
+    ap.add_argument("--mini-tools-helper", action="store_true",
+                    help="enable private calculator, datetime and regex batches in Flash-Next thinking")
     ap.add_argument("--grammar", action=argparse.BooleanOptionalAction, default=GRAMMAR_DEFAULT,
                     help="hold every tool call and JSON response format to a grammar in the engine (on by default; a request "
                          "with strict: true gets it either way); --no-grammar turns it off")

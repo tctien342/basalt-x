@@ -1,8 +1,14 @@
 #include "basalt/models/qwen4exp/decode/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/core/on_device.hpp"
+#include "basalt/log.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <exception>
+#include <future>
 #include <limits>
 
 namespace basalt::core {
@@ -20,6 +26,35 @@ std::array<int64_t, 18> geometry_key(const ModelGeometry& g) {
 bool fail(std::string& error, const char* message) {
     error = std::string("conversation snapshot: ") + message;
     return false;
+}
+
+constexpr size_t snapshot_lanes = 4;
+constexpr size_t fresh_capture_lanes = 12;
+
+template <class Work>
+bool run_snapshot_lanes(int device, size_t lanes, Work&& work, std::string& error) {
+    std::array<std::string, fresh_capture_lanes> errors;
+    std::array<std::future<bool>, fresh_capture_lanes - 1> workers;
+    for (size_t i = 1; i < lanes; ++i)
+        workers[i - 1] = std::async([&, i] {
+            if (cudaSetDevice(device) != cudaSuccess) {
+                errors[i] = "conversation snapshot: cannot select the layer copy device";
+                return false;
+            }
+            return work(i, errors[i]);
+        });
+    bool ok = work(0, errors[0]);
+    for (size_t i = 1; i < lanes; ++i) ok = workers[i - 1].get() && ok;
+    if (!ok) {
+        for (auto& e : errors) {
+            if (e.empty() || e == kCaptureInterrupted) continue;
+            error = std::move(e);
+            return false;
+        }
+        if (std::find(errors.begin(), errors.end(), kCaptureInterrupted) != errors.end())
+            error = kCaptureInterrupted;
+    }
+    return ok;
 }
 
 bool sync(std::string& error) {
@@ -339,29 +374,149 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                const ConversationCaptureStop* stop) {
     size_t estimate = 0;
-    if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    if (conversation_capture_interrupted(stop, error) ||
+        !conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) ||
+        !sync(error) || conversation_capture_interrupted(stop, error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
-    captured.cvec = view.cvec; captured.checkpoints = view.checkpoints;
-    const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
+    captured.cvec = view.cvec;
+    if (stop) {
+        captured.checkpoints.reserve(view.checkpoints.size());
+        for (const auto& checkpoint : view.checkpoints) {
+            if (conversation_capture_interrupted(stop, error)) return false;
+            captured.checkpoints.push_back(checkpoint);
+        }
+    } else {
+        captured.checkpoints = view.checkpoints;
+    }
+    const bool fresh_backing = reuse.kv.empty();
+    const int64_t unchanged = fresh_backing ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
-    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    if (conversation_capture_interrupted(stop, error) ||
+        !conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     const int64_t upto = (int64_t) view.ids.size();
-    for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+    auto save_layers = [&](size_t begin, size_t step, std::string& e, size_t* reused) {
+        for (size_t j = begin; j < layers; j += step)
+            if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, e,
+                                      unchanged, reused, stop)) return false;
+        return true;
+    };
+    int device = -1;
+    if (layers >= snapshot_lanes && upto >= 32768 && exp_flag("park_parallel_copy") != 0 &&
+        cudaGetDevice(&device) == cudaSuccess) {
+        // Each lane owns different destination layers. The save's device fence ran before any lane started.
+        const bool wider = fresh_backing && layers >= fresh_capture_lanes && exp_flag("park_capture_lanes12") != 0;
+        const size_t lanes = wider ? fresh_capture_lanes : snapshot_lanes;
+        std::array<size_t, fresh_capture_lanes> reuse_counts{};
+        if (!run_snapshot_lanes(device, lanes, [&](size_t i, std::string& e) {
+                return save_layers(i, lanes, e, &reuse_counts[i]);
+            }, error)) return false;
+        if (reused_bytes) for (size_t n : reuse_counts) *reused_bytes += n;
+        static std::array<std::atomic<bool>, 2> noted{};
+        if (!noted[wider].exchange(true))
+            basalt::log::info("basalt serve", "parallel parked KV capture using %zu lanes", lanes);
+    } else if (!save_layers(0, 1, error, reused_bytes)) {
+        return false;
+    }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes, stop)) return false;
+    if (conversation_capture_interrupted(stop, error)) return false;
     image = std::move(captured);
+    return true;
+}
+
+bool conversation_snapshot_seal_shared(ConversationSharedSnapshot& job, SavedConversation&& chain,
+                                       const SessionState& ss, const ModelGeometry& g,
+                                       const QsaState* draft, std::string& error, bool frozen_index, int64_t draft_prefix) {
+    const ConversationView view{chain.live.ids, chain.live.imgs, chain.checkpoints, chain.cvec};
+    size_t estimate = 0;
+    const size_t layers = owned_qsa(ss);
+    if (layers == 0 || !chain.kv.empty() || !chain.stage_images.empty())
+        return fail(error, "conversation snapshot: invalid chain for shared capture");
+    if (!conversation_snapshot_bytes(view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    const auto& first = owned(ss, 0);
+    const int64_t page_cells = basalt::kernels::qsa_real_shapes().page_size;
+    const int64_t upto = static_cast<int64_t>(chain.live.ids.size());
+    const size_t pages = static_cast<size_t>(upto / page_cells + (upto % page_cells != 0));
+    if (!pages || !first.host_page_ids || pages > first.host_page_count)
+        return fail(error, "conversation snapshot: missing frozen page directory");
+    ConversationSharedSnapshot pending;
+    if (frozen_index && cudaGetDevice(&pending.index_device) != cudaSuccess)
+        return fail(error, "cannot identify the frozen index device");
+    pending.pages.assign(first.host_page_ids, first.host_page_ids + pages);
+    pending.sources.resize(layers);
+    pending.image = std::move(chain);
+    auto& image = pending.image;
+    image.geometry = geometry_key(g);
+    image.layer_lo = ss.layer_lo;
+    image.layer_hi = ss.layer_hi;
+    image.kv.resize(layers + (draft ? 1 : 0));
+    if (!conversation_checkpoint_save(image.live, ss, g, error)) return false;
+    if (draft && !conversation_kv_seal_shared_draft(image.kv.back(), pending.draft_tail,
+                                                   *draft, g, upto, draft_prefix, error)) return false;
+    for (size_t i = 0; i < layers; ++i)
+        if (!conversation_kv_seal_shared(image.kv[i], pending.sources[i], owned(ss, i), g,
+                                        upto, pending.pages, error, frozen_index)) return false;
+    job = std::move(pending);
+    return true;
+}
+
+bool conversation_snapshot_read_shared_index(ConversationSharedSnapshot& job, std::string& error) {
+    if (job.index_device < 0) return true;
+    if (job.sources.empty() || job.sources.size() > job.image.kv.size())
+        return fail(error, "invalid frozen index layers");
+    for (size_t i = 0; i < job.sources.size(); ++i) {
+        const auto& source = job.sources[i];
+        if (!source.pooled || !source.pooled_bytes) return fail(error, "missing frozen index rows");
+        job.image.kv[i].pooled.resize_for_overwrite(source.pooled_bytes);
+    }
+    const OnDevice device(job.index_device);
+    int current = -1;
+    if (cudaGetDevice(&current) != cudaSuccess || current != job.index_device)
+        return fail(error, "cannot select the frozen index device");
+    cudaStream_t stream = nullptr;
+    auto status = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    if (status != cudaSuccess) return fail(error, cudaGetErrorString(status));
+    for (size_t i = 0; i < job.sources.size() && status == cudaSuccess; ++i) {
+        const auto& source = job.sources[i];
+        auto& pooled = job.image.kv[i].pooled;
+        const bool submitted = pooled.visit(0, source.pooled_bytes, [&](uint8_t* dst, size_t count, size_t offset) {
+            status = cudaMemcpyAsync(dst, static_cast<const uint8_t*>(source.pooled) + offset, count,
+                                     cudaMemcpyDeviceToHost, stream);
+            return status == cudaSuccess;
+        });
+        if (!submitted && status == cudaSuccess) status = cudaErrorInvalidValue;
+    }
+    // Drain any copies already submitted even if a later submission failed.
+    const auto synchronized = cudaStreamSynchronize(stream);
+    const auto destroyed = cudaStreamDestroy(stream);
+    if (status == cudaSuccess) status = synchronized;
+    if (status == cudaSuccess) status = destroyed;
+    if (status != cudaSuccess) return fail(error, cudaGetErrorString(status));
+    job.index_device = -1;
+    return true;
+}
+
+bool conversation_snapshot_finish_shared(SavedConversation& result, ConversationSharedSnapshot&& job,
+                                         std::string& error, const ConversationCaptureStop* stop) {
+    if (job.sources.empty() || job.sources.size() > job.image.kv.size())
+        return fail(error, "conversation snapshot: invalid frozen capture");
+    if (job.index_device >= 0 || job.draft_tail.end_cell)
+        return fail(error, "frozen index or draft copy has not completed");
+    for (size_t i = 0; i < job.sources.size(); ++i)
+        if (!conversation_kv_finish_shared(job.image.kv[i], job.sources[i], job.pages, error, stop)) return false;
+    if (conversation_capture_interrupted(stop, error)) return false;
+    result = std::move(job.image);
     return true;
 }
 
@@ -383,14 +538,65 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
 }
 
+bool conversation_snapshot_trim_to_checkpoint(SavedConversation& image, const SessionState& ss,
+                                              const ModelGeometry& g, const QsaState* draft,
+                                              int64_t upto, std::string& error) {
+    if (!image.stage_images.empty() || !conversation_snapshot_validate(image, ss, g, draft, error)) return false;
+    const auto checkpoint = std::find_if(image.checkpoints.begin(), image.checkpoints.end(),
+        [upto](const auto& c) { return (int64_t) c.ids.size() == upto; });
+    if (checkpoint == image.checkpoints.end()) return fail(error, "no saved running state at the selected prefix");
+    const size_t layers = owned_qsa(ss);
+    for (size_t i = 0; i < layers; ++i)
+        if (!conversation_detail::trim_kv(image.kv[i], owned(ss, i), g, upto, true, error)) return false;
+    if (draft && !conversation_detail::trim_kv(image.kv.back(), *draft, g, upto, false, error)) return false;
+    image.live = *checkpoint;
+    image.checkpoints.erase(std::remove_if(image.checkpoints.begin(), image.checkpoints.end(),
+        [upto](const auto& c) { return (int64_t) c.ids.size() > upto; }), image.checkpoints.end());
+    return true;
+}
+
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
-    for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
+    const size_t layers = owned_qsa(ss);
+    int device = -1;
+    const bool parallel = layers >= snapshot_lanes && upto >= 32768 &&
+        exp_flag("park_parallel_restore") != 0 && cudaGetDevice(&device) == cudaSuccess;
+    if (parallel) {
+        constexpr size_t shared_restore_lanes = 8;
+        const bool wider = layers >= shared_restore_lanes && exp_flag("park_shared_restore8") != 0 &&
+            std::any_of(image.kv.begin(), image.kv.begin() + layers, [](const ConversationKv& layer) {
+                return layer.bytes(true) < layer.bytes();
+            });
+        const size_t lanes = wider ? shared_restore_lanes : snapshot_lanes;
+        bool copied = false;
+        try {
+            copied = run_snapshot_lanes(device, lanes, [&](size_t i, std::string& e) {
+                for (size_t j = i; j < layers; j += lanes)
+                    if (!conversation_detail::restore_kv(image.kv[j], owned(ss, j), g, upto, true, true, e))
+                        return false;
+                return true;
+            }, error);
+        } catch (const std::exception& e) {
+            error = std::string("conversation snapshot restore worker: ") + e.what();
+        }
+        // The worker streams and the authoritative host writes must finish before restoring running state.
+        std::string sync_error;
+        if (!sync(sync_error)) {
+            if (copied) error = std::move(sync_error);
             return ConversationRestore::transfer_failed;
+        }
+        if (!copied) return ConversationRestore::transfer_failed;
+        static std::atomic<bool> noted{false};
+        if (wider || !noted.exchange(true))
+            basalt::log::info("basalt serve", "parallel parked KV restore using %zu lanes", lanes);
+    } else {
+        for (size_t j = 0; j < layers; ++j)
+            if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
+                return ConversationRestore::transfer_failed;
+    }
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;

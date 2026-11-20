@@ -5,6 +5,8 @@
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/geometry.hpp"
 
+namespace basalt::qwen4exp { class AtomicLora; }
+
 namespace basalt::core {
 
 class PeerExperts;
@@ -13,6 +15,9 @@ class PeerExperts;
 struct ExpertDispatch {
     basalt::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
+    const basalt::qwen4exp::AtomicLora* cpu_lora = nullptr;
+    float cpu_lora_scale = 0;
+    const float* cpu_lora_rows = nullptr;
     int64_t n_expert = basalt::kernels::cpu::NE;
 
     /// Counters, for the driver to report rather than for control flow.

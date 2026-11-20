@@ -286,6 +286,12 @@ static inline __m128i get_scale_shuffle(int i) {
     return _mm_loadu_si128((const __m128i*)k_shuffle + i);
 }
 
+static inline __m256i unpack_q5_0(const block_q5_0 * x) {
+    const __m256i qx = bytes_from_nibbles_32(x->qs);
+    const __m256i high = bytes_from_bits_32(x->qh);
+    return _mm256_or_si256(qx, _mm256_andnot_si256(high, _mm256_set1_epi8((char) 0xf0)));
+}
+
 static void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
@@ -311,10 +317,7 @@ static void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, co
         /* Compute combined scale for the block */
         const __m256 d = _mm256_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d));
 
-        __m256i qx = bytes_from_nibbles_32(x[ib].qs);
-        __m256i bxhi = bytes_from_bits_32(x[ib].qh);
-        bxhi = _mm256_andnot_si256(bxhi, _mm256_set1_epi8((char)0xF0));
-        qx = _mm256_or_si256(qx, bxhi);
+        const __m256i qx = unpack_q5_0(x + ib);
 
         __m256i qy = _mm256_loadu_si256((const __m256i *)y[ib].qs);
 
@@ -325,6 +328,41 @@ static void ggml_vec_dot_q5_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, co
     }
 
     *s = hsum_float_8(acc);
+}
+
+// Pair independent activations so each packed Q5_0 block is decoded once.
+void basalt_q5_0_q8_0_rows(const uint8_t * weights, size_t row_bytes, int n,
+                          const void * const * act, int nt, float * const * out,
+                          int r0, int r1, float scale) {
+    const int nb = n / QK5_0;
+    assert(n % QK5_0 == 0);
+    for (int r = r0; r < r1; ++r) {
+        const block_q5_0 * x = (const block_q5_0 *) (weights + (size_t) r * row_bytes);
+        int t = 0;
+        for (; t + 1 < nt; t += 2) {
+            const block_q8_0 * y0 = act[t];
+            const block_q8_0 * y1 = act[t + 1];
+            __m256 acc0 = _mm256_setzero_ps();
+            __m256 acc1 = _mm256_setzero_ps();
+            for (int ib = 0; ib < nb; ++ib) {
+                const float dx = GGML_CPU_FP16_TO_FP32(x[ib].d);
+                const __m256i qx = unpack_q5_0(x + ib);
+                const __m256i qy0 = _mm256_loadu_si256((const __m256i *) y0[ib].qs);
+                const __m256i qy1 = _mm256_loadu_si256((const __m256i *) y1[ib].qs);
+                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(y0[ib].d)),
+                                       mul_sum_i8_pairs_float(qx, qy0), acc0);
+                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(dx * GGML_CPU_FP16_TO_FP32(y1[ib].d)),
+                                       mul_sum_i8_pairs_float(qx, qy1), acc1);
+            }
+            out[t][r] = hsum_float_8(acc0) * scale;
+            out[t + 1][r] = hsum_float_8(acc1) * scale;
+        }
+        if (t < nt) {
+            float sum = 0.0f;
+            ggml_vec_dot_q5_0_q8_0(n, &sum, 0, x, 0, act[t], 0, 1);
+            out[t][r] = sum * scale;
+        }
+    }
 }
 
 static void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {

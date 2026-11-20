@@ -18,6 +18,8 @@
 
 #include "basalt/models/qwen4exp/kernels/s_gemv.hpp"
 
+namespace basalt::qwen4exp { struct SwiftLoraFactors; }
+
 namespace basalt::kernels {
 
 /// Optional native GGUF projections. Each supported type with nonnull data
@@ -32,6 +34,17 @@ struct NativeSharedWeights {
     const void* up_data = nullptr;
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
+    const float* down_lora_a = nullptr;
+    const float* down_lora_b = nullptr;
+    const float* down_lora_scale = nullptr;
+    bool down_lora_per_row = false;
+    const basalt::qwen4exp::SwiftLoraFactors* swift_gate = nullptr;
+    const basalt::qwen4exp::SwiftLoraFactors* swift_up = nullptr;
+    const basalt::qwen4exp::SwiftLoraFactors* swift_down = nullptr;
+    const float* swift_input = nullptr;
+    const float* swift_scale = nullptr;
+    float* swift_scratch = nullptr;
+    bool swift_per_row = false;
 };
 
 /// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL ALLOCATES NOTHING**:

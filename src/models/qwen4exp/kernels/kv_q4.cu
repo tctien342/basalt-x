@@ -2,12 +2,15 @@
 // (with KV-streaming integration and a deterministic group maximum).
 #include "basalt/models/qwen4exp/kernels/kv_q4.hpp"
 #include "basalt/kernels/f16_bits.hpp"
+#include "basalt/core/diag.hpp"
+#include "basalt/kernels/q8_1_fm.cuh"
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include "basalt/log.hpp"
 
 namespace basalt::kernels {
@@ -23,7 +26,9 @@ void check(const char* what) {
 
 // Fast Walsh-Hadamard Transform for N = 256: one warp per row, 8 values per lane in registers.
 // Orthonormal (scale 1/sqrt(256) = 1/16), so it is its own inverse.
-__global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n_rows, float scale) {
+template <bool PackGated, int Width>
+__global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n_rows, float scale,
+                               const float* q_full, Q81Fm* packed) {
     constexpr int warp_size = 32;
     constexpr int N = 256;
     constexpr int el_w = N / warp_size;   // 8
@@ -32,7 +37,6 @@ __global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict_
     if (r >= n_rows) return;
 
     const float* row_src = src + r * N;
-    float* row_dst = dst + r * N;
 
     float reg[el_w];
     const int lane = threadIdx.x;
@@ -52,7 +56,7 @@ __global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict_
     }
     // the high 3 bits across each lane's registers
 #pragma unroll
-    for (int h = warp_size; h < N; h *= 2) {
+    for (int h = warp_size; h < Width; h *= 2) {
         const int step = h / warp_size;
 #pragma unroll
         for (int j = 0; j < el_w; j += 2 * step) {
@@ -65,8 +69,19 @@ __global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict_
             }
         }
     }
+    if constexpr (PackGated) {
+        const float* gate = q_full + r * 2 * N + N;
 #pragma unroll
-    for (int i = 0; i < el_w; ++i) row_dst[i * warp_size + lane] = reg[i];
+        for (int i = 0; i < el_w; ++i) {
+            const float raw = gate[i * warp_size + lane];
+            const float sigmoid = fm_div(1.0f, fm_add(1.0f, __expf(-raw)));
+            q8_1_store_fm(reg[i] * sigmoid, packed, r * el_w + i, lane);
+        }
+    } else {
+        float* row_dst = dst + r * N;
+#pragma unroll
+        for (int i = 0; i < el_w; ++i) row_dst[i * warp_size + lane] = reg[i];
+    }
 }
 
 // One 32-value group in one warp (lane = element), ggml's q4_0: d = (the value of largest |x|) / -8,
@@ -182,13 +197,50 @@ void need_256(const QsaShapes& s, const char* what) {
 
 }  // namespace
 
-void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
+namespace {
+template <bool PackGated, int Width>
+void launch_fwht(const float* src, float* dst, int64_t n_rows, void* stream, const float* gate, void* packed) {
     if (n_rows <= 0) return;
-    const int rows_per_block = 4;
-    const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
-    fwht256_kernel<<<dim3((unsigned) num_blocks), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
-        src, dst, n_rows, 1.0f / 16.0f);
+    constexpr unsigned rows_per_block = 4;
+    constexpr float scale = Width == 64 ? 0.125f : Width == 128 ? 0x1.6a09e6p-4f : 0.0625f;
+    const auto blocks = static_cast<unsigned>((n_rows + rows_per_block - 1) / rows_per_block);
+    fwht256_kernel<PackGated, Width><<<blocks, dim3(32, rows_per_block), 0, static_cast<cudaStream_t>(stream)>>>(
+        src, dst, n_rows, scale, gate, static_cast<Q81Fm*>(packed));
     check("fwht256 launch");
+}
+
+template <bool PackGated>
+void launch_value_fwht(const float* src, float* dst, int64_t n_rows, void* stream,
+                       const float* gate, void* packed, int width) {
+    switch (width) {
+    case 64: launch_fwht<PackGated, 64>(src, dst, n_rows, stream, gate, packed); return;
+    case 128: launch_fwht<PackGated, 128>(src, dst, n_rows, stream, gate, packed); return;
+    case 256: launch_fwht<PackGated, 256>(src, dst, n_rows, stream, gate, packed); return;
+    }
+    throw std::invalid_argument("unsupported KV value rotation width");
+}
+}  // namespace
+
+int kv_value_rotation_width(bool rotated_int8) {
+    if (!rotated_int8) return 256;
+    static const int width = [] {
+        const double requested = basalt::core::exp_flag("int8_kv_v_rot_width", 256);
+        if (requested == 64 || requested == 128 || requested == 256) return static_cast<int>(requested);
+        throw std::invalid_argument("int8_kv_v_rot_width must be 64, 128 or 256");
+    }();
+    return width;
+}
+
+void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
+    launch_fwht<false, 256>(src, dst, n_rows, stream, nullptr, nullptr);
+}
+
+void fwht_value_inplace_cuda(float* data, int64_t n_rows, void* stream, int width) {
+    launch_value_fwht<false>(data, data, n_rows, stream, nullptr, nullptr, width);
+}
+
+void fwht256_gate_q8_cuda(const float* src, const float* q_full, void* packed, int64_t n_rows, void* stream, int width) {
+    launch_value_fwht<true>(src, nullptr, n_rows, stream, q_full, packed, width);
 }
 
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,

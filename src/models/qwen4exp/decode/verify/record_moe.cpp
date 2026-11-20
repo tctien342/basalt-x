@@ -1,3 +1,6 @@
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
+#include "basalt/core/diag.hpp"
 #include "common.hpp"
 #include "record.hpp"
 #include "expert_plan.hpp"
@@ -27,7 +30,8 @@ bool Verifier::WindowRecorder::post(int64_t l) {
     using namespace basalt::kernels;
     const int n = T;
     const uint32_t ring = (uint32_t) (l - v_.lb_ + 1);
-    const int64_t cap = (int64_t) n * K, capx = (int64_t) v_.max_t_ * K;
+    const int64_t K = v_.layer_k(l);
+    const int64_t cap = (int64_t) n * K, capx = (int64_t) v_.max_t_ * v_.routed_k_;
     int32_t* pl = v_.plan_;
     const int32_t* p_counts = pl;
     const int32_t* p_start = pl + 4;
@@ -101,6 +105,16 @@ bool Verifier::WindowRecorder::post(int64_t l) {
             cudaEventRecord(v_.lz_join_, v_.lz_s_);
             lz_open = true;
         }
+        const auto add_lora = [&](const int32_t* count, const int32_t* dst) {
+            if (const auto* adapter = v_.lora_) {
+                const auto name = LayerView(wt, l).name("ffn_down_exps.weight");
+                PdlScope wait_for_down(false);
+                atomic_lora_grouped_down(v_.hit_scratch_, count, dst, v_.ids_, (int) cap,
+                    (int) L.n_ff, (int) L.n_embd, adapter->input_factor(name), adapter->output_factor(),
+                    v_.batch_rec_ ? v_.m_adapter_scale_ : adapter->scale(), parts_out, cs,
+                    v_.batch_rec_ ? (int) K : 0);
+            }
+        };
         if (glue_on) {
             DmGlueArgs ga;
             ga.ids = v_.ids_; ga.ptab = v_.dm_->ptab0 + l * g.n_expert;
@@ -113,7 +127,8 @@ bool Verifier::WindowRecorder::post(int64_t l) {
                 ga.landed_stop = v_.dm_->m_w + 60;
             }
             dec_moe_glue(L, ga, v_.hit_scratch_, parts_out, (int) cap, cs);
-        } else if (v_.dm_->vram >= 0) {
+            add_lora(P->counts + 1, P->dst);
+        } else if (v_.dm_->vram >= 0 && !v_.lora_) {
             v_.landed_glue_ = false;
             dec_moe_vram(L, P, v_.nat_xq_, v_.dm_->vscr, parts_out, v_.dm_->vsync, cs, v_.dm_->vram,
                          (int) cap);
@@ -121,12 +136,20 @@ bool Verifier::WindowRecorder::post(int64_t l) {
             v_.landed_glue_ = false;
             native_expert_grouped(L, P->ptr, P->start, P->counts, P->dst, P->tok, cap, cap,
                                   v_.nat_xq_, v_.hit_scratch_, parts_out, cs);
+            add_lora(P->counts + 1, P->dst);
         }
-        if (v_.dm_->stage_src != nullptr && v_.batch_rec_) {   // the staged share, once its copy is in staging
+        if (v_.dm_->stage_src != nullptr && v_.batch_rec_ && (!v_.dm_->stage_tune || v_.batch_pcie_active_)) {
+            if (v_.batch_pcie_timing_) gpu_stamp(v_.dm_->m_stage_timing, (int) l * DmPcieTimingWords + DmPcieLocal, cs);
             cudaStreamWaitEvent(cs, v_.dm_->st_join, 0);
             PdlScope pst(false);
+            const int stat = kDmStatStage + kDmStageStatPerLayer * (int) l;
+            auto* stats = l < kDmStatLayers ? v_.dm_->wstat : nullptr;
+            if (stats != nullptr) gpu_stamp(stats, stat + 2, cs);
             native_expert_grouped(L, P->sptr, P->sstart, P->scounts, P->sdst, P->stok, cap, cap, v_.nat_xq_,
                                   v_.hit_scratch_, parts_out, cs, kPcieGroupRows);
+            if (v_.dm_->stage_tune) add_lora(P->scounts + 1, P->sdst);
+            if (stats != nullptr) gpu_stamp(stats, stat + 3, cs);
+            if (v_.batch_pcie_timing_) gpu_stamp(v_.dm_->m_stage_timing, (int) l * DmPcieTimingWords + DmPcieGrouped, cs);
         }
         stamp(l, 20);
         stamp(l, 21);
@@ -182,15 +205,20 @@ bool Verifier::WindowRecorder::post(int64_t l) {
         // --wait-stats it also waits for the CPU pool's word itself, with no wait launch before it.
         const bool dm_tag = v_.dm_->tags || (v_.dm_->tag && (v_.dm_->wstat == nullptr || !v_.dm_->xp.empty()));
         const volatile uint32_t* tag_done = !dm_tag ? nullptr : v_.dm_->xp.empty() ? v_.dm_->m_w + 16 : v_.dm_->m_w + 60;
+        auto* pcie_timing = v_.batch_rec_ && v_.batch_pcie_timing_
+            ? v_.dm_->m_stage_timing + l * DmPcieTimingWords : nullptr;
         if (!v_.dm_->tags) {
             PdlScope pw(false);
-            dec_moe_wait(v_.dm_->plan, v_.dm_->m_w + 16, v_.m_flag_, ring, cs, v_.dm_->wstat, (int) l, true, dm_tag);
+            dec_moe_wait(v_.dm_->plan, v_.dm_->m_w + 16, v_.m_flag_, ring, cs, v_.dm_->wstat, (int) l, true,
+                         dm_tag, pcie_timing);
         }   // true: the combine is the wait's programmatic dependent
         stamp(l, 23);
         try {
             dec_moe_combine(v_.parts_, v_.dm_->m_rows, v_.m_ymiss_, v_.dm_->plan, v_.w_, v_.shared_, v_.bo_, N, K, n, nullptr, nullptr,
                             ring, cs, !v_.dm_->tags, tag_done, v_.dm_->tags ? v_.m_flag_ : nullptr, v_.dm_->cseen,
-                            sh_read ? v_.sh_g_ : nullptr);
+                            sh_read ? v_.sh_g_ : nullptr,
+                            v_.dm_->peer_device_rows && basalt::core::exp_flag("decode_peer_fp16") != 0,
+                            v_.dm_->tags ? pcie_timing : nullptr);
         } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
     } else if (n > 1) {   // one launch for the window's rows
         try {

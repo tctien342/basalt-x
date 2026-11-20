@@ -23,6 +23,8 @@ add_library(model_qwen4exp_kernels STATIC
   src/models/qwen4exp/kernels/native_gdn.cu
   src/models/qwen4exp/kernels/native_gr_postops.cu
   src/models/qwen4exp/kernels/native_router.cu
+  src/models/qwen4exp/kernels/atomic_lora.cu
+  src/models/qwen4exp/kernels/swift_lora.cu
   src/models/qwen4exp/kernels/native_gdn_preprocess.cu
   src/models/qwen4exp/kernels/native_qsa.cu
   src/models/qwen4exp/kernels/native_rope.cu
@@ -58,6 +60,7 @@ add_library(model_qwen4exp_engine STATIC src/models/qwen4exp/decode/layer.cpp sr
   src/models/qwen4exp/decode/kv_arena.cpp
   src/models/qwen4exp/decode/layout.cpp
   src/models/qwen4exp/decode/native_head.cpp
+  src/models/qwen4exp/decode/dflash2.cu
   src/models/qwen4exp/decode/native_dense.cpp
   src/models/qwen4exp/decode/verify/batch_capture.cpp
   src/models/qwen4exp/decode/verify/batch_execution.cpp

@@ -35,17 +35,18 @@ import signal
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from serve.api.grammar import REQUEST_KEY as GRAMMAR_KEY, engine_key as grammar_key
 from serve.api.logit_bias import REQUEST_KEY as BIAS_KEY, engine_key as bias_key
 from serve.api.logprobs import REQUEST_KEY as LOGPROBS_KEY, engine_key as logprobs_key, parse_line as logprob_line, \
     token as logprob_token
-from serve.engine import lifeline, suspend
+from serve.engine import lifeline, overlap_hint, overlap_learning, suspend
 from serve.engine.flags import flag_value
 from serve.engine.errors import EngineDied, EngineError, EngineSilent, EngineStartError, EngineStuck, split_err
 from serve.engine.slots import AdmissionQueue
-from serve.prompt import PromptText
+from serve.prompt import CTX_SLACK, PromptText, overflow_error
 from serve.util.console import tagged
 from serve.engine.progress import narrate_start, server_line, start_errors, start_failure_hint, start_last_line
 
@@ -113,8 +114,8 @@ def relay_auto_flags(line: str) -> bool:
 
 # First words of the stdout lines the server reads (or knowingly ignores); any other line is the engine talking to
 # its log, such as a device-side trap message.
-PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR",
-                  "BADM ", "BT ", "BP ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
+PROTOCOL_LINES = (AUTO_FLAGS, "INFO ", "CONV ", "READY", "T ", "P ", "PP ", "PL ", "PT ", "RESUME ", "REUSED ", "DONE", "ERR", "BGROWN ",
+                  "BADM ", "BT ", "BP ", "BPF ", "BDONE ", "YIELDED ", "VRAM ", "ENC ", "VIDEO ")
 
 
 def log_unparsed(line: str, log) -> None:
@@ -238,6 +239,14 @@ class ProcessEngine:
             self.slot_cv = threading.Condition()
         if "sleep_lock" not in self.__dict__:            # sleep, wake and close never overlap, across restarts too
             self.sleep_lock = threading.RLock()
+        if "wlock" not in self.__dict__:
+            self.wlock = threading.Lock()               # serializes whole native request frames
+        if "overlap_hint_lock" not in self.__dict__:
+            self.overlap_hint_lock = threading.Lock()
+            self.overlap_hint_rejected = None
+        if "image_reply_lock" not in self.__dict__:
+            self.image_reply_lock = threading.Lock()
+            self.image_replies = {}
         self.ended, self.unloaded = True, True
         if "loading" not in self.__dict__:               # restart() holds these across its __init__ calls
             self.loading, self.load_status = False, {}
@@ -260,6 +269,13 @@ class ProcessEngine:
             self.info["version"] = None
         if lazy:
             return
+        effective_env, self.overlap_hint = overlap_hint.load(engine_bin, args, cwd, env)
+        with self.overlap_hint_lock:
+            if self.overlap_hint and self.overlap_hint == self.overlap_hint_rejected:
+                effective_env.pop("BASALT_NATIVE_OVERLAP_HINT")
+                self.overlap_hint = None
+        effective_env, self.overlap_learning = overlap_learning.load(
+            engine_bin, args, cwd, effective_env, getattr(self, "overlap_learning", None))
         self.unloaded = False            # `ended` stays True until READY
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: stops the narrator
@@ -276,7 +292,7 @@ class ProcessEngine:
         try:
             self.proc = lifeline.popen([engine_bin, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE if sink else self.log,
-                                       text=True, encoding="utf-8", errors="replace", bufsize=1, env=env)
+                                       text=True, encoding="utf-8", errors="replace", bufsize=1, env=effective_env)
         except OSError as e:                            # missing or not executable: nothing started, so this is a start error
             loading.set()                               # the narrator stops and the log handle goes back
             if log:
@@ -352,6 +368,9 @@ class ProcessEngine:
         self.slot_order = list(range(self.batch))
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
         self.slot_busy = [False] * self.batch
+        self.slot_kv_pages = [0] * self.batch
+        self.slot_kv_full = [None] * self.batch
+        self.slot_adapters = [0] * self.batch
         # tokens each slot holds (for prefix reuse by a conversation's next turn) and when it was last used
         self.slot_held: list[list[int]] = [[] for _ in range(self.batch)]
         self.slot_used = [0.0] * self.batch
@@ -362,16 +381,43 @@ class ProcessEngine:
         # admission state outlives engine processes: restart() re-runs this while requests wait on it
         if "ctl" not in self.__dict__:
             self.waiting = 0                            # requests waiting for ctl
-            self.wait_lens: list[list[int]] = []        # their prompt lengths
+            self.wait_lens: list[tuple[int, float]] = []  # prompt length and enqueue time
             self.ctl_epoch = 0                          # times ctl was taken
             self.ctl = threading.Lock()                 # one admission or solo request at a time
             self.admission = AdmissionQueue()           # requests waiting for a free slot
         self.gen = self.__dict__.get("gen", 0) + 1      # which engine process this is
         self._yielded = None                            # (slot, tokens read) of a read that gave way
         self._ctl_erred = False                         # the control lines ended on an ERR
-        self.wlock = threading.Lock()                   # serializes stdin writes
+        self._frozen_shared_kv = [(0, 0)]                # process-local mailbox for (pages, cache key)
+        self.scheduler_stats = None
         self.pump = threading.Thread(target=self._pump, daemon=True)
         self.pump.start()
+        if self.info.get("scheduler_queue") == 1:
+            threading.Thread(target=self._publish_scheduler_queue, args=(proc,), daemon=True).start()
+
+    def _publish_scheduler_queue(self, proc):
+        last = None
+        published = 0.0
+        while proc is self.proc and not self.ended and proc.poll() is None:
+            with self.slot_cv:
+                now = time.monotonic()
+                waiters = self.admission.waiters
+                oldest = min(
+                    min((started for _, started in self.wait_lens), default=now),
+                    waiters[0].enqueued if waiters else now,
+                )
+                total = self.info.get("shared_kv_pages", 0)
+                free = max(0, total - sum(self.slot_kv_pages)) if total else -1
+                current = (self.waiting, len(waiters), sum(w.parked for w in waiters),
+                           int((now - oldest) * 1000), free)
+            if current != last or now - published >= 2.0:
+                try:
+                    self._send("SCHEDQ " + " ".join(map(str, current)), proc=proc)
+                except EngineDied:
+                    return
+                last = current
+                published = now
+            time.sleep(1)
 
     def _note_load(self, status: dict) -> None:
         self.load_status = status
@@ -397,19 +443,61 @@ class ProcessEngine:
     def _pump(self):
         proc, lines, log = self.proc, self.lines, self.log   # a restart replaces all three
         slot_q = self.slot_q
+        frozen_kv = self._frozen_shared_kv
+        learner = self.overlap_learning
+        last_episode = 0
         line = None
         for line in proc.stdout:
             line = engine_line(line)
+            if line.startswith("SCHEDLEARN "):
+                if learner and self.proc is proc:
+                    fields = line.split()
+                    if (len(fields) == 5 and fields[1] in ("win", "drop") and fields[2].isascii()
+                        and fields[2].isdigit() and len(fields[2]) <= 10 and fields[4].isascii()
+                        and fields[4].isdigit() and len(fields[4]) <= 5):
+                        episode = int(fields[2])
+                        if episode > last_episode:
+                            last_episode = episode
+                            learner.observe(fields[3], int(fields[4]), fields[1] == "win")
+                continue
+            if line.startswith("SCHEDHINTDROP "):
+                with self.overlap_hint_lock:
+                    hint = self.overlap_hint
+                    if self.proc is not proc or not hint or line.split() != ["SCHEDHINTDROP", hint[1]["scope"]]:
+                        continue
+                    if hint == self.overlap_hint_rejected:
+                        continue
+                    self.overlap_hint_rejected = hint
+                threading.Thread(target=overlap_hint.revoke, args=hint, daemon=True).start()
+                continue
+            if line.startswith("SCHEDSTAT "):           # scheduler telemetry is outside replies and the text log
+                if self.proc is proc:
+                    self.scheduler_stats = {**info_facts(line), "sampled_at": time.time()}
+                continue
             log_unparsed(line, log)
             if line.startswith(AUTO_FLAGS):             # printed once, before READY; never a reply line
                 continue
             if line.startswith("INFO "):                # a fact the engine updates as it runs; never a reply line
                 if self.proc is proc:
-                    self.info.update(info_facts(line))
+                    facts = info_facts(line)
+                    pages = facts.pop("frozen_shared_kv_pages", None)
+                    cache = facts.pop("frozen_shared_kv_cache", None)
+                    if isinstance(pages, int) and pages >= 0 and isinstance(cache, int) and 0 <= cache < 8:
+                        # BGROW can wait for its reply with slot_cv held.
+                        frozen_kv[0] = (pages, cache)
+                    self.info.update(facts)
                 continue
             if line.startswith("CONV "):                # the conversation cache's figures; never a reply line
                 if self.proc is proc:
                     self.conversation = {**self.conversation, **conversation_facts(line)}
+                continue
+            if line.startswith("ENCA "):
+                parts = line.rstrip().split(" ", 2)
+                if len(parts) == 3:
+                    with self.image_reply_lock:
+                        reply = self.image_replies.get((proc, parts[1]))
+                        if reply is not None:
+                            reply.put(parts[2])
                 continue
             if line.startswith(FATAL_PREFIXES):         # before batch routing
                 if self.proc is proc:
@@ -420,7 +508,7 @@ class ProcessEngine:
                 except OSError:
                     pass
                 break                                   # publish EOF, never the trailing DONE
-            if line.startswith(("BT ", "BP ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
+            if line.startswith(("BT ", "BP ", "BPF ", "BDONE ")) and slot_q:   # a batch slot's own lines (BT <slot> <id> [<id> ..])
                 try:
                     slot_q[int(line.split()[1])].put(line)
                     continue
@@ -434,6 +522,14 @@ class ProcessEngine:
         lines.put(None)
         for q in slot_q:
             q.put(None)
+        with self.image_reply_lock:
+            for (owner, _), reply in self.image_replies.items():
+                if owner is proc:
+                    reply.put(None)
+        on_exit = getattr(self, "on_unexpected_exit", None)
+        if (on_exit is not None and self.proc is proc and not self.starting
+                and getattr(self, "_closing_proc", None) is not proc):
+            on_exit(proc)
 
     def death_note(self) -> str:
         """What is known of why the engine ended: its exit code or signal and its last error line, never a guess."""
@@ -519,6 +615,7 @@ class ProcessEngine:
             self.loading = False
             with self.slot_cv:                   # wake the requests that waited through the restart
                 self.slot_cv.notify_all()
+        info.pop("cold_shared_recovery_min_tokens", None)
         self.info = {**info, **self.info}
 
     def _parse_done(self, line):
@@ -598,8 +695,7 @@ class ProcessEngine:
         """Send a VRAM, SLEEP or WAKE command and read its VRAM line."""
         if not self.alive():
             raise EngineDied("the engine is not running")
-        self.proc.stdin.write(command + "\n")
-        self.proc.stdin.flush()
+        self._send(command)
         what = command.split()[0]
         deadline = time.time() + timeout
         while True:
@@ -626,10 +722,45 @@ class ProcessEngine:
     ENC_TIMEOUT_S = 300.0
 
     def encode_images(self, jobs: list, timeout: float | None = None) -> list[str]:
-        """ENC: the engine's in-process image encoder reads each (image file, output file) of `jobs` and answers one
-        `OK <n> <nx> <ny> <ms>` line per image. Caller holds the service FIFO; with batch slots the control lines are
-        taken here too (a decoding slot pauses for the encode). ValueError carries the engine's refusal."""
+        """Read image files and return one `OK <n> <nx> <ny> <ms>` reply per output file.
+        The legacy encoder takes native control. The independent encoder reports refusals via ValueError."""
+        if self.info.get("vision_overlap"):
+            if self.asleep:
+                raise ValueError("the independent encoder is asleep")
+            return self._encode_async_images(jobs, timeout)
         return self._encode("ENC " + " ".join(f"{img} {out}" for img, out in jobs), len(jobs), "image", timeout)
+
+    def _encode_async_images(self, jobs: list, timeout: float | None) -> list[str]:
+        if not self.alive():
+            raise EngineDied("the engine is not running")
+        proc = self.proc
+        job = uuid.uuid4().hex
+        reply = queue.Queue()
+        for _, out in jobs:
+            Path(out).touch(exist_ok=False)
+        with self.image_reply_lock:
+            self.image_replies[proc, job] = reply
+            if self.proc is not proc or not self.alive():
+                del self.image_replies[proc, job]
+                raise EngineDied("the engine ended before encoding")
+        try:
+            self._send("ENCA " + job + " " + " ".join(f"{img} {out}" for img, out in jobs), proc=proc)
+            deadline = time.monotonic() + (self.ENC_TIMEOUT_S if timeout is None else timeout)
+            result = []
+            for _ in jobs:
+                try:
+                    line = reply.get(timeout=max(0, deadline - time.monotonic()))
+                except queue.Empty:
+                    raise ValueError("the independent encoder timed out") from None
+                if line is None:
+                    raise EngineDied("the engine ended while encoding images")
+                if not line.startswith("OK "):
+                    raise ValueError(line.removeprefix("ERR ").strip())
+                result.append(line)
+            return result
+        finally:
+            with self.image_reply_lock:
+                self.image_replies.pop((proc, job), None)
 
     def encode_video(self, video, out, words: str = "", timeout: float | None = None) -> str:
         """ENCV: the engine's in-process encoder reads the video file and writes one record per group to `out`; its
@@ -676,7 +807,15 @@ class ProcessEngine:
         """The GEN line's sampling keys, each value as sent (the handler refused what is out of range,
         config.checked_sampling); a field left out is not sent.  A temperature of 0 is greedy, as an absent one;
         penalties that change nothing (repetition 1, frequency and presence 0) are not sent."""
-        keys = ""
+        close = sampling.get("_think_close")
+        keys = f" think_close={close}" if isinstance(close, int) else ""
+        if sampling.get("_atomic_lora") is True:
+            keys += " atomic_lora=1"
+        if sampling.get("_swift_lora") is True:
+            keys += " swift_lora=1"
+        profile = sampling.get("_rope_profile")
+        if type(profile) is int and profile in (0, 1):
+            keys += f" rope_profile={profile}"
         t = sampling.get("temperature")
         if _number(t) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
@@ -723,13 +862,42 @@ class ProcessEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
-    def _send(self, text: str):
+    def _send(self, text: str, *, proc=None):
         try:
             with self.wlock:
-                self.proc.stdin.write(text + "\n")
-                self.proc.stdin.flush()
-        except (OSError, AttributeError):                # the pipe is gone
+                target = self.proc if proc is None else proc
+                target.stdin.write(text + "\n")
+                target.stdin.flush()
+        except (OSError, AttributeError, ValueError):    # the pipe is gone
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+
+    def _grow_shared_slot(self, profile: int | None = None) -> int | None:
+        """Grow between native commands while owning both control and the slot condition."""
+        proc, lines, slots, born = self.proc, self.lines, self.slot_busy, self.gen
+        self._send("BGROW" if profile is None else f"BGROW {profile}", proc=proc)
+        try:
+            line = lines.get(timeout=30)
+            slot = int(line.split()[1]) if line and line.startswith("BGROWN ") else -2
+        except (queue.Empty, ValueError, IndexError):
+            slot = -2
+        if self.proc is not proc or self.lines is not lines or self.slot_busy is not slots or self.gen != born:
+            raise EngineDied("engine restarted during shared slot growth")
+        if slot == -1:
+            return None
+        if slot != len(self.slot_q):
+            if proc is not None:
+                proc.terminate()
+            raise EngineDied("invalid shared slot growth reply")
+        self.slot_order.append(slot)
+        self.slot_q.append(queue.Queue())
+        self.slot_busy.append(False)
+        self.slot_kv_pages.append(0)
+        self.slot_kv_full.append(None)
+        self.slot_adapters.append(0)
+        self.slot_held.append([])
+        self.slot_used.append(0.0)
+        self.batch += 1
+        return slot
 
     def _control(self, cancel, on_token, stop_when=None, idle=None, stop_soon=None):
         """Read the control lines of a GEN/BGEN, yielding None as heartbeat and False per token (on_token gets the id).
@@ -798,6 +966,12 @@ class ProcessEngine:
                 f = line.split()
                 if len(f) >= 3 and f[1].lstrip("-").isdigit() and f[2].isdigit():
                     self._yielded = (int(f[1]), int(f[2]))
+            elif self._ctl_mode == "batch" and line.rstrip() in (
+                "ERR shared KV: indexer backing unavailable: the driver has no VRAM for the KV pools",
+                "ERR shared KV: draft backing unavailable: mtp: allocating the slot's draft K/V failed",
+            ):
+                self._ctl_result = ("resource_wait", False)
+                return
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # the engine refused it and is idle: no DONE follows
                 raise request_err(line[4:].strip())
@@ -834,10 +1008,10 @@ class ProcessEngine:
             self._send(f"BSTOP {slot}")
         except EngineDied:
             pass
-        q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # restart() replaces them
+        q, busy, held, pages = self.slot_q[slot], self.slot_busy, self.slot_held, self.slot_kv_pages   # restart() replaces them
         tail = list(stream or [])
 
-        def drain(end):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
+        def drain(end, report_prompt=False):             # "done" (fields) | "gone" (engine ended) | "wait" (not yet)
             while time.monotonic() < end:
                 try:
                     line = q.get(timeout=max(0.01, min(5.0, end - time.monotonic())))
@@ -846,6 +1020,10 @@ class ProcessEngine:
                 if line is None:
                     tail.clear()
                     return "gone", None
+                if line.startswith("BPF "):
+                    if report_prompt:
+                        self._note_batch_prompt(line)
+                    continue
                 if line.startswith("BT "):
                     try:
                         tail.extend(int(x) for x in line.split()[2:])
@@ -854,25 +1032,38 @@ class ProcessEngine:
                 if line.startswith("BDONE "):
                     f = line.split()
                     self._note_bdone(slot, f)
+                    if f[2:4] == ["0", "cancel"]:
+                        tail.clear()
                     return "done", f
             return "wait", None
 
         def free():
             held[slot] = tail[:-1] if stream and tail else []
             with self.slot_cv:
+                pages[slot] = 0
                 busy[slot] = False
                 self.slot_cv.notify_all()
 
-        state, fields = drain(time.monotonic() + wait_s) if wait_s > 0 else ("wait", None)
+        state, fields = drain(time.monotonic() + wait_s, report_prompt=True) if wait_s > 0 else ("wait", None)
         if state != "wait":
             free()
             return fields
 
         def wait():
-            drain(time.monotonic() + 600.0)
+            while drain(time.monotonic() + 600.0)[0] == "wait":
+                if busy is not self.slot_busy or not pages[slot]:
+                    break
             free()
         threading.Thread(target=wait, daemon=True).start()
         return None
+
+    def _note_batch_prompt(self, line: str):
+        _, _, read, reused, elapsed = line.split()
+        if not isinstance(self.last, dict):
+            return
+        prompt_ms = float(elapsed)
+        self.read_ms += max(0.0, prompt_ms - self.last["prompt_ms"])
+        self.last.update(prompt_ms=prompt_ms, prompt_read=int(read), reused=int(reused))
 
     def _note_bdone(self, slot: int, f: list[str]):
         """Keep a slot's draft counts from its BDONE line (optional trailing accepted, offered; None when absent)."""
@@ -945,7 +1136,7 @@ class ProcessEngine:
     def _take_control(self, cancel, plen: int, after_epoch: int | None = None):
         """Wait for the control lines, yielding None heartbeats; False when cancelled. `after_epoch`: let requests
         already waiting go first."""
-        entry = [plen]
+        entry = (plen, time.monotonic())
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -983,14 +1174,24 @@ class ProcessEngine:
     SOLO_AGAIN_MAX = 2      # times a request alone in a slot returns to the solo path
     SOLO_AGAIN_MIN_LEFT = 32  # ... and only with this many tokens still allowed
 
-    def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
+    def _group_prefill_key(self, prompt_size: int, embeddings, cached_prefix: int = 0) -> str:
+        cutoff = self.info.get("grouped_short_prefill", 0)
+        if embeddings or not 0 < prompt_size - cached_prefix <= cutoff:
+            return ""
+        with self.slot_cv:
+            if cached_prefix:
+                return " group_prefill=1" if self.wait_lens else ""
+            return " group_prefill=1" if any(0 < length <= cutoff for length, _ in self.wait_lens) else ""
+
+    def _may_go_solo(self, left: int, times: int, embeddings, *, shared: bool = False) -> bool:
         """Whether a request alone in a slot should go back to the solo path (needs INFO slot_cache=1)."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
                 not (self.info or {}).get("slot_cache") or
                 ((self.info or {}).get("slot0_solo") and not (self.info or {}).get("solo_any_slot"))):
             return False
         with self.slot_cv:
-            return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
+            return sum(self.slot_busy) == 1 and self.waiting == 0 and (
+                not shared or not len(self.admission))
 
     def _shorter_waiting(self, plen: int, free: int = 1) -> bool:
         """A waiting prompt under half this length is worth giving way to, when `free` slots are free (the one it
@@ -1011,6 +1212,64 @@ class ProcessEngine:
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+        pool_pages = int(self.info.get("shared_kv_pages") or 0)
+        page_cells = int(self.info.get("shared_kv_page_cells") or 0)
+        charge = 0
+        if pool_pages:
+            if page_cells <= 0:
+                raise EngineError("invalid shared KV geometry")
+            charge = (len(prompt) + left + CTX_SLACK + page_cells - 1) // page_cells
+            if charge > pool_pages:
+                raise overflow_error(len(prompt), left, pool_pages * page_cells)
+        slot_pages, busy_slots = self.slot_kv_pages, self.slot_busy
+        slot_adapters = self.slot_adapters
+        context_profiles = self.info.get("rope_context_profiles") == 1
+        mixed_adapters = self.info.get("shared_kv_mixed_adapters") == 1 or context_profiles
+        can_grow = bool(pool_pages and self.info.get("shared_kv_grow") == 1)
+        adapter = int((sampling or {}).get("_atomic_lora") is True) + 2 * ((sampling or {}).get("_swift_lora") is True)
+        if context_profiles and (sampling or {}).get("_rope_profile") == 1:
+            adapter += 4  # the slot hint identifies both the LoRA mode and the RoPE profile
+        incremental = bool(pool_pages and os.environ.get("BASALT_SHARED_KV_INCREMENTAL") == "1")
+        # A replay uses Philox at absolute positions. Keep even an implicit seed stable across runs.
+        if incremental and " temperature=" in keys and " seed=" not in keys:
+            keys += f" seed={int.from_bytes(os.urandom(8), 'little')}"
+        # Reusing an image payload on a new native admission needs separate parity coverage.
+        sliceable = incremental and not embeddings
+        shared_solo = bool(pool_pages and self.info.get("solo_any_slot") and
+                           os.environ.get("BASALT_SHARED_SOLO") == "1")
+
+        previous_owners = frozenset()
+        parked = False
+        cold_min = int(self.info.get("cold_shared_recovery_min_tokens") or 0)
+        frozen_kv = self._frozen_shared_kv
+
+        def protected_alternate_pages(free_pages):
+            if not (pool_pages and context_profiles and not embeddings and not out and not busy_slots[0]):
+                return 0
+            pages, key = frozen_kv[0]
+            if pages and (adapter ^ key) == 4 and charge + pages <= free_pages:
+                return pages
+            # A mixed alias can use another lease while slot zero keeps its cached prefix.
+            held = len(self.slot_held[0])
+            if cold_min and held >= cold_min and (adapter ^ slot_adapters[0]) > 4:
+                pages = (held + page_cells - 1) // page_cells
+                if charge + pages <= free_pages:
+                    return pages
+            return 0
+
+        def preserve_cold_source(free_pages):
+            if (not cold_min or not can_grow or not context_profiles or embeddings or out or parked or reserved is not None
+                    or len(busy_slots) != 1 or busy_slots[0] or (slot_adapters[0] ^ adapter) != 4):
+                return False
+            held = len(self.slot_held[0])
+            return held >= cold_min and charge + (held + page_cells - 1) // page_cells <= free_pages
+
+        def full_owners():
+            return frozenset(owner for busy, owner in zip(busy_slots, self.slot_kv_full)
+                             if busy and owner is not None) if incremental else frozenset()
+
+        def stop_waiting():
+            return stop_soon is not None and stop_soon.is_set()
 
         def gen_keys() -> str:      # a run that continues after tokens were generated tells the grammar where the prompt ends
             return keys + (f" gprompt={len(ids)}" if out and " grammar=" in keys else "")
@@ -1033,6 +1292,12 @@ class ProcessEngine:
                     if not ok:
                         return
                     holding, born = True, self.gen
+                if shared_solo and reserved is not None:
+                    if busy_slots is not self.slot_busy:
+                        reserved = None
+                        raise EngineDied("engine restarted during shared solo transition")
+                    if cancel.is_set() or stop_waiting():
+                        return
                 solo_slot = None
                 with self.slot_cv:
                     # With slot 0 as the solo session, a solo run on another slot's state is only possible when the
@@ -1040,15 +1305,36 @@ class ProcessEngine:
                     # would copy its conversation into slot 0 over the one that slot holds) and a lone request is a
                     # batch of one.
                     any_slot = bool(self.info.get("solo_any_slot"))
-                    alone = not any(self.slot_busy) and self.waiting == 0 and (any_slot or not self.info.get("slot0_solo"))
+                    returning = shared_solo and reserved is not None
+                    other_busy = any(busy for i, busy in enumerate(self.slot_busy)
+                                     if not returning or i != reserved)
+                    alone = (not pool_pages or shared_solo) and not other_busy and self.waiting == 0 and (
+                        any_slot or not self.info.get("slot0_solo"))
+                    if shared_solo and len(self.admission):
+                        alone = False
                     if alone and left > 1 and any_slot:
-                        solo_slot = self.pick_slot(prompt, session)   # the slot holding the longest start, else a free one
+                        solo_slot = reserved if returning else self.pick_slot(
+                            prompt, session, adapter if shared_solo else None)
+                        free_pages = pool_pages - sum(slot_pages)
+                        if shared_solo and (solo_slot != 0 or preserve_cold_source(free_pages) or
+                                            ((can_grow or len(busy_slots) > 1) and protected_alternate_pages(free_pages))):
+                            solo_slot = None
                         if solo_slot is None:
                             alone = False
                         else:
+                            if shared_solo:
+                                if slot_adapters[solo_slot] != adapter:
+                                    self.slot_held[solo_slot] = []
+                                slot_adapters[solo_slot] = adapter
+                                slot_pages[solo_slot] = charge
+                                if incremental:
+                                    self.slot_kv_full[solo_slot] = object()
                             self.slot_busy[solo_slot] = True
                             self.claim_slot(solo_slot, session)
                             reserved = solo_slot
+                    if returning and (not alone or left <= 1):
+                        # A waiter or new decoder won while STOP was draining. Keep the original grant in BGEN.
+                        slot, reserved = reserved, None
                 if alone and left > 1:
                     if solo_slot is not None:
                         head = f"SGENI {solo_slot} {left}{gen_keys()} {embeddings}" if embeddings else \
@@ -1071,7 +1357,7 @@ class ProcessEngine:
                             out.append(t)
                             yield t
                         if x is None:                       # heartbeat
-                            if (not yield_sent and not out and not embeddings and yields < self.YIELDS_MAX and
+                            if (not shared_solo and not yield_sent and not out and not embeddings and yields < self.YIELDS_MAX and
                                     self._shorter_waiting(len(prompt), 2 if solo_slot is None else 1)):
                                 if solo_slot is None:
                                     with self.slot_cv:      # slot the partial read will wait in
@@ -1089,11 +1375,20 @@ class ProcessEngine:
                         t = pending.pop(0)
                         out.append(t)
                         yield t
-                    if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
+                    if (shared_solo and reserved is not None and out and not cancel.is_set()
+                            and not (stop_soon is not None and stop_soon.is_set())
+                            and len(out) < int(max_new) and out[-1] not in self.eos_ids()
+                            and (self.last or {}).get("finish") == "cancel"):
+                        slot, reserved = reserved, None
+                        left = int(max_new) - len(out)
+                        self._carry_run(carry, first, last0, False)
+                        prompt = list(ids) + out
+                    elif self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read continues in that slot
                     elif reserved is not None:              # did not give way: release the slot
                         self._solo_kept(solo_slot, prompt, out[run0:])
                         with self.slot_cv:
+                            slot_pages[reserved] = 0
                             self.slot_busy[reserved] = False
                             self.slot_cv.notify_all()
                         reserved = None
@@ -1110,12 +1405,70 @@ class ProcessEngine:
                     if slot is None:
                         # prefer the slot holding this prompt's start, else the longest unused
                         with self.slot_cv:
-                            ticket = self.admission.join()
+                            minimum = ((len(prompt) + min(left, 256) + CTX_SLACK + page_cells - 1) // page_cells
+                                       if sliceable else None)
+                            ticket = self.admission.join(charge, adapter, minimum, previous_owners, parked=parked)
+                            beat = time.monotonic()
                             try:
                                 while True:
-                                    slot = self.pick_slot(prompt, session)
-                                    if slot is not None and self.admission.may_go(ticket, self._resumes(slot, prompt)):
-                                        self.slot_busy[slot] = True
+                                    if cancel.is_set() or (out and stop_waiting()):
+                                        return
+                                    if busy_slots is not self.slot_busy:
+                                        raise EngineDied("engine restarted while waiting for admission")
+                                    slot = self.pick_slot(prompt, session, adapter if pool_pages else None)
+                                    active_adapter = next((slot_adapters[i] for i, pages in enumerate(slot_pages)
+                                                           if pages), None) if pool_pages and not mixed_adapters else None
+                                    free_pages = pool_pages - sum(slot_pages)
+                                    # A full owner can finish without new pages. Once it leaves, existing bounded
+                                    # runs drain and the next fitting waiter must obtain a full reservation.
+                                    owners = full_owners()
+                                    ordinary_slot = slot
+                                    held_pages = protected_alternate_pages(free_pages)
+                                    uses_alternate = False
+                                    if held_pages and self.admission.may_go_shared(
+                                        ticket, free_pages - held_pages, active_adapter,
+                                        charge_bypass=False, full_owners=owners
+                                    ):
+                                        other = self.pick_slot(prompt, session, adapter, skip_zero=True)
+                                        if other is not None or can_grow:
+                                            slot = other
+                                            free_pages -= held_pages
+                                            uses_alternate = True
+                                    keep_source = slot == 0 and preserve_cold_source(free_pages)
+                                    if (slot is None or keep_source) and can_grow and self.admission.may_go_shared(
+                                        ticket, free_pages, active_adapter, charge_bypass=False, full_owners=owners
+                                    ):
+                                        if holding or self.ctl.acquire(blocking=False):
+                                            holding, born = True, self.gen
+                                            grown = self._grow_shared_slot((adapter >> 2) if keep_source else None)
+                                            can_grow = grown is not None
+                                            if grown is not None:
+                                                slot = grown
+                                            elif uses_alternate:
+                                                # The ordinary command can reclaim the source if no alternate fits.
+                                                slot = ordinary_slot
+                                                free_pages += held_pages
+                                            if cancel.is_set():
+                                                slot = None
+                                                return
+                                    if slot is not None and (
+                                        self.admission.may_go_shared(ticket, free_pages, active_adapter,
+                                                                     full_owners=owners)
+                                        if pool_pages else self.admission.may_go(ticket, self._resumes(slot, prompt))
+                                    ):
+                                        if pool_pages and slot_adapters[slot] != adapter:
+                                            self.slot_held[slot] = []
+                                        slot_adapters[slot] = adapter
+                                        grant = charge
+                                        if pool_pages and charge > free_pages:
+                                            # Leave some spare pages for the next fitting request.
+                                            spare = free_pages - ticket.minimum_pages
+                                            grant = min(ticket.minimum_pages + spare // 2,
+                                                        (len(prompt) + 32768 + CTX_SLACK + page_cells - 1) // page_cells)
+                                        slot_pages[slot] = grant
+                                        if incremental:
+                                            self.slot_kv_full[slot] = object() if grant == charge else None
+                                        busy_slots[slot] = True
                                         self.claim_slot(slot, session)
                                         break
                                     slot = None
@@ -1125,7 +1478,15 @@ class ProcessEngine:
                                         self.ctl.release()
                                         holding = False
                                         self.slot_cv.notify_all()
-                                    self.slot_cv.wait(timeout=10.0)
+                                    self.slot_cv.wait(timeout=0.5 if can_grow or parked else 10.0)
+                                    if parked and time.monotonic() - beat >= 10.0:
+                                        # Keep the API stream alive while parked, with neither lock held.
+                                        beat = time.monotonic()
+                                        self.slot_cv.release()
+                                        try:
+                                            yield None
+                                        finally:
+                                            self.slot_cv.acquire()
                                     if cancel.is_set():
                                         return
                             finally:
@@ -1136,6 +1497,8 @@ class ProcessEngine:
                         if not ok:
                             return
                         holding, born = True, self.gen
+                    if parked and (cancel.is_set() or stop_waiting()):
+                        return
                     if self._yielded is not None:           # gave way: waiting requests go first
                         self.slot_held[slot] = list(prompt[:self._yielded[1]])
                         self._yielded = None
@@ -1148,10 +1511,21 @@ class ProcessEngine:
                         if not ok:
                             return
                         holding, born = True, self.gen
-                    left = max(1, min(left, self.max_context - len(prompt) - SLOT_MARGIN))   # the slot's room
+                    left = max(1, min(left, (sampling or {}).get("_context_limit", self.max_context) - len(prompt) - SLOT_MARGIN))   # the slot's room
+                    run_limit = left
+                    if sliceable and slot_pages[slot] < charge:
+                        run_limit = min(left, slot_pages[slot] * page_cells - len(prompt) - CTX_SLACK)
                     while not self.slot_q[slot].empty():
                         self.slot_q[slot].get_nowait()
-                    head = f"BGENI {slot} {left}{gen_keys()} {embeddings}" if embeddings else f"BGEN {slot} {left}{gen_keys()}"
+                    if embeddings:
+                        head = f"BGENI {slot} {run_limit}{gen_keys()} {embeddings}"
+                    else:
+                        cutoff = self.info.get("grouped_short_prefill", 0)
+                        cached_prefix = len(self.slot_held[slot])
+                        if len(prompt) - cached_prefix > cutoff or not self._resumes(slot, prompt):
+                            cached_prefix = 0
+                        group_prefill = self._group_prefill_key(len(prompt), embeddings, cached_prefix)
+                        head = f"BGEN {slot} {run_limit}{gen_keys()}{group_prefill}"
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # admission overwrites the slot
                     phase = "admit"
@@ -1161,7 +1535,7 @@ class ProcessEngine:
 
                     def ask_yield():    # a shorter request waits: the read gives way at its next chunk boundary
                         nonlocal asked
-                        if (not asked and not embeddings and yields < self.YIELDS_MAX and
+                        if (not pool_pages and not asked and not embeddings and yields < self.YIELDS_MAX and
                                 self._shorter_waiting(len(prompt))):
                             self._send(f"BYIELD {slot}")
                             asked = True
@@ -1176,6 +1550,31 @@ class ProcessEngine:
                     self._note_first_reused(first, last0)
                     cont = bool(self._ctl_result and self._ctl_result[1])
                     phase = "slot" if cont else "none"
+                    if self._ctl_result == ("resource_wait", False):
+                        with self.slot_cv:
+                            active = {i: self.slot_used[i] for i, busy in enumerate(busy_slots) if busy and i != slot}
+                            slot_pages[slot] = 0
+                            busy_slots[slot] = False
+                            slot = None
+                            self.ctl.release()
+                            holding = False
+                            self.slot_cv.notify_all()
+                        if not active:
+                            raise EngineError("shared KV: insufficient VRAM for the request's backing")
+                        beat = time.monotonic()
+                        while True:
+                            with self.slot_cv:
+                                if cancel.is_set() or (parked and stop_waiting()):
+                                    return
+                                if busy_slots is not self.slot_busy or not self.alive():
+                                    raise EngineDied("engine stopped while waiting for shared KV backing")
+                                if any(not busy_slots[i] or self.slot_used[i] != at for i, at in active.items()):
+                                    break
+                                self.slot_cv.wait(timeout=0.5)
+                            if parked and time.monotonic() - beat >= 10.0:
+                                beat = time.monotonic()
+                                yield None
+                        continue
                     while pending:
                         t = pending.pop(0)
                         out.append(t)
@@ -1183,11 +1582,12 @@ class ProcessEngine:
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: retry after the shorter request
                     break
+                # BADM is shared control state. Another admission may replace it once ctl is released.
+                notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
                 self.ctl.release()
                 holding = False
                 if not cont:
                     return
-                notok = bool(self._ctl_result and len(self._ctl_result) > 2 and self._ctl_result[2])
                 gen0 = len(out) if notok else len(out) - 1  # the admission's token, if any; the slot feeds it first
                 going_solo = False
                 slot_lp: list = []                       # BP lines waiting for their BT line
@@ -1206,6 +1606,9 @@ class ProcessEngine:
                     if line is None:
                         phase = "none"
                         raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    if line.startswith("BPF "):
+                        self._note_batch_prompt(line)
+                        continue
                     if line.startswith("BP "):                  # a kept pick's logprobs, ahead of its BT line
                         slot_lp.append(logprob_line(line.split()[2:]))
                         continue
@@ -1221,8 +1624,11 @@ class ProcessEngine:
                                     stop_sent = True
                                 continue
                             yield t
-                        if not going_solo and not stop_sent and not cancel.is_set() and \
-                                self._may_go_solo(int(max_new) - len(out), solo_again, embeddings):
+                        # Only slot zero has native shared SGEN settlement. A partial grant keeps slicing.
+                        shared_return = shared_solo and slot == 0 and slot_pages[slot] == charge
+                        if (not pool_pages or shared_return) and not going_solo and not stop_sent and \
+                                not cancel.is_set() and not stop_waiting() and self._may_go_solo(
+                                    int(max_new) - len(out), solo_again, embeddings, shared=shared_return):
                             self._send(f"BSTOP {slot}")         # alone now: continue solo
                             going_solo = True
                     elif line.startswith("BDONE "):
@@ -1235,16 +1641,26 @@ class ProcessEngine:
                         again = (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                  and not (out and out[-1] in self.eos_ids())
                                  and not (stop_soon is not None and stop_soon.is_set()))
-                        self._carry_run(carry, first, last0, not again)
-                        if again:
-                            # continue on the solo path
+                        sliced = (run_limit < left and f[3:4] == ["length"] and int(f[2]) == run_limit
+                                  and not stop_sent and not cancel.is_set() and not stop_waiting())
+                        self._carry_run(carry, first, last0, not (again or sliced))
+                        if again or sliced:
                             self.slot_used[slot] = time.time()
                             with self.slot_cv:
-                                self.slot_busy[slot] = False
-                                self.slot_cv.notify_all()
+                                if again and shared_solo:
+                                    # Keep the shared page charge and slot ownership until SGEN or BGEN takes over.
+                                    reserved = slot
+                                    solo_slot = None
+                                else:
+                                    if sliced:
+                                        parked = True
+                                        previous_owners = full_owners()
+                                    slot_pages[slot] = 0
+                                    self.slot_busy[slot] = False
+                                    self.slot_cv.notify_all()
                             slot, gen0 = None, None
                             prompt, left = list(ids) + out, int(max_new) - len(out)
-                            solo_again += 1
+                            solo_again += int(again)
                             break
                         return
         finally:
@@ -1269,12 +1685,14 @@ class ProcessEngine:
             if holding:
                 self.ctl.release()
             if reserved is not None:
-                if reserved == solo_slot:
-                    self._solo_kept(solo_slot, prompt, out[run0:])
                 with self.slot_cv:
-                    self.slot_busy[reserved] = False
-                    self.slot_cv.notify_all()
-            if slot is not None:
+                    if busy_slots is self.slot_busy:
+                        if reserved == solo_slot:
+                            self._solo_kept(solo_slot, prompt, out[run0:])
+                        slot_pages[reserved] = 0
+                        busy_slots[reserved] = False
+                        self.slot_cv.notify_all()
+            if slot is not None and busy_slots is self.slot_busy:
                 self.slot_used[slot] = time.time()
                 if phase == "slot":
                     self.slot_held[slot] = []
@@ -1290,7 +1708,8 @@ class ProcessEngine:
                         carry[:] = [0, 0]
                 else:
                     with self.slot_cv:
-                        self.slot_busy[slot] = False
+                        slot_pages[slot] = 0
+                        busy_slots[slot] = False
                         self.slot_cv.notify_all()
 
     def _solo_kept(self, slot, prompt: list[int], gen: list[int]) -> None:
@@ -1310,25 +1729,57 @@ class ProcessEngine:
         with self.slot_cv:
             return self.waiting + len(self.admission)
 
-    def pick_slot(self, prompt: list[int], session: str | None = None) -> int | None:
+    def pick_slot(self, prompt: list[int], session: str | None = None,
+                  adapter: int | None = None, *, skip_zero: bool = False) -> int | None:
         """A free slot for `prompt` (caller holds slot_cv): this session's own slot first (a conversation stays
-        where its K/V sits), then the longest held prefix, else an empty one, then the least recently used; None
-        when none is free.  A slot owned by another session is taken only when no unowned one is free: the owner
-        lost its conversation either way, and the least recently used goes first.  Read-only: `claim_slot` records
-        the choice."""
-        free = [b for b in self.slot_order if not self.slot_busy[b]]
+        where its K/V sits), then the longest held prefix. With shared KV, a cold assignment prefers the smallest
+        held prefix, with recency as the tie-breaker. Other modes prefer an empty slot, then least recently used.
+        A long compatible shared prefix in slot zero can match without its session key.
+        Returns None when none is free.
+        Read-only: `claim_slot` records the choice."""
+        free = [b for b in self.slot_order if not self.slot_busy[b] and (b != 0 or not skip_zero)]
         if not free:
             return None
         own = self.session_slot.get(session) if session is not None else None
-        if own is not None and own in free:
+        if own is not None and own in free and (adapter is None or self.slot_adapters[own] == adapter):
             return own
 
         def held_prefix(b):
+            if adapter is not None and self.slot_adapters[b] != adapter:
+                return 0
             h = self.slot_held[b]
-            return len(h) if h and len(h) < len(prompt) and prompt[:len(h)] == h else 0
+            if h and len(h) < len(prompt) and prompt[:len(h)] == h:
+                return len(h)
+            if adapter is None:
+                return 0
+            # Only prefer a partial match when it saves more tokens than it
+            # would discard from the old slot. Common system prompts alone
+            # should not replace a much longer conversation.
+            lo = len(h) // 2 + 1
+            hi = min(len(h), len(prompt) - 1)
+            if lo > hi or h[:lo] != prompt[:lo]:
+                return 0
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if h[:mid] == prompt[:mid]:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return lo
         pool = [b for b in free if b not in self.slot_owner] or free   # slot_owner is keyed by slot
-        best = max(pool, key=held_prefix)
-        return best if held_prefix(best) > 0 else min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
+        prefixes = {b: held_prefix(b) for b in pool}
+        best = max(pool, key=prefixes.__getitem__)
+        if adapter is not None and 0 in free and 0 not in prefixes:
+            threshold = int(self.info.get("cold_shared_recovery_min_tokens") or 0)
+            if threshold and len(self.slot_held[0]) >= threshold:
+                score = held_prefix(0)
+                if score >= threshold and score > prefixes[best]:
+                    return 0
+        if prefixes[best] > 0:
+            return best
+        if adapter is not None:
+            return min(pool, key=lambda b: (len(self.slot_held[b]), self.slot_used[b]))
+        return min(pool, key=lambda b: (bool(self.slot_held[b]), self.slot_used[b]))
 
     def claim_slot(self, slot: int, session: str | None) -> None:
         """Bind `slot` to `session` (caller holds slot_cv), dropping whoever held it and the session's own previous
@@ -1352,10 +1803,19 @@ class ProcessEngine:
         and every token yielded but the last, so a next request that extends them reads only its new tokens."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        fields = sampling or {}
+        profile = fields.get("_rope_profile")
+        ctx = self.max_context
+        if profile is not None:
+            if self.info.get("rope_context_profiles") != 1 or not self.info.get("shared_kv_pages") or not self.batch:
+                raise EngineError("native worker does not support shared RoPE context profiles")
+            ctx = min(ctx, fields["_context_limit"])
         text = ids if isinstance(ids, PromptText) else None
         if text is not None and (getattr(self, "batch", 0) or embeddings or not self.info.get("text_prompt")):
-            ids, max_new = text.resolve(int(max_new), self.max_context)    # this engine takes ids
+            ids, max_new = text.resolve(int(max_new), ctx)    # this engine takes ids
             text = None
+        if profile is not None and len(ids) + max_new + CTX_SLACK > ctx:
+            raise overflow_error(len(ids), max_new, ctx)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings, session, stop_soon)
             return
@@ -1364,16 +1824,17 @@ class ProcessEngine:
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
         try:
-            if text is not None:
-                body = text.text
-                spans = text.byte_spans()
-                plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
-                clip = " clip=1" if text.clip else ""
-                self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
-                                      f"{len(body.encode('utf-8'))}{plain}\n{body}")
-            else:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-            self.proc.stdin.flush()
+            with self.wlock:
+                if text is not None:
+                    body = text.text
+                    spans = text.byte_spans()
+                    plain = " plain=" + ",".join(f"{a}:{b}" for a, b in spans) if spans else ""
+                    clip = " clip=1" if text.clip else ""
+                    self.proc.stdin.write(f"GENT {int(max_new)}{self.sampling_keys(sampling or {})}{clip} "
+                                          f"{len(body.encode('utf-8'))}{plain}\n{body}")
+                else:
+                    self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
+                self.proc.stdin.flush()
         except OSError:                                  # the pipe is gone: the engine died
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
@@ -1390,8 +1851,9 @@ class ProcessEngine:
                     if not self.can_stop:
                         return                            # an engine that cannot stop early: STOP and drain below
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        with self.wlock:
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
                     except OSError:
                         pass
                     soft_sent = True
@@ -1467,8 +1929,9 @@ class ProcessEngine:
             if not done:                                  # consumer left early: STOP and drain to DONE
                 if self.can_stop:
                     try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
+                        with self.wlock:
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
                     except OSError:
                         pass
                 # never wait untimed: this holds the request FIFO. With STOP the whole drain gets the current
@@ -1491,6 +1954,17 @@ class ProcessEngine:
                     if not self.can_stop:
                         heard = time.monotonic()
 
+    def discard_corrupt_output(self, proc, reason):
+        # A stale reply may notice the fault after its worker was replaced.
+        if proc is None or self.proc is not proc or self.ended:
+            return
+        self.silent_note = reason
+        self.ended = True
+        try:
+            proc.kill()  # A suspect worker must not publish its current cache at QUIT.
+        except OSError:
+            pass
+
     def _silent(self, what: str) -> EngineSilent:
         """Kill an engine that lost step with the server so the next request restarts it."""
         self.silent_note = "the engine and the server lost step (engine_silence_s, 0 = wait forever)"
@@ -1507,6 +1981,7 @@ class ProcessEngine:
         """End the engine: QUIT, then terminate, then kill, 20 s each; EngineStuck if it still runs."""
         if self.proc is None:
             return
+        self._closing_proc = self.proc
         with self.sleep_lock:                        # a sleep in progress ends first
             if self.asleep:                          # its GPU state back first: QUIT runs CUDA calls
                 self.asleep = False
@@ -1514,9 +1989,10 @@ class ProcessEngine:
         try:
             if self.proc.poll() is None:
                 try:
-                    self.proc.stdin.write("QUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # the engine must see EOF before shutdown
+                    with self.wlock:
+                        self.proc.stdin.write("QUIT\n")
+                        self.proc.stdin.flush()
+                        self.proc.stdin.close()  # the engine must see EOF before shutdown
                     self.proc.wait(timeout=self.quit_s)
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()

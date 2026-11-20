@@ -138,7 +138,15 @@ struct SplitDrive {
 };
 struct SlotDelete {
     bool own = true;
-    void operator()(basalt::core::SessionState* p) const { if (own) delete p; }
+    void* runtime_arena = nullptr;
+    void operator()(basalt::core::SessionState* p) const {
+        if (runtime_arena) {
+            basalt::core::session_release(*p);
+            delete[] p->qsa_states;
+            cudaFree(runtime_arena);
+        }
+        if (own) delete p;
+    }
 };
 using SlotSession = std::unique_ptr<basalt::core::SessionState, SlotDelete>;
 

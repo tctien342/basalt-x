@@ -1,3 +1,6 @@
+#include "basalt/core/direct_peer.hpp"
+#include "basalt/log.hpp"
+#include <atomic>
 // src/core/staged_copy.cpp - see include/basalt/core/staged_copy.hpp.
 #include "basalt/core/staged_copy.hpp"
 
@@ -89,6 +92,20 @@ bool StagedCopy::copy(void* dst, const void* src, uint64_t bytes, std::string& e
         }
         if (!ok) err = std::string("a staged copy between two cards: ") + cudaGetErrorString(cudaGetLastError());
         return ok;
+    }
+    if (bytes > 0 && direct_peer_enabled(dst_dev_, src_dev_) &&
+        direct_peer_pointer(dst, dst_dev_, src_dev_, (size_t) bytes) &&
+        direct_peer_pointer(src, src_dev_, dst_dev_, (size_t) bytes)) {
+        const OnDevice on(dst_dev_);
+        const cudaError_t copy = cudaMemcpyPeerAsync(dst, dst_dev_, src, src_dev_, (size_t) bytes, dst_stream_);
+        if (copy != cudaSuccess) {
+            err = std::string("direct peer session state: ") + cudaGetErrorString(copy);
+            return false;
+        }
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true)) basalt::log::info("basalt P2P", "session state CUDA%d -> CUDA%d (%llu bytes)",
+                         src_dev_, dst_dev_, (unsigned long long) bytes);
+        return true;
     }
     for (uint64_t at = 0; at < bytes;) {
         const size_t n = (size_t) std::min<uint64_t>(piece_, bytes - at);

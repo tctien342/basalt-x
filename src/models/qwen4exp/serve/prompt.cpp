@@ -50,8 +50,10 @@ bool QfnRuntime::split_region(PromptStage& st, int64_t cells, int64_t chunk, int
     const basalt::core::ExpertCache& pc = st.tier->cache();
     uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
     auto down = [](uint8_t* p) { return (uint8_t*) ((uintptr_t) p & ~(uintptr_t) 255); };
+    // The stage's WeightStore and NativeDense were bound to this address at startup.
     w_at = down(base + pc.bytes() - st.image_bytes);
-    s_at = down(w_at - basalt::core::prompt_session_bytes(g, cells, l0, l1));
+    const auto vision_bytes = vision_stage_bytes(*st.tier);
+    s_at = down(w_at - vision_bytes - basalt::core::prompt_session_bytes(g, cells, l0, l1));
     basalt::core::prompt_session_carve(g, cells, K, s_at, st.ss, l0, l1);
     b_at = down(s_at - basalt::prefill::Prefill::bytes_needed(g, st.ss, chunk));
     // the loan leaves the tier a tenth of its slots, as the main card's
@@ -125,7 +127,8 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     if (runtime_.pf_parts.empty()) return true;                     // its own buffers: nothing to lend
     // the ring depth this read's layout uses; every size computed below (and the layout) follows it, and
     // the full depth is restored on the way out for the sizing done elsewhere
-    const bool beside = runtime_.batch_on() && (tokens > runtime_.kReadAlone || resumed_chunk > 0);
+    const int64_t alone = read_alone_limit();
+    const bool beside = runtime_.batch_on() && (tokens > alone || resumed_chunk > 0);
     basalt::prefill::Prefill::set_ring_depth(beside ? runtime_.kRingDecoding : 1 << 20);
     struct RingReset { ~RingReset() { basalt::prefill::Prefill::set_ring_depth(1 << 20); } } ring_reset;
     // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -136,6 +139,10 @@ bool QfnRequest::lend(int64_t tokens, std::string& e, int64_t chunk, int64_t hea
     // `auto:N` and a fixed N keep the operator's number.  (Chunking changes the GEMM tiles and so the rounding of
     // a prompt's K/V; the answers can differ from another chunking by greedy near-ties.)
     int64_t cap = runtime_.read_cap();
+    if (beside && alone < runtime_.kReadAlone) {
+        // Fit the largest slice the controller may use inside the existing expert-loan budget.
+        cap = std::min(cap, runtime_.o.prefill_auto_fit ? kInterleavedPrefillCap : alone);
+    }
     // Loan limits beside decoding slots: the loan stays within kLendCapDecoding slots (they keep their experts in
     // the cache) and takes only slots whose expert has a RAM copy (a lent slot is refilled from RAM, never read
     // from the file, while the slots decode).  A read that runs alone, on an idle engine or while the slots wait
@@ -268,7 +275,7 @@ bool QfnRequest::park_read(int64_t q, int ys, std::string& ye, int64_t chunk) {
 }
 
 int QfnRuntime::init_prompt() {
-    if ((!no_spec && (o.spec < 2 || o.mtp.empty())) || o.prefill_chunk <= 0 ||
+    if ((!no_spec && (o.spec < 2 || (o.mtp.empty() && !o.no_mtp))) || o.prefill_chunk <= 0 ||
         (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
         basalt::log::error("basalt serve", "needs --spec T (0 for none; T >= 2 also needs the model's draft layer) "
                              "and --prefill CHUNK (and a fillable "
@@ -549,6 +556,12 @@ int QfnRuntime::init_prompt() {
                   std::to_string(kStageFreeMin >> 20) + "; --peer-reserve-mib";
         }
         if (ok) {
+            if (lora_peer && st.dev == peer.device()) {
+                st.sp.bind_lora(lora_peer.get(), lora_main.get());
+                st.sp.set_cpu_lora(lora_host.get(), (active_adapter & 1u) ? atomic_lora_scale : 0.0f);
+                bind_lora_ple(st.ss, lora_peer.get());
+            }
+            if ((active_adapter & 2u) && swift_peer && st.dev == peer.device()) st.sp.bind_swift_lora(swift_peer);
             st.sp.set_ring_remote(host_res.data(), &xcache, 0);
             basalt::log::info("basalt serve", "prompt split: CUDA%d can take layers %lld-%lld of a long prompt (chunks up "
                                  "to %lld tokens, links %.1f/%.1f GB/s); %zu MiB free on it (%zu before)", st.dev,

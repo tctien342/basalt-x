@@ -59,7 +59,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         if (v_.batch_rec_) dec_gdn_rec_seg(ra, v_.segb_, (size_t) gi * gdn_floats, n, n, cs);
         else dec_gdn_rec(ra, n, cs);
     };
-    const bool gdnf_fork = gdnf >= 2 && v_.sh_cs_ != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
+    const bool gdnf_fork = !use_swift && gdnf >= 2 && v_.sh_cs_ != nullptr && v_.ev_fork_ != nullptr && v_.ev_join_ != nullptr;
     auto gdnf_z_side = [&] {
         cudaEventRecord(v_.ev_fork_, cs);
         cudaStreamWaitEvent(v_.sh_cs_, v_.ev_fork_, 0);
@@ -79,12 +79,15 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             kernels::dense_tc_pair(wqkv->native_type, wqkv->native_data, qkv, (int) C,
                                    wg->native_type, wg->native_data, v_.z_, (int) ZV, v_.xq_, (int) N, n, cs);
         }
+        swift_project(v, "attn_qkv.weight", xm, qkv, N, C);
+        swift_project(v, "attn_gate.weight", xm, v_.z_, N, ZV);
         for (int i = 2; i <= 5; ++i) stamp(l, i);
         DecRecArgs ra;
         ra.state = state; ra.qkv = qkv; ra.conv_w = (const float*) wc->data; ra.x = xm;
         ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
         ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
+        if (v_.lora_ || use_swift) ra.y = v_.y_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
         ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
         {
@@ -111,6 +114,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
         ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
+        if (v_.lora_ || use_swift) ra.y = v_.y_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
         cudaStreamWaitEvent(cs, v_.ev_join_, 0);
         for (int i = 3; i <= 5; ++i) stamp(l, i);
@@ -124,6 +128,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
     }
     if (gdnf_fork && gdnf == 3) gdnf_z_side();
     dense_proj(1, wqkv->native_type, wqkv->native_data, v_.xq_, qkv, (int) N, (int) C, n, cs);
+    swift_project(v, "attn_qkv.weight", xm, qkv, N, C);
     stamp(l, 2);
     if (gdnf) {
         DecRecArgs ra;
@@ -131,6 +136,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
         ra.w_alpha = (const uint16_t*) wa->data; ra.w_beta = (const uint16_t*) wb->data;
         ra.dt = (const float*) wdt->data; ra.ssm_a = (const float*) wsa->data; ra.z = v_.z_;
         ra.gamma = (const float*) wnm->data; ra.h = hb; ra.gate = gate; ra.beta = beta; ra.yq = v_.xq_;
+        if (v_.lora_ || use_swift) ra.y = v_.y_;
         ra.C = (int) C; ra.n_embd = (int) N; ra.h_k = (int) HK; ra.h_v = (int) HV; ra.eps = EPS;
         ra.early_trigger = pdl;   // PDL2: the out projection stages its weights
         if (gdnf_fork) {
@@ -145,6 +151,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
             dense_proj(4, wout->native_type, wout->native_data, v_.xq_, v_.bo_, (int) ZV, (int) N, n, cs);
         } else {
             dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
+            swift_project(v, "attn_gate.weight", xm, v_.z_, N, ZV);
             for (int i = 3; i <= 5; ++i) stamp(l, i);
             dec_gdn_rec(ra, n, cs);
             stamp(l, 6);
@@ -164,6 +171,7 @@ bool Verifier::WindowRecorder::gdn(int64_t l, const LayerView& v, bool read_q8, 
                  n, cs);
     stamp(l, 4);
     dense_proj(2, wg->native_type, wg->native_data, v_.xq_, v_.z_, (int) N, (int) ZV, n, cs);
+    swift_project(v, "attn_gate.weight", xm, v_.z_, N, ZV);
     stamp(l, 5);
     // the recurrence from the untouched state over tokens [0, T); outputs only for this group's
     if (v_.batch_rec_) {   // each segment's recurrence from its own slot's state

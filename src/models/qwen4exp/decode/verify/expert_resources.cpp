@@ -1,3 +1,4 @@
+#include "basalt/core/direct_peer.hpp"
 #include "common.hpp"
 #include "expert_plan.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -35,7 +36,7 @@ bool Verifier::dm_init(std::string& err) {
     if (!lay.native) why = "the experts are not a native pack";
     else if (all_resident_) why = "every expert is resident";
     else if (hits_.h_res == nullptr) why = "no host residency table";
-    else if ((int64_t) max_t_ * ss_->k > kDmCap) why = "the window is too large";
+    else if ((int64_t) max_t_ * routed_k_ > kDmCap) why = "the window is too large";
     for (int64_t l = 0; why == nullptr && l < g.n_layers; ++l) {
         const auto& f = lay.fmt[(size_t) l];
         if (!dec_moe_formats_ok(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type)) why = "an expert format the kernels do not cover";
@@ -50,7 +51,7 @@ bool Verifier::dm_init(std::string& err) {
     }
     DecMoe* d = new DecMoe;
     dm_ = d;
-    const int64_t LE = g.n_layers * g.n_expert, N = g.n_embd, T = max_t_, K = ss_->k;
+    const int64_t LE = g.n_layers * g.n_expert, N = g.n_embd, T = max_t_, K = routed_k_;
     d->rings = le_ - lb_;
     d->x_stride = (size_t) (T * N);
     d->xq_stride = (size_t) (T * (N / 32) * 36);
@@ -100,7 +101,7 @@ bool Verifier::dm_init(std::string& err) {
         d->pin = nullptr;
     }
     // the warm-ups' predictors, quantized once: every layer's router in int8 for the peer's, in 4-bit for the CPU pool's
-    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= 16 &&
+    const bool cpu_warm = warm_pool_ != nullptr && warm_src_ != nullptr && K <= kCpuWarmMaxK &&
                           std::all_of(lay.fmt.begin(), lay.fmt.end(), [&](const basalt::kernels::cpu::NativeFmt& f) {
                               return f.bytes == lay.fmt[0].bytes && f.down_off == lay.fmt[0].down_off;
                           });
@@ -113,6 +114,20 @@ bool Verifier::dm_init(std::string& err) {
                           router_codes(*wt_, g, peer_on ? &rq_h : nullptr, peer_on ? &rs_h : nullptr,
                                        cpu_warm ? &rq4_h : nullptr, cpu_warm ? &rs4_h : nullptr);
     const bool router_ok = peer_on && codes_ok;
+    if (peer_on && xpeers_.empty() && direct_peer_enabled(peer_->device(), device_) &&
+        direct_peer_enabled(device_, peer_->device())) {
+        const bool fp16 = basalt::core::exp_flag("decode_peer_fp16") != 0;
+        const size_t bytes = d->rows_words * (fp16 ? sizeof(uint16_t) : sizeof(float));
+        if (cudaMalloc(&d->peer_device_rows, bytes) == cudaSuccess) {
+            d->m_rows = d->peer_device_rows;
+            // The existing done-word path waits for the peer's system fence before local GPU reads.
+            d->tags = false;
+            basalt::log::info("basalt P2P", "decode rows CUDA%d -> CUDA%d (%zu-byte arena, %s)",
+                              peer_->device(), device_, bytes, fp16 ? "FP16" : "FP32");
+        } else {
+            (void) cudaGetLastError();
+        }
+    }
     if (peer_ != nullptr && peer_->valid()) {
         const OnDevice on(peer_->device());
         d->pdev = peer_->device();
@@ -132,7 +147,7 @@ bool Verifier::dm_init(std::string& err) {
              cudaMalloc(&d->pscr, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMemset(d->pscr, 0, dec_moe_peer_scratch_bytes((int) N, (int) lay.fmt[0].n_ff)) == cudaSuccess &&
              cudaMalloc((void**) &d->parr, 64) == cudaSuccess;
-        d->tag = true;
+        d->tag = d->peer_device_rows == nullptr;
         for (size_t i = 0; i < d->rows_words; ++i) ((volatile uint32_t*) d->h_rows)[i] = basalt::kernels::dec_moe_tag_word();
         if (!ok) { err = "verify: device-planned MoE peer buffers"; return false; }
         d->shadow1.assign((size_t) LE, INT32_MIN);
@@ -199,10 +214,18 @@ bool Verifier::dm_init(std::string& err) {
     // is never staged; the addresses are read again before a batch window when the source's places moved (a swap).
     // The count staged for m misses balances the pool's time for the rest against the copy's, both reading host
     // memory at once.
-    bool stage = d->pdev < 0 && d->xp.empty() && lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
-                 warm_src_ != nullptr && staging_ != nullptr && warm_src_->pcie_layer(0) && lay.fmt[0].bytes % 16 == 0;
-    for (int64_t l = 1; stage && l < g.n_layers; ++l) stage = lay.fmt[(size_t) l].bytes == lay.fmt[0].bytes;
-    const int64_t blob = (int64_t) lay.fmt[0].bytes, stride = dec_moe_stage_stride(blob);
+    const bool tune_stage = d->pdev >= 0 && d->xp.empty() &&
+                            basalt::core::exp_flag("adaptive_pcie_fraction") != 0;
+    bool stage = (d->pdev < 0 || tune_stage) && d->xp.empty() &&
+                 lb_ == 0 && le_ == g.n_layers && hand_in_ == nullptr &&
+                 warm_src_ != nullptr && staging_ != nullptr &&
+                 (tune_stage || warm_src_->pcie_layer(0)) && lay.fmt[0].bytes % 16 == 0;
+    for (int64_t l = 1; stage && l < g.n_layers; ++l) {
+        const auto bytes = lay.fmt[(size_t) l].bytes;
+        stage = tune_stage ? bytes % 16 == 0 : bytes == lay.fmt[0].bytes;
+    }
+    const int64_t blob = (int64_t) lay.fmt[0].bytes;
+    const int64_t stride = dec_moe_stage_stride(tune_stage ? (int64_t) lay.max_blob : blob);
     const int stage_slots =
         (int) std::min<int64_t>(kDmStageMax, (int64_t) (kStagingBlobs * (int64_t) lay.max_blob) / stride);
     if (stage && stage_slots >= 1) {
@@ -210,8 +233,9 @@ bool Verifier::dm_init(std::string& err) {
         // the combine's wait for them
         constexpr double kPoolBytesPerUs = 45e3, kLinkBytesPerUs = 18e3, kPoolFixUs = 15.0, kStageFixUs = 35.0;
         const double cpu_us = (double) blob / kPoolBytesPerUs, link_us = (double) blob / kLinkBytesPerUs;
-        std::vector<int32_t> kt((size_t) kDmCap + 1, 0);
-        for (int m = 1; m <= kDmCap; ++m) {
+        const size_t stage_rows = tune_stage ? (size_t) g.n_layers : 1;
+        std::vector<int32_t> kt(stage_rows * (kDmCap + 1), 0);
+        for (int m = 1; !tune_stage && m <= kDmCap; ++m) {
             double best = kPoolFixUs + m * cpu_us;
             for (int k = 1; k <= std::min(m, stage_slots); ++k) {
                 const double t = std::max(kPoolFixUs + (m - k) * cpu_us, kStageFixUs + k * link_us);
@@ -230,11 +254,29 @@ bool Verifier::dm_init(std::string& err) {
                    cudaEventCreateWithFlags(&d->st_join, cudaEventDisableTiming) == cudaSuccess;
         if (!sok) { err = "verify: the staged share's buffers"; return false; }
         std::memset(d->stage_host, 0, (size_t) LE * 8);
+        d->stage_tune = tune_stage;
+        d->stage_cap = stage_slots;
+        if (tune_stage) {
+            for (int64_t l = lb_; l < le_; ++l) d->stage_reference_bytes += lay.blob_bytes(l);
+            d->stage_reference_bytes /= (uint64_t) (le_ - lb_);
+            d->stage_cpu_us.resize(stage_rows);
+            d->stage_cost.resize(stage_rows);
+            d->stage_misses.resize(stage_rows);
+            d->stage_seen.resize((size_t) g.n_expert);
+            d->stage_table = std::move(kt);
+            d->stage_next = d->stage_table;
+            const bool timed_wait = d->peer_device_rows != nullptr && d->wstat == nullptr;
+            if ((d->tags || timed_wait) && !mapped(stage_rows * DmPcieTimingWords * sizeof(unsigned long long),
+                                   (void**) &d->h_stage_timing, (void**) &d->m_stage_timing)) {
+                err = "verify: mapped PCIe timing buffer";
+                return false;
+            }
+        }
         d->stage_gen = warm_src_->places_generation() + 1;   // read at the first batch window
         d->stage_stride = stride;
         d->stage_blocks = 8;
         d->stage_min = 1;
-        while (d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
+        while (!tune_stage && d->stage_min < kDmCap && kt[(size_t) d->stage_min] == 0) ++d->stage_min;
     }
     std::string served;
     if (d->pdev >= 0) {
@@ -280,9 +322,10 @@ void Verifier::dm_free() {
     for (void* p : {(void*) d->res0, (void*) d->res1, (void*) d->plan, (void*) d->ctr, (void*) d->slot_off, d->vscr,
                     (void*) d->vsync, d->xq_pub, (void*) d->wstat,
                     (void*) d->ptab0, (void*) d->pub, (void*) d->cseen, (void*) d->landed,
-                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts})
+                    (void*) d->stage_src, (void*) d->stage_k, (void*) d->route_counts, (void*) d->peer_device_rows})
         if (p) cudaFree(p);
     if (d->stage_host) cudaFreeHost(d->stage_host);
+    if (d->h_stage_timing) cudaFreeHost(d->h_stage_timing);
     if (d->pin) cudaFreeHost(d->pin);
     if (d->landed_pin) cudaFreeHost(d->landed_pin);
     for (void* h : {(void*) d->h_ring, (void*) d->h_x, (void*) d->h_xq, (void*) d->h_w, (void*) d->h_rows})

@@ -78,6 +78,12 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     if (argc >= 2 && std::strcmp(argv[1], "serve") == 0) return serve_subcommand(argc, argv);
+    const bool check_model_flags = argc >= 2 && std::strcmp(argv[1], "--check-model-flags") == 0;
+    if (check_model_flags) {
+        argv[1] = argv[0];  // preserve the program name in the argument view passed to the normal parser
+        ++argv;
+        --argc;
+    }
     // if memory runs out the kernel ends this process first, not the rest of the machine
     basalt::platform::prefer_oom_victim();
     // the CPU expert pool keeps its speed while the window is in the background
@@ -98,6 +104,7 @@ std::optional<int> start(int argc, char** argv, std::unique_ptr<CommonOptions>& 
         o.quality_window = adapter->quality_window();
     }
     if (const auto code = parse_options(argc, argv, o, adapter)) return *code;
+    if (check_model_flags) return 0;
     if (adapter != nullptr) {
         if (o.gpu_plan) o.plan_spec = adapter->planned_spec(o);
         pack_tokens(*adapter, o);

@@ -43,8 +43,9 @@ struct HcFusedArgs {
     float* xn = nullptr;                ///< scratch [T][hc * n_embd]
     const uint16_t* w_router = nullptr; ///< bf16 [512][n_embd], or null (no router)
     float* logits = nullptr;            ///< [T][512]
-    int32_t* ids = nullptr;             ///< [T][10]
-    float* weights = nullptr;           ///< [T][10]
+    int router_k = 10;                  ///< 10 or 23
+    int32_t* ids = nullptr;             ///< [T][router_k]
+    float* weights = nullptr;           ///< [T][router_k]
     /// mixed's q8_1 rows (36-byte blocks, [T][n_embd / 32]), or null: written by the router items, or without a
     /// router by the up slices
     void* xq = nullptr;
@@ -61,7 +62,7 @@ struct HcFusedArgs {
     bool next_early = false;
     /// A read with a router and xq may also count its progress for a kernel that starts before it ends (device, three
     /// words): each router item adds one to pub_ctr[0] once its share of xq is written (hc_fused_pub_arrivals() in
-    /// all), the top-10 adds one to pub_ctr[1] once the ids and weights are, and the last up slice adds one to
+    /// all), the selector adds one to pub_ctr[1] once the ids and weights are, and the last up slice adds one to
     /// pub_ctr[2] once mixed is complete.  Null: no counts.
     unsigned* pub_ctr = nullptr;
     /// 8-bit copies of w_down / w_up / w_inject (int8, one f16 scale per 32 consecutive values of a row); null: found

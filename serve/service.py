@@ -5,18 +5,22 @@ import collections
 import contextlib
 import ctypes
 import inspect
+import os
 import subprocess
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterator
 
 from serve.engine.errors import EngineDied, EngineSilent, EngineStartError, EngineStarting, EngineStuck, GpuBusy, ModelBusy
 from serve.engine.mock import Engine
-from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, unmark_think_literals
+from serve.engine.recovery import OutputLoop, checked_tokens
+from serve.frontend import ChatTemplate, Event, images_of, mark_think_literals, media_of, tool_choice_of, unmark_think_literals
 from serve.util.logbuf import LogBuffer
 from serve.security import LOOPBACK_NAMES
 from serve.models import Dialect, dialect_for
+from serve import mini_batch
 from serve.prompt import CTX_SLACK, PromptText, overflow_error, room_error
 from serve.util.text import Detokenizer, StopMatcher, control_literals, stop_strings
 from serve.engine.image_source import USAGE as IMAGE_USAGE, VIDEO as VIDEO_KIND, ImageRefused, ImageSources
@@ -78,25 +82,62 @@ class Service:
         value = "loading" if self.loading else "loaded" if self.loaded() else "unloaded"
         return {"id": self.model, "object": "model", "status": {"value": value},
                 "asleep": getattr(self.engine, "asleep", False) is True,
-                "meta": {"n_ctx": self.engine.max_context},
+                "meta": {"n_ctx": self.model_context(self.model)},
                 "architecture": {"input_modalities": ["text", "image"] + (["video"] if self.video_on() else [])
                                  if self.vision is not None else ["text"],
                                  "output_modalities": ["text"]}}
 
     def served_names(self) -> list[str]:
         """The model names a request may use: the one /v1/models lists, and the model file's own name."""
-        names = [self.model]
+        names = [self.model, *self.adapted_models]
+        if self.context_profiles:
+            return names
         path = getattr(self.engine, "model_path", None)
         if isinstance(path, str) and path:
             names.append(path.replace("\\", "/").rsplit("/", 1)[-1])
         return names
 
+    def canonical_model(self, name) -> str:
+        return name if isinstance(name, str) and name in self.adapted_models else self.model
+
+    def response_model(self) -> str:
+        return getattr(self.request_ctx, "model", None) or self.model
+
+    def model_context(self, name: str) -> int:
+        if not self.context_profiles:
+            return self.engine.max_context
+        return 524288 if self.adapted_models.get(name, {}).get("_rope_profile") == 1 else 262144
+
+    def _request_context(self) -> int:
+        ctx = self.engine.max_context
+        if ctx <= 0:
+            if getattr(self.engine, "starting", False):
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+            ctx = getattr(self.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        return min(ctx, self.model_context(self.response_model())) if self.context_profiles else ctx
+
     def __init__(self, engine: Engine, tokenizer, template: ChatTemplate, model_name: str = "basalt",
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False, grammar: bool = GRAMMAR_DEFAULT, grammar_engine: bool = True,
-                 dialect: Dialect | None = None, video_max_tokens: int = VIDEO_MAX_TOKENS):
+                 dialect: Dialect | None = None, atomic_lora: bool = False, mini_tools_helper: bool = False, video_max_tokens: int = VIDEO_MAX_TOKENS,
+                 swift_lora: bool = False, context_profiles: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.context_profiles = context_profiles
+        self.adapted_models = {}
+        if swift_lora:
+            self.adapted_models[f"{model_name}-swift"] = {"_swift_lora": True}
+        if atomic_lora:
+            self.adapted_models[f"{model_name}-uncen"] = {"_atomic_lora": True}
+        if context_profiles:
+            for name, adapter in self.adapted_models.copy().items():
+                self.adapted_models[f"{name}-512k"] = {**adapter, "_rope_profile": 1}
+            self.adapted_models[f"{model_name}-512k"] = {"_rope_profile": 1}
+        elif atomic_lora and swift_lora:
+            self.adapted_models[f"{model_name}-uncen-swift"] = {"_atomic_lora": True, "_swift_lora": True}
         self.dialect = dialect or dialect_for(None)      # how this model's prompts and replies are written
+        self.mini_tools_helper = mini_tools_helper and self.dialect.name == "qwen4exp"
         self.literals = self.dialect.literal_tags(control_literals(tokenizer))   # control texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # clamp the output cap instead of a 400
         self.video_max_tokens = video_max_tokens      # one video's merged tokens over all its groups
@@ -105,6 +146,9 @@ class Service:
         self.sampling_defaults = dict(sampling_defaults or {})   # the model file's sampling defaults
         self.fifo = threading.Lock()
         self.stopping = threading.Event()               # set at shutdown: nothing starts the engine again
+        self.self_heal = os.environ.get("BASALT_VRAM_SELF_HEAL") == "1" and hasattr(engine, "discard_corrupt_output")
+        if self.self_heal:
+            engine.on_unexpected_exit = self._recover_after_failure
         self.embeddings = threading.local()           # this request's image embeddings file
         self.api_key = ""                              # when set, /v1/* requires it
         self.image_sources = ImageSources()             # --image-url-host and --image-dir; remote, as is any default
@@ -347,6 +391,24 @@ class Service:
                 ctl.release()
             self.fifo.release()
 
+    def _recovery_ready(self):
+        return self.self_heal and self.engine.info.get("recovery_ram") == 1
+
+    def _recover_after_failure(self, proc):
+        if not self._recovery_ready():
+            return
+
+        def reload():
+            with self.fifo:
+                if self.stopping.is_set() or self.engine.proc is not proc or self.loaded():
+                    return
+                try:
+                    self.ensure_loaded()
+                except (EngineDied, EngineStuck, GpuBusy) as error:
+                    print(f"[server] warning: GPU recovery could not reload the model: {error}", flush=True)
+
+        threading.Thread(target=reload, daemon=True).start()
+
     def _say_died(self, e: Exception) -> None:
         """Print the server-window line for an engine that ended mid-request."""
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
@@ -360,10 +422,19 @@ class Service:
             raise ValueError("response_format json_schema and json_object (structured output) need grammar enabled "
                              "on this server; start it without --no-grammar, or send strict: true")
 
-    def grammar_for(self, tools, tool_choice, raw_tools, response_format) -> dict | None:
+    def configure_mini_tools(self, req, tools, kwargs):
+        enabled = (self.mini_tools_helper and kwargs.get("enable_thinking") is not False
+                   and tool_choice_of(req.get("tool_choice"))[0] == "auto")
+        if enabled and any(tool.get("name") == mini_batch.TOOL_NAME for tool in tools or ()):
+            raise ValueError(f"tool name {mini_batch.TOOL_NAME!r} is reserved by the server")
+        req["_mini_tools_enabled"] = kwargs["_mini_tools_enabled"] = enabled
+
+    def grammar_for(self, tools, tool_choice, raw_tools, response_format, mini_enabled=False) -> dict | None:
         """The engine request's `grammar` value (api.grammar.grammar_spec); None when the engine cannot take it."""
         if not self.grammar_engine:
             return None
+        if mini_enabled:
+            tools = [*(tools or ()), mini_batch.TOOL]
         return grammar_spec(self.grammar, tools, tool_choice, raw_tools, response_format)
 
     def load(self):
@@ -596,13 +667,20 @@ class Service:
                 rates = {id(self.status): list(self.rate)}
             live.sort(key=lambda st: st.get("started") or 0)
             running, waiting = live[:active], live[active:]
-            taken = {st["slot"] for st in running if st.get("slot") is not None and st["slot"] < total}
+            taken = set()
             for st in running:
-                if st.get("slot") is None or st["slot"] >= total:
-                    st["slot"] = next((i for i in range(total) if i not in taken), None)
-                    taken.add(st["slot"])
+                slot = st.get("slot")
+                if slot is None or slot >= total or slot in taken:
+                    st["slot"] = None
+                else:
+                    taken.add(slot)
+            unused = iter(i for i in range(total) if i not in taken)
+            for st in running:
+                if st["slot"] is None:
+                    st["slot"] = next(unused)
             by_slot = {st["slot"]: (dict(st), rates.get(id(st), [])) for st in running}
             queue = [{"api": st.get("api"), "model": st.get("model"), "prompt_tokens": st.get("prompt_tokens"),
+                      "reasoning_effort": st.get("reasoning_effort"), "request_id": st.get("request_id"),
                       "waited_s": round(now - (st.get("started") or now), 1)}
                      for st in waiting + sorted(self.waiting.values(), key=lambda w: w["started"])]
             last = {k: dict(v) for k, v in self.slot_last.items()}
@@ -626,6 +704,9 @@ class Service:
                 done = prompt if decoding else (min(progress[0], prompt) if progress and reading == [i] else None)
                 windows = st.get("windows") or 0
                 row.update(state="decoding" if decoding else "prefill", api=st.get("api"), model=st.get("model"),
+                           n_ctx=self.model_context(st.get("model") or self.model),
+                           reasoning_effort=st.get("reasoning_effort"), request_id=st.get("request_id"),
+                           path=st.get("path"), started_at=st.get("started"),
                            tok_s=round(self._rate_of(st, rate), 1), generated=gen, max_tokens=st.get("max_tokens"),
                            prompt_tokens=prompt, prefill_done=done, ctx_used=prompt + gen, reused=st.get("reused"),
                            ttft_s=round(st["first_token"] - st["started"], 2) if decoding and st.get("started")
@@ -676,9 +757,15 @@ class Service:
         with self.status_lock:
             self._drop_stale_best()
             best = {k: dict(v) for k, v in self.best.items()}
+        learner = getattr(self.engine, "overlap_learning", None)
+        learning = learner.snapshot() if self.loaded() and info.get("scheduler_queue") == 1 and learner else None
         return {"engine": engine, "live": live, "requests": hist[::-1][:REQUESTS_SHOWN], "best": best,
                 "totals": totals, "conversation": dict(getattr(self.engine, "conversation", None) or {}),
-                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"]}
+                "hardware": tel["now"], "hardware_static": tel["static"], "history": tel["history"],
+                "scheduler": getattr(self.engine, "scheduler_stats", None) if self.loaded() else None,
+                "scheduler_learning": learning,
+                "startup_memory": {"kv_allocations": (getattr(self.engine, "load_status", None) or {}).get("kv_allocations", [])}
+                if self.loaded() else None}
 
     def _drop_stale_best(self) -> None:
         """A best is a fact about the engine that produced it: a restarted engine (another model, other flags, a
@@ -750,8 +837,16 @@ class Service:
     def render_prompt(self, messages, tools, kwargs) -> str:
         """Render the template. With `effort_end`, a non-default effort is rendered as the default up to the answer
         (same prefix, cache kept) and follows as a short system turn right before it."""
+        kwargs = dict(kwargs)
+        mini_enabled = kwargs.pop("_mini_tools_enabled", self.mini_tools_helper)
+        if mini_enabled and kwargs.get("enable_thinking") is not False:
+            # Stable leading instructions keep user turns and tool results out of the system-prefix key.
+            messages = [{"role": "system", "content": mini_batch.INSTRUCTIONS}, *messages]
+            tools = [*(tools or ()), mini_batch.TOOL]
         if kwargs.get("reasoning_effort") not in (None, ""):
-            kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level(kwargs["reasoning_effort"]))
+            effort = kwargs["reasoning_effort"]
+            # xhigh and maximum remain aliases for max in the model's template.
+            kwargs = dict(kwargs, reasoning_effort=self.dialect.effort_level("max" if effort == "xhigh" else effort))
         kwargs = self.dialect.template_kwargs(kwargs)
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
@@ -845,6 +940,13 @@ class Service:
         prompt; with thinking, run() writes it once the thinking is over.  `image_access`: what this request's
         connection may name as an image; without one, the remote policy."""
         self.embeddings.path = None
+        self.request_ctx.mini_input = ""
+        if self.mini_tools_helper and kwargs.get("enable_thinking", True) is not False:
+            self.request_ctx.mini_input = "\n".join(
+                value for m in messages if m.get("role") == "user"
+                for value in ([m.get("content")] if isinstance(m.get("content"), str) else
+                              [p.get("text") for p in (m.get("content") or []) if isinstance(p, dict)])
+                if isinstance(value, str))
         try:
             return self._prepare(messages, tools, kwargs, max_new, force, image_access or self.image_sources)
         except BaseException:
@@ -858,17 +960,12 @@ class Service:
         answer cap with the engine (clip: cut to the room the context leaves)."""
         text, plain = self.render_text(messages, tools, kwargs)
         tail = force if force and kwargs.get("enable_thinking", True) is False else ""
-        ctx = self.engine.max_context
-        if ctx <= 0:
-            if getattr(self.engine, "starting", False):
-                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-            ctx = getattr(self.engine, "known_ctx", 0)
-            if ctx <= 0:
-                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        ctx = self._request_context()
         unset = max_new is None or max_new <= 0
         if unset:
             max_new = ctx - CTX_SLACK
-        prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens)
+        prompt = PromptText(self.tok, text + tail, plain, tail, clip=unset or self.fit_max_tokens,
+                            context_limit=ctx if self.context_profiles else None)
         prompt.max_new = max_new
         return prompt, kwargs.get("enable_thinking", True) is not False, max_new
 
@@ -913,7 +1010,9 @@ class Service:
             self._video_state_check()
         try:                                            # before the fifo: a slow source must not hold the turn
             read = iter(self.vision.read(images, image_access)) if images else iter(())
-            datas = [next(read) if item["type"] == "image" else self.vision.read_video(item["source"], image_access)
+            stt_videos = getattr(self.request_ctx, "stt_videos", {})
+            datas = [next(read) if item["type"] == "image" else
+                     stt_videos.get(item["source"]) or self.vision.read_video(item["source"], image_access)
                      for item in media]
         except ImageRefused as e:
             print(f"[server] error: {e.log_line}", flush=True)
@@ -930,8 +1029,9 @@ class Service:
                 raise ModelBusy("too many images are waiting to be encoded; try again shortly")
             self.images_waiting += held
         try:
-            # encode under the fifo: the encoder and a running engine must not use the GPU together
-            with self.fifo:
+            # An independent encoder owns its arena and reply channel. Other backends use the FIFO.
+            overlap = not videos and getattr(self.vision, "allows_overlap", False)
+            with nullcontext() if overlap else self.fifo:
                 if getattr(self.vision, "in_engine", False):   # the encoder lives in the engine: it must be running
                     self.ensure_loaded()
                 try:
@@ -972,14 +1072,7 @@ class Service:
 
     def _fit(self, ids, kwargs, max_new):
         """(ids, thinking, max_new) with the answer cap settled against the context."""
-        ctx = self.engine.max_context
-        if ctx <= 0:
-            if getattr(self.engine, "starting", False):   # starting, not an oversized prompt
-                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
-            # a failed restart leaves max_context 0: use the last known context so run() can restart the engine
-            ctx = getattr(self.engine, "known_ctx", 0)
-            if ctx <= 0:
-                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        ctx = self._request_context()
         room = ctx - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
@@ -1085,7 +1178,28 @@ class Service:
         if self.sampling_defaults:     # the request's own fields win
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**self.sampling_defaults, **req_values}
+        effort = ((budget_req or {}).get("_monitor_effort") or "default") if thinking else "off"
+        private = ("_think_close", "_atomic_lora", "_swift_lora", "_monitor_effort", "_rope_profile", "_context_limit")
+        if sampling and any(key in sampling for key in private):
+            sampling = {key: value for key, value in sampling.items() if key not in private}
+        model = self.response_model()
+        adapter = self.adapted_models.get(model) or {}
+        if adapter:
+            sampling = {**(sampling or {}), **adapter}
+        if self.context_profiles:
+            sampling = {**(sampling or {}), "_rope_profile": adapter.get("_rope_profile", 0),
+                        "_context_limit": self.model_context(model)}
+        max_experts = thinking and self.dialect.name == "qwen4exp" and sampling and sampling.get("_thinking_max") is True
+        think_close = None
+        if max_experts and not (getattr(self.engine, "info", None) or {}).get("shared_kv_pages"):
+            (think_close,) = self.tok.encode("</think>", parse_special=True)
         parser = self.dialect.parser(thinking, tools, stream_tools=True)
+        mini_on = thinking and self.mini_tools_helper and (sampling or {}).get("_mini_tools_enabled", True)
+        if mini_on:
+            parser.mini_batch = True
+        batch_count, inserted = 0, 0
+        mini_segments = []
+        mini_input = getattr(self.request_ctx, "mini_input", "")
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         lp_channels = LogprobChannels(thinking) if (sampling or {}).get(LOGPROBS_KEY) is not None else None
         thinking_n = 0                                 # tokens written while thinking
@@ -1122,6 +1236,8 @@ class Service:
         # identity token: only a DONE line replaces engine.last, so a request without one records no stale figures
         engine_last0 = getattr(self.engine, "last", None)
         path = getattr(self.request_ctx, "path", None)   # the API path serving this request
+        identity = {"model": getattr(self.request_ctx, "model", None) or self.model,
+                    "reasoning_effort": effort, "request_id": f"live_{time.monotonic_ns():x}"}
         # parallel requests keep their own status and rate window; otherwise self.status / self.rate
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
@@ -1131,8 +1247,7 @@ class Service:
             self.status["queued"] += 1
             if not par:
                 self.waiting[id(wait_key)] = {"api": "anthropic" if path == "/v1/messages" else "openai",
-                                              "model": getattr(self.request_ctx, "model", None) or self.model,
-                                              "prompt_tokens": len(ids), "started": time.time()}
+                                              **identity, "prompt_tokens": len(ids), "started": time.time()}
         try:
             # batch slots run requests concurrently, so no fifo
             turn = contextlib.ExitStack()
@@ -1174,7 +1289,7 @@ class Service:
                                   generated=0, started=time.time(), first_token=None, tool=None, tail="",
                                   max_tokens=max_new, slot=None, reused=None,
                                   api="anthropic" if path == "/v1/messages" else "openai",
-                                  model=getattr(self.request_ctx, "model", None) or self.model)
+                                  path=path, **identity)
                         if par:
                             self.live_reqs[id(st)] = (st, rate)
                             self.status.update(st)
@@ -1194,24 +1309,32 @@ class Service:
                     while True:
                         if isinstance(ids, PromptText) and ids.max_new:
                             max_new = ids.max_new       # settled by the engine at PT (a clipped cap)
+                        segment_last = getattr(self.engine, "last", None)
+                        run_sampling = sampling
+                        if think_close is not None and parser.state == "reasoning":
+                            run_sampling = {**sampling, "_think_close": think_close}
                         # answer now stops the engine at its own pace: the tokens it still writes are kept, so the
                         # next pass extends exactly what it holds and reads only the close
                         soft = threading.Event() if soft_stops else None
                         more = {"stop_soon": soft} if soft is not None else {}
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb,
+                        gen = self.engine.generate(prompt, max_new - n - inserted, run_sampling, cancel, embeddings=emb,
                                                    session=session, **more) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel, session=session, **more)
+                            else self.engine.generate(prompt, max_new - n - inserted, run_sampling, cancel, session=session, **more)
                         seg, wrap, leaving = [], False, False   # this pass's tokens; budget reached; consumer left
                         looped = False                  # the wrap is for a repeated token, not the budget
                         asked = False                   # the wrap is the client's answer now
                         drained = False                 # the pass ran to the engine's DONE
                         resumed = False                 # stopped for answer now, but not at a point to close: go on
+                        mini_body = None
+                        mini_native = False
                         ended_thinking = False          # the turn ended inside the thinking
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
                             # a held-back tool argument can leave the stream silent for long: ping after a quiet spell
                             last_out = time.monotonic()
-                            for t in gen:
+                            worker = getattr(self.engine, "proc", None)
+                            tokens = checked_tokens(gen, self.stop_ids, self.tok.decode) if self._recovery_ready() else gen
+                            for t in tokens:
                                 # The engine settles a text prompt's output cap before its first token.
                                 if isinstance(ids, PromptText) and ids.max_new:
                                     max_new = ids.max_new
@@ -1248,6 +1371,10 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 state0 = parser.state
                                 evs = cut(parser.feed(piece))
+                                if evs and evs[-1].kind in ("mini_batch", "mini_native_batch"):
+                                    batch_event = evs.pop()
+                                    mini_body = batch_event.text
+                                    mini_native = batch_event.kind == "mini_native_batch"
                                 if lp_channels is not None:
                                     lp = logprob_entry(self.tok, t) if getattr(t, "lp", None) is not None else None
                                     for item in lp_channels.token(lp, state0, parser.state, evs):
@@ -1267,6 +1394,8 @@ class Service:
                                 elif time.monotonic() - last_out >= KEEPALIVE_S:
                                     last_out = time.monotonic()
                                     yield "ping", None
+                                if mini_body is not None:
+                                    break
                                 if stops is not None and stops.hit is not None:
                                     finish = "stop"         # gen.close() below STOPs the engine
                                     break
@@ -1301,6 +1430,8 @@ class Service:
                                 drained = True
                         except EngineDied as e:
                             finish = "error"
+                            if isinstance(e, OutputLoop):
+                                self.engine.discard_corrupt_output(worker, str(e))
                             self._say_died(e)
                             raise
                         except ValueError as e:             # the engine's ERR line
@@ -1319,10 +1450,35 @@ class Service:
                                 if not leaving and not cancel.is_set():
                                     raise
                         run_last = getattr(self.engine, "last", None)
+                        if mini_on and isinstance(run_last, dict) and run_last is not segment_last:
+                            mini_segments.append(dict(run_last))
                         if reused0 is None and isinstance(run_last, dict) and run_last is not engine_last0 \
                                 and run_last.get("reused") is not None:
                             reused0 = min(int(run_last["reused"]), len(ids))    # later passes extend this reply
-                        if drained and soft is not None and soft.is_set() and n < max_new and not cancel.is_set():
+                        if mini_body is not None and not cancel.is_set():
+                            batch_count += 1
+                            if batch_count > mini_batch.MAX_BATCHES + 1:
+                                break
+                            results = mini_batch.execute(mini_body, mini_input, batch_count)
+                            reasoning = parser.state == "reasoning"
+                            extra = mini_batch.result_ids(self.tok, results, mini_native, reasoning)
+                            room = max_new - n - inserted
+                            if len(extra) >= room:
+                                results = [{"error": "batch result exceeds remaining token budget"}]
+                                extra = mini_batch.result_ids(self.tok, results, mini_native, reasoning)
+                            if len(extra) >= room:
+                                break
+                            inserted += len(extra)
+                            prompt = prompt + seg + extra
+                            if mini_native:
+                                parser.state, parser.lead = "reasoning", False
+                                parser.fence, parser.ticks = "", 0
+                                closed_early = False
+                            parser.rtail = "\n"
+                            parser.line = ""
+                            yield "event", Event("reasoning", mini_batch.notice(results))
+                            continue
+                        if drained and soft is not None and soft.is_set() and n + inserted < max_new and not cancel.is_set():
                             if parser.state == "reasoning" and not parser.buf and not detok.pending():
                                 wrap = asked = True
                             else:                       # a split tag or character, or the thinking ended meanwhile
@@ -1335,7 +1491,7 @@ class Service:
                             closed_early = True
                             extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
-                            if max_new - n - len(extra) < 1:
+                            if max_new - n - inserted - len(extra) < 1:
                                 finish = "stop"
                                 break
                             print("[server] the model ended while thinking, closing it for an answer", flush=True)
@@ -1343,7 +1499,7 @@ class Service:
                             budget = None
                             extra = self.tok.encode(self.dialect.reasoning_close + (force or ""), parse_special=True)
                             force = None
-                            if max_new - n - len(extra) < 1:
+                            if max_new - n - inserted - len(extra) < 1:
                                 break                   # no room to answer: "length"
                             if asked:
                                 print(f"[server] answer now: closing the thinking after {thinking_n} tokens", flush=True)
@@ -1359,7 +1515,7 @@ class Service:
                             text = "\n" * (2 - (len(tail) - len(tail.rstrip("\n")))) + force
                             force = None
                             extra = self.tok.encode(text, parse_special=True)
-                            if max_new - n - len(extra) < 1:
+                            if max_new - n - inserted - len(extra) < 1:
                                 break                   # no room for the call: "length"
                         for t in extra:
                             n += 1
@@ -1391,6 +1547,17 @@ class Service:
                             # same object as before: no DONE arrived
                             last = dict(getattr(self.engine, "last", {}) or {}) \
                                 if getattr(self.engine, "last", None) is not engine_last0 else {}
+                            if batch_count and len(mini_segments) > 1:
+                                for key in ("decode_ms", "generated", "hits", "lookups", "offloaded",
+                                            "drafts_offered", "drafts_accepted"):
+                                    if all(segment.get(key) is not None for segment in mini_segments):
+                                        last[key] = sum(segment[key] for segment in mini_segments)
+                                # Keep the HTTP prompt/usage anchored to segment one, not the appended batch suffix.
+                                last["prompt_read"] = mini_segments[0].get("prompt_read")
+                                last["prompt_ms"] = mini_segments[0].get("prompt_ms")
+                                print("[server] mini batch cache: " + "; ".join(
+                                    f"{seg.get('reused', '?')}/{seg.get('prompt_tokens', '?')} reused"
+                                    for seg in mini_segments), flush=True)
                             if reused0 is not None and last.get("reused") is not None:
                                 last["reused"] = reused0
                             started = st.get("started", time.time())
@@ -1415,6 +1582,7 @@ class Service:
                             dl = window_tokens / windows if windows else None
                             self.history.append({
                                 "id": f"r_{self.requests_done:04d}", "path": path, "slot": self._slot_of(st),
+                                **identity,
                                 "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                                 "prompt_tokens": seen, "reused": last.get("reused"), "output_tokens": n,
                                 "prompt_ms": last.get("prompt_ms"),
@@ -1429,6 +1597,11 @@ class Service:
                             fresh = getattr(self.engine, "last", None)
                             if fresh is not None and fresh is not before:      # a DONE line arrived for this request
                                 timings = request_timings(seen, n, last)
+                                if timings is not None and batch_count and len(mini_segments) > 1:
+                                    timings["mini_segment_cache"] = [
+                                        {"reused": seg.get("reused"), "fresh": seg.get("prompt_read"),
+                                         "prompt_tokens": seg.get("prompt_tokens")} for seg in mini_segments
+                                    ]
                                 self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()

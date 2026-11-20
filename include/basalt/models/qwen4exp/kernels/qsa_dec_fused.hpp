@@ -6,7 +6,7 @@
 //                     indexer keys in order (native_qsa_indexer_append)
 //   qsa_dec_q_post    the query heads out of q_full with norm + RoPE, the indexer query heads with norm + RoPE
 //
-// INT8 K/V without rotation only (qsa_dec_kv_post_supported).
+// Rotated INT8 can supply prepared K and V while retaining the segmented append and indexer.
 #pragma once
 
 #include "basalt/models/qwen4exp/kernels/kv_stream.hpp"
@@ -24,6 +24,7 @@ struct QsaDecKvPost {
     int pos_stride = 0;                 ///< 0: n_head_kv
     const float* k_norm = nullptr;      ///< [head_dim]
     const int32_t* steps = nullptr;     ///< [n][kStepCount]: each row's cell at kStepPos
+    uint16_t *k_pool = nullptr, *v_pool = nullptr;
     int8_t *k_q = nullptr, *v_q = nullptr;
     uint16_t *k_scale = nullptr, *v_scale = nullptr;
     const int32_t* page_table = nullptr;
@@ -36,6 +37,9 @@ struct QsaDecKvPost {
     int max_cells = 0;
     float eps = 1e-6f;
     int part = 0;                       ///< 0: K/V rows and indexer; 1: K/V rows only; 2: indexer only
+    bool hadamard = false;             ///< rotate INT8 K/V before the append
+    int value_hadamard_width = 256;    ///< contiguous block width of the V transform
+    bool k_prepared = false;           ///< K/V ready to quantize; the indexer retains its own RoPE processing
 };
 
 struct QsaDecQPost {
@@ -47,6 +51,7 @@ struct QsaDecQPost {
     const int32_t* pos_i = nullptr;     ///< [n][idx_n_head]
     const float* idx_q_norm = nullptr;  ///< [idx_dim]
     float eps = 1e-6f;
+    bool hadamard = false;             ///< rotate query heads after RoPE
 };
 
 bool qsa_dec_fused_supported(const QsaShapes& s);

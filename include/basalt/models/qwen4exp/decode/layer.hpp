@@ -219,6 +219,7 @@ struct QsaState {
     /// The elastic KV (qsa_set_kv_elastic): the pool arrays above live in this arena's ranges, and only its first
     /// `cells()` cells are backed.  Null: the pools are carved from the session arena, all backed.
     KvArena* kv_arena = nullptr;
+    KvArena* shared_index_arena = nullptr; ///< graph-stable pooled keys backed to the shared lease extent
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
@@ -229,6 +230,11 @@ struct QsaState {
     int kv_mode = 0;
     int64_t n_slots = 0;
     basalt::kernels::KvHostPools host;
+    // Scheduler-owned CPU mirror of host.fp16_host_pages, stable while a transfer runs.
+    const uint32_t* host_page_ids = nullptr;
+    size_t host_page_count = 0;
+    size_t host_pool_pages = 0;
+    bool shared_residency = false;  ///< map and page_table keyed by physical host page
     basalt::kernels::KvStreamMap map;
     int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
@@ -264,7 +270,8 @@ struct QsaState {
 /// The RoPE cos/sin table (max_cells x n_rot/2 x 2 floats) is identical in every QSA layer.  `with_rope = false` sizes a
 /// state that borrows it; `share_rope` points `st` at another state's table instead of building a copy (the session
 /// builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         bool borrow_residency = false);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -300,8 +307,19 @@ inline int qsa_kv_format(const QsaState& st) {
     }
     return st.kv_q4 ? basalt::kernels::kKvQ4 : st.kv_int8 ? basalt::kernels::kKvInt8 : basalt::kernels::kKvF16;
 }
+// The owner supplies portable pinned FP16 or INT8 backing. The borrower keeps its own
+// sequence state and can borrow residency too. Both page-table addresses outlive the borrower.
+struct QsaHostBinding {
+    const QsaState& backing;
+    const int32_t* device_pages;
+    const uint32_t* host_pages;
+    size_t page_count;
+    bool borrow_residency = false;
+};
+
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
+                        const QsaHostBinding* host_binding = nullptr);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

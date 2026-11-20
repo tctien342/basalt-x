@@ -1,5 +1,7 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "basalt/models/qwen4exp/swift_lora.hpp"
+#include "basalt/models/qwen4exp/decode/layout.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -25,6 +27,48 @@ int cache_size(Context& context) {
     auto& native_head = *context.native_head;
     auto& mtp_head = *context.mtp_head;
 
+    // Keep these factors alive for every later startup phase and the server.
+    std::unique_ptr<basalt::qwen4exp::SwiftLora> swift;
+    std::unique_ptr<basalt::qwen4exp::SwiftLoraDevice> swift_main, swift_peer;
+    if (!o.swift_lora.empty()) {
+        if (!o.serve || multi_gpu || g.n_layers != 48 || g.n_embd != 2560 || g.n_ff != 640 ||
+            !o.dflash2.empty())
+            return fatal_start_error("--swift-lora requires the unsplit Flash-Next target verifier");
+        try {
+            std::vector<basalt::qwen4exp::SwiftLoraSite> sites;
+            for (int layer = 0; layer < g.n_layers; ++layer) {
+                const std::string prefix = "blk." + std::to_string(layer) + ".";
+                const auto add = [&](const char* suffix) {
+                    auto name = prefix + suffix;
+                    const auto* weight = wt.find(name);
+                    if (!weight || weight->ne0 <= 0 || weight->ne1 <= 0)
+                        throw std::runtime_error("missing base projection " + name);
+                    sites.push_back({std::move(name), uint64_t(weight->ne0), uint64_t(weight->ne1)});
+                };
+                for (const char* suffix : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+                    add(suffix);
+                if (basalt::core::is_qsa_layer(g, layer)) {
+                    for (const char* suffix : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"})
+                        add(suffix);
+                } else {
+                    for (const char* suffix : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"})
+                        add(suffix);
+                }
+            }
+            swift = std::make_unique<basalt::qwen4exp::SwiftLora>(o.swift_lora, sites);
+            swift_main = std::make_unique<basalt::qwen4exp::SwiftLoraDevice>(*swift, 0);
+            if (o.peer_device > 0 && !o.no_peer_prefill)
+                swift_peer = std::make_unique<basalt::qwen4exp::SwiftLoraDevice>(*swift, o.peer_device);
+            context.swift_host = swift.get();
+            context.swift_main = swift_main.get();
+            context.swift_peer = swift_peer.get();
+            basalt::log::info("basalt serve", "Swift LoRA factors loaded before expert sizing (%zu bytes per device)",
+                              swift->factor_bytes());
+        } catch (const std::exception& e) {
+            return fatal_start_error(std::string("--swift-lora: ") + e.what());
+        }
+    }
+
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
     // sees the memory this process actually has left rather than the card's idle figure - and refuses with both
     // numbers if the slots do not fit, instead of handing back a cache smaller than it was asked for.
@@ -39,7 +83,7 @@ int cache_size(Context& context) {
     };
     // the GDN mixer split is priced once, before either card sizes its experts: its peer reserve displaces experts
     // only when the cards cannot hold them all
-    if (o.peer_device >= 1) {
+    if (o.peer_device >= 1 && !swift_main) {
         int d0 = 0, count = 0;
         size_t f0 = 0, t0 = 0, f1 = 0, t1 = 0;
         cudaGetDevice(&d0);
@@ -248,6 +292,9 @@ int cache_size(Context& context) {
     }
     // --vram-elastic: the cache in physical segments (the VRAM command resizes it between requests).  One GPU, serve
     // mode: anything else keeps the one cudaMalloc, said once.
+    if (o.serve && !multi_gpu && basalt::core::exp_flag("shared_kv_pool") &&
+        basalt::core::exp_flag("shared_kv_expert_lending"))
+        xcache.set_segment_bytes(std::max<int64_t>(64, o.vram_segment_mib) << 20);
     if (o.vram_elastic) {
         const char* why = !o.serve ? "it works between requests of --serve"
                         : multi_gpu ? "a layer split has a cache per GPU"

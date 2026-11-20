@@ -1,5 +1,6 @@
 // src/models/qwen4exp/serve/verify.cpp - verify operations for the persistent engine.
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "qfn_state.hpp"
 
 namespace basalt::models::qwen4exp::serve {
@@ -126,13 +127,40 @@ int QfnRuntime::init_verify() {
                       " (CUDA" + std::to_string(split_same ? 0 : stages[(size_t) st - 1]->dev) + ")";
         basalt::log::info("basalt serve", "layer split: layers %s, one hand-off per window", plan_s.c_str());
     }
-    ver.set_route_tail_skip(o.route_tail_skip);
-    ver.set_route_prior(o.route_prior);
-    ver.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
-    if (peer.valid()) ver.set_peer(&peer);   // the window drives the peer tier itself
-    for (const auto& xpe : xpeers)
-        if (xpe->valid()) ver.add_peer(xpe.get());
-    ver.set_cpu_warm(drive.d.pool, drive.d.src);
+    auto configure_verifier = [&](basalt::core::Verifier& v) {
+        v.bind_lora(lora_main.get(), lora_peer.get());
+        v.bind_swift_lora(swift_main);
+        v.set_route_tail_skip(o.route_tail_skip);
+        v.set_route_prior(o.route_prior);
+        v.set_main_priority(o.batch > 0);   // beside a prompt read the slots' windows must win the SMs
+        if (peer.valid()) v.set_peer(&peer);   // the window drives the peer tier itself
+        for (const auto& xpe : xpeers)
+            if (xpe->valid()) v.add_peer(xpe.get());
+        v.set_cpu_warm(drive.d.pool, drive.d.src);
+    };
+    if (o.serve && basalt::core::exp_flag("thinking_max") != 0) {
+        if (n_stages != 1 || o.batch > 1 || ss.k != 10) {
+            basalt::log::error("basalt serve", "thinking max needs single-slot, unsplit Flash-Next with top-10 prefill");
+            return 1;
+        }
+        if (g.n_layers != 48) {
+            basalt::log::error("basalt serve", "tail K16 requires 48 layers");
+            return 1;
+        }
+        const int target_k = o.target_k_thinking_num;
+        const int first_wide_layer = (int) g.n_layers - o.target_k_last_layer_num;
+        const int thinking_width = basalt::core::exp_flag("thinking_max_mtp") != 0 && mtp_on
+            ? std::min(basalt::kernels::kVerifyMaxT, basalt::kernels::kDmCap / target_k) : 2;
+        basalt::log::info("basalt serve", "thinking max: target K=%d, last %d layers, up to %d verifier rows",
+                          target_k, o.target_k_last_layer_num, thinking_width);
+        thinking_ver = std::make_unique<basalt::core::Verifier>();
+        configure_verifier(*thinking_ver);
+        if (!thinking_ver->init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, thinking_width, err, target_k, first_wide_layer)) {
+            basalt::log::error("basalt serve", "thinking max: %s", err.c_str());
+            return 1;
+        }
+    }
+    configure_verifier(ver);
     if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, std::max({o.spec, o.batch, 2}), err) ||
         (mtp_on && !mtp.bind(wt, multi_gpu ? &mtp_head : &native_head, ver.final_R_all(), err))) {
         basalt::log::error("basalt serve", "%s", err.c_str());
@@ -168,8 +196,13 @@ int QfnRuntime::init_verify() {
 int QfnRuntime::capture_windows() {
 
     // every window width's graph is captured before READY, not by the first request that needs it
-    if (o.serve && stages.empty() && !ver.warm_graphs(err)) {
+    if (o.serve && stages.empty() &&
+        (!ver.warm_graphs(err) || (shared_pages && !ver.warm_session(&ss, err)))) {
         basalt::log::error("basalt serve", "capturing the verify windows failed: %s", err.c_str());
+        return 1;
+    }
+    if (thinking_ver && !thinking_ver->warm_graphs(err)) {
+        basalt::log::error("basalt serve", "capturing the thinking verify windows failed: %s", err.c_str());
         return 1;
     }
     // the solo windows of every slot session, so a lone request in any slot runs the solo path in place
@@ -216,7 +249,6 @@ int QfnRuntime::capture_windows() {
     std::fflush(stdout);
 
     rounds = 0;
-    sfx.emplace(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
     policy.emplace(S);   // MTP or lookup window, learned over the whole process
     // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images and videos.  The
     // file is one or more basalt-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats) in prompt

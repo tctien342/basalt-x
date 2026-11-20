@@ -25,6 +25,9 @@ int dispatch(Context& context) {
     auto& profile_loaded = *context.profile_loaded;
     auto& pf_borrow = *context.pf_borrow;
     auto& wt = *context.wt;
+    auto* swift_host = context.swift_host;
+    auto* swift_main = context.swift_main;
+    auto* swift_peer = context.swift_peer;
     auto& d_mrope = *context.d_mrope;
     auto& mrope_host = *context.mrope_host;
     auto& cvec_summary = *context.cvec_summary;
@@ -41,6 +44,7 @@ int dispatch(Context& context) {
     auto& bslot_ss = *context.bslot_ss;
     auto& slot_cap = *context.slot_cap;
     auto& slot0_is_solo = *context.slot0_is_solo;
+    auto& shared_tables = *context.shared_tables;
     auto& mtp = *context.mtp;
     auto& mtp_on = *context.mtp_on;
     auto& mtp_kv = *context.mtp_kv;
@@ -143,6 +147,9 @@ int dispatch(Context& context) {
             .profile_loaded = profile_loaded,
             .pf_borrow = pf_borrow,
             .wt = wt,
+            .swift_host = swift_host,
+            .swift_main = swift_main,
+            .swift_peer = swift_peer,
             .d_mrope = d_mrope,
             .mrope_host = mrope_host,
             .cvec_summary = cvec_summary,
@@ -159,6 +166,7 @@ int dispatch(Context& context) {
             .bslot_ss = bslot_ss,
             .slot_cap = slot_cap,
             .slot0_is_solo = slot0_is_solo,
+            .shared_tables = shared_tables,
             .mtp = mtp,
             .mtp_on = mtp_on,
             .mtp_kv = mtp_kv,

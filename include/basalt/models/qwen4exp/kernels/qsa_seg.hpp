@@ -3,7 +3,7 @@
 // comes from a device table instead of kernel arguments. Every row's result is bit for bit what the single-sequence
 // kernel gives that slot's rows alone.
 //
-//   QsaSegSlot   one slot's cache and indexer pointers for one layer; static, uploaded once per layer
+//   QsaSegSlot   one segment's cache and indexer pointers for one layer, uploaded per window
 //   QsaSeg       a row's slot and its segment (first row, row count); uploaded per window, one entry per row
 //                (`rows`) and one per segment (`segs`)
 //
@@ -70,6 +70,9 @@ struct QsaSegTable {
     const QsaSeg* rows = nullptr;
     const QsaSeg* segs = nullptr;
     int n_rows = 0, n_seg = 0;
+    // Shared FP16 residency uses a single map indexed by physical host page.
+    // When enabled all slots refer to the same map and backing on this layer.
+    bool shared_residency = false;
 };
 
 constexpr int kQsaSegMaxRows = 16;
@@ -104,7 +107,7 @@ struct QsaSegCommitLayer {
 struct QsaSegCommit {
     QsaSegCommitLayer layer[kQsaCommitMaxLayers];
     const QsaSeg* segs = nullptr;
-    const int32_t* pos = nullptr;   ///< segment j's rows t: pos[slot * pos_stride + t] (< 0 skipped)
+    const int32_t* pos = nullptr;   ///< segment j's rows t: pos[j * pos_stride + t] (< 0 skipped)
     int pos_stride = 0;
     float epsilon = 0.0f;
     int n_layers = 0, n_seg = 0;

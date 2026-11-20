@@ -7,6 +7,8 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
+#include "pcie_cost.hpp"
+#include <array>
 #include <vector>
 
 namespace basalt::core {
@@ -44,6 +46,7 @@ struct DecMoe {
     uint8_t* h_xq = nullptr; uint8_t* m_xq = nullptr;
     uint32_t* h_w = nullptr; uint32_t* m_w = nullptr;
     float* h_rows = nullptr; float* m_rows = nullptr;
+    float* peer_device_rows = nullptr;   ///< optional peer-write arena on the verifier device
     bool tag = false;       ///< the combine polls the peer's rows (each dword not yet written holds the tag word)
     bool tags = false;      ///< the combine waits for the CPU pool's word itself: no wait launch (without --wait-stats)
     size_t rows_words = 0;
@@ -92,6 +95,18 @@ struct DecMoe {
     cudaEvent_t st_fork = nullptr, st_join = nullptr;
     int64_t stage_stride = 0;
     int stage_blocks = 0;
+    bool stage_tune = false;
+    int stage_cap = 0, stage_rows = 0;
+    uint64_t stage_reference_bytes = 0, stage_last_placement = 0;
+    uint64_t stage_placement_changes = 0, stage_shape_resets = 0;
+    std::array<uint64_t, (size_t) PcieBudget::count> stage_decisions{};
+    double stage_bandwidth = 0.0;
+    unsigned long long* h_stage_timing = nullptr;
+    unsigned long long* m_stage_timing = nullptr;
+    std::vector<double> stage_cpu_us;
+    std::vector<PcieLayerCost> stage_cost;
+    std::vector<int> stage_misses, stage_seen;
+    std::vector<int32_t> stage_table, stage_next;
     int stage_min = 0;   // the fewest distinct CPU misses a layer stages a share of
     // pinned staging of the residency uploads: the copies take their source from here, so the call does
     // not wait for the stream; a ring of slots, each reused only after the window's stream sync

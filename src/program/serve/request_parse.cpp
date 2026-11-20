@@ -32,6 +32,11 @@ Flow Request::parse() {
     req_penalty_last_n = 0;
     req_bias_present = false;
     req_gprompt = -1;       // gprompt=N: the first N ids are the prompt, the rest tokens the request has already generated
+    req_think_close = -1;
+    req_atomic_lora = false;
+    req_swift_lora = false;
+    req_rope_profile = -1;
+    req_group_prefill = false;
     req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
     req_relax = default_relax();   // relax=P: this request's --relaxed-drafting (0 = exact)
     // ppl=K [ppl_t=T]: quality gate (basalt/program/ppl_gate.hpp) - chunk K of --ppl-base, the rest of
@@ -56,6 +61,24 @@ Flow Request::parse() {
             else if (key == "grammar") req_grammar_text = tok.substr(eq + 1);
             else if (key == "gprompt") req_gprompt = std::atoll(tok.c_str() + eq + 1);
             else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+            else if (key == "atomic_lora" || key == "swift_lora") {
+                const std::string value = tok.substr(eq + 1);
+                if (value != "0" && value != "1") {
+                    std::printf("ERR %s must be 0 or 1\n", key.c_str());
+                    return Flow::next;
+                }
+                (key == "atomic_lora" ? req_atomic_lora : req_swift_lora) = value == "1";
+            }
+            else if (key == "rope_profile") {
+                const std::string value = tok.substr(eq + 1);
+                if (req_rope_profile >= 0 || (value != "0" && value != "1")) {
+                    std::printf("ERR rope_profile must occur once with value 0 or 1\n");
+                    return Flow::next;
+                }
+                req_rope_profile = value == "1" ? 1 : 0;
+            }
+            else if (key == "group_prefill") req_group_prefill = tok.substr(eq + 1) == "1";
+            else if (key == "think_close") req_think_close = std::atoi(tok.c_str() + eq + 1);
             else if (key == "temperature") req_temperature = fv;
             else if (key == "top_p") req_top_p = fv;
             else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);

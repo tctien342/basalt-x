@@ -50,9 +50,12 @@ enum class RegionBacking { LargePages, NormalPages };
 /// file whose first 4 KiB identify the pack (`shared_hash`, which must not be 0) and whose remaining bytes are the
 /// region - Linux only, meant for tmpfs; elsewhere it fails with a note. `mapping_base` and `mapping_bytes` are what
 /// `free_region` releases: the region itself, or the file mapping that its header precedes; both are 0 when nothing
-/// was allocated. nullptr on failure.
+/// was allocated. A ready-only mapping requires a published shared payload. nullptr on failure.
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes);
+                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes, bool ready_only = false);
+/// Query or publish a shared mapping's fully populated expert payload. The caller holds the population lock.
+bool shared_arena_ready(const void* mapping);
+void publish_shared_arena(void* mapping);
 /// Releases what `alloc_region` returned through `mapping_base` and `mapping_bytes`. A null is fine.
 void free_region(void* mapping_base, uint64_t mapping_bytes);
 

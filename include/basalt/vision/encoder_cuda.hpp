@@ -33,7 +33,7 @@ public:
     size_t weights_bytes() const;
     size_t arena_bytes(int max_tokens) const;
     bool attach(void* arena, size_t bytes, int max_tokens, std::string& err);
-    void detach();
+    bool detach();  // false if the encoder stream could not be fenced
 
     /// As CpuEncoder::encode (a picture's 768-wide rows or a video group's 1536-wide ones); the taps copy to the host
     /// and are for parity runs only.

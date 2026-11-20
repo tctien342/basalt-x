@@ -25,6 +25,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         err = "mtp: draft arguments out of range";
         return false;
     }
+    if (!before_draft_write(p, p + T + max_t_ + 1, err)) return false;
     note_cells(p, p + T + max_t_ + 1);
     if (n_xcap_ > 0) {   // the window's committed picks (rows 0..a) may hold names the subset lacks
         for (int t = 0; t <= a; ++t) ctx_note(tokens[t]);
@@ -83,7 +84,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
     int n = 0;
     if (max_steps > 0) {
         decode_gaps().mark(6);
-        const cudaGraphExec_t first = cond ? cond_exec_[tier_][T] : round_exec_[tier_][T];
+        const cudaGraphExec_t first = cond ? cond_exec_[basalt::kernels::rope_context_index()][tier_][T] : round_exec_[basalt::kernels::rope_context_index()][tier_][T];
         decode_events().record(DecodeEvents::kDraftPre, cs_);
         if (cudaGraphLaunch(first, cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
@@ -117,7 +118,7 @@ bool MtpDrafter::draft_rows(int T, const int32_t* tokens, int64_t p, int a, int3
         chain_steps_ = max_steps;
         for (int j = 1; j < max_steps && draft_keep(pr, j - 1, host_th); ++j) {
             if (!cond) {   // the conditional graph runs step j on the device by the same comparison
-                if (cudaGraphLaunch(step_exec_[tier_][j], cs_) != cudaSuccess) {
+                if (cudaGraphLaunch(step_exec_[basalt::kernels::rope_context_index()][tier_][j], cs_) != cudaSuccess) {
                     err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }

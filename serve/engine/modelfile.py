@@ -120,12 +120,12 @@ def model_config(spec: ModelSpec, engine_bin: str) -> dict:
     v = vision_config(mf, engine_bin, sidecar=vision != "dynamic") if vision else None
     if v:
         v["mode"] = vision
-        v["gpu"] = vision != "cpu"
+        v["gpu"] = vision not in ("cpu", "adaptive")
         cfg["vision"] = v
         # dynamic: the engine encodes, opening the projector inside the model file itself; else the sidecar's
         # embeddings come in with each image
-        if vision == "dynamic" and "--vision" not in args:
+        if vision in ("dynamic", "adaptive") and "--vision" not in args:
             args.append("--vision")
-        elif vision != "dynamic" and "--vision-external" not in args:
+        elif vision not in ("dynamic", "adaptive") and "--vision-external" not in args:
             args.append("--vision-external")
     return cfg

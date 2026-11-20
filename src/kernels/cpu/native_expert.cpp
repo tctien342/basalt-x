@@ -11,10 +11,15 @@
 #include "basalt/kernels/cpu/expert_layout.hpp"
 
 #include "basalt/ggml/ggml.h"
+#include "basalt/log.hpp"
 
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+
+extern "C" void basalt_q5_0_q8_0_rows_avx2(const uint8_t* weights, size_t row_bytes, int n,
+                                         const void* const* act, int nt, float* const* out,
+                                         int r0, int r1, float scale);
 
 namespace basalt::kernels::cpu {
 namespace {
@@ -232,6 +237,19 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     static const bool avx512 = cpu_avx512_ok();
     if (avx512 && f.d_type == GGML_TYPE_NVFP4 && nvfp4_512_fits((int) f.n_embd, (int) f.n_ff)) {
         nvfp4_512_down_rows(blob + f.down_off, f.d_row, n, sd, hq, nt, out, r0, r1);
+        return;
+    }
+    static const bool q5_pairs = [] {
+        const char* opt = std::getenv("BASALT_CPU_Q5_MULTI");
+        return opt && std::strcmp(opt, "1") == 0;
+    }();
+    if (q5_pairs && !avx512 && cpu_avx2_ok() && f.d_type == GGML_TYPE_Q5_0 && nt > 1) {
+        static const bool entered = [] {
+            basalt::log::info("basalt", "AVX2 Q5_0 down projection using paired token rows");
+            return true;
+        }();
+        (void) entered;
+        basalt_q5_0_q8_0_rows_avx2(blob + f.down_off, f.d_row, n, hq, nt, out, r0, r1, sd);
         return;
     }
     if (!avx512 && cpu_avx2_ok() && f.d_type == GGML_TYPE_NVFP4 && nvfp4_256_fits((int) f.n_embd, (int) f.n_ff)) {

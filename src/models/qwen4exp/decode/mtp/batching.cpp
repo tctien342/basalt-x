@@ -33,9 +33,11 @@ bool MtpDrafter::draft_seq(int id, const float* R_rows, int T, const int32_t* to
 
 bool MtpDrafter::flush(int id, std::string& err) {
     if (id < 0 || id >= (int) pend_tok_.size() || pend_tok_[(size_t) id].empty()) return true;
+    if (!use_store(id, err)) return false;
+    const auto first = pend_cell0_[(size_t) id];
+    if (!before_draft_write(first, first + (int64_t) pend_tok_[(size_t) id].size(), err)) return false;
     std::vector<int32_t> tk;
     tk.swap(pend_tok_[(size_t) id]);
-    if (!use_store(id, err)) return false;
     return prefill_cur(pend_R_[(size_t) id], tk.data(), (int64_t) tk.size(), pend_cell0_[(size_t) id], err);
 }
 
@@ -48,6 +50,17 @@ bool MtpDrafter::defer_rows(int id, const float* R_rows, const int32_t* next_tok
     if (n > kPendRows) return catch_up(id, R_rows, next_tokens, n, cell0, err);
     const OnDevice on_device(device_);
     const size_t HCN = (size_t) (g_->hc * g_->n_embd);
+    float*& deferred = pend_R_[(size_t) id];
+    if (!deferred) {
+        const size_t bytes = (size_t) kPendRows * HCN * sizeof(float);
+        const auto status = cudaMalloc((void**) &deferred, bytes);
+        if (status == cudaErrorMemoryAllocation) {
+            cudaGetLastError();
+            return catch_up(id, R_rows, next_tokens, n, cell0, err);
+        }
+        if (status != cudaSuccess) { err = cudaGetErrorString(status); return false; }
+        vram_ += bytes;
+    }
     if (tk.empty()) pend_cell0_[(size_t) id] = cell0;
     if (cudaMemcpyAsync(pend_R_[(size_t) id] + tk.size() * HCN, R_rows, (size_t) n * HCN * sizeof(float),
                         cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {

@@ -6,7 +6,170 @@
 namespace basalt::models::qwen4exp::serve {
 
 bool QfnRequest::parse_begin() { return !runtime_.mtp_on || runtime_.mtp.use_main(runtime_.err); }
+Flow QfnRequest::bind_context_profile() {
+    if (!runtime_.rope_context_profiles) return Request::bind_context_profile();
+    using basalt::kernels::RopeContext;
+    rope_scope_.emplace(req_rope_profile == 1 ? RopeContext::YaRN2 : RopeContext::Native);
+    return Flow::proceed;
+}
+
+int64_t QfnRequest::limit_context(int64_t context) const {
+    if (!runtime_.rope_context_profiles) return context;
+    return std::min<int64_t>(context, req_rope_profile == 1 ? 524288 : 262144);
+}
+
+Flow QfnRequest::bind_atomic_lora() {
+    auto& r = runtime_;
+    const unsigned mode = request_adapter();
+    const unsigned key = r.cache_key(mode, basalt::kernels::rope_context());
+    if (!r.cache_configured(key)) return Request::bind_atomic_lora();
+    // The frozen image is not visible to restore until the worker finishes.
+    // Resolve it before searching the outgoing namespace for a prefix match.
+    if (r.frozen_recovery.valid() && key == r.frozen_recovery_cache && !r.settle_shared_slot(0, false)) {
+        std::printf("ERR cold shared snapshot: %s\n", r.err.c_str());
+        return Flow::error;
+    }
+    const bool profile_switch = (key >= QfnRuntime::adapter_count) != (r.active_cache >= QfnRuntime::adapter_count);
+    bool deferred = false;
+    if (profile_switch && !geni && r.admit_slot > 0 && basalt::core::exp_flag("cold_shared_recovery")) {
+        const int64_t ctx = limit_context(r.slot_context(r.admit_slot));
+        if (n > 0 && ctx >= 8 && n <= ctx - 8 && r.admit_max_new <= ctx - 8 - n) {
+            if (mode == r.active_adapter) {
+                deferred = r.defer_profile_park(r.admit_slot, n + r.admit_max_new + 8);
+            } else if (r.shared_pages && r.slot0_solo() && !r.pipe_on && !r.piped && r.stages.empty() &&
+                       !r.frozen_recovery.valid() && r.rsp == &r.ss && r.live_ok && !r.live.empty() &&
+                       r.live_imgs.empty() && !r.bs[0].active && !r.bs[0].cached && !r.bs[0].partial &&
+                       r.cached_context_key(0) == r.active_cache) {
+                auto& source = *r.shared_sequences[0];
+                const auto& destination = *r.shared_sequences[(size_t) r.admit_slot];
+                const auto page = basalt::kernels::qsa_real_shapes().page_size;
+                const auto source_pages = (uint32_t) (1 + (r.live.size() - 1) / page);
+                const auto needed = (uint64_t) (1 + (n + r.admit_max_new + 7) / page);
+                if (needed <= (uint64_t) r.shared_pages->available() + destination.lease.pages().size() &&
+                    basalt::core::SharedKvTable::covers_prefix(source.lease, source.stages, source_pages)) {
+                    // Publish the old solo checkpoint chain in its existing lease. Preserve its
+                    // draft store under the outgoing context before selecting the incoming adapter.
+                    const basalt::kernels::RopeContextScope outgoing(source.rope_context);
+                    r.ckd_finish();
+                    if (!r.ver.wait_commit(r.err) || (r.thinking_ver && !r.thinking_ver->wait_commit(r.err))) {
+                        std::printf("ERR pending commit before slot handoff: %s\n", r.err.c_str());
+                        return Flow::error;
+                    }
+                    if (!r.batch_spec || !r.lora_main || r.mtp.set_store_adapter_scale(0,
+                            (r.active_adapter & 1u) ? QfnRuntime::atomic_lora_scale : 0.0f, r.err)) {
+                        slot_draft_out();
+                        if (!r.batch_spec || r.solo_draft_in0) {
+                            auto& slot = r.bs[0];
+                            slot = {};
+                            slot.p = (int64_t) r.live.size();
+                            slot.ids = std::move(r.live);
+                            slot.checks = std::move(r.checks);
+                            slot.cvec = r.cvec_cached;
+                            slot.idle_busy = r.solo_idle_busy;
+                            slot.cached = true;
+                            r.solo_draft_in0 = false;
+                            deferred = true;
+                        }
+                    }
+                    if (!deferred) r.err.clear();
+                }
+            }
+        }
+    }
+    if (r.lora_main && r.mtp_on && !r.mtp.set_store_adapter_scale(r.mtp.main_store(),
+            req_atomic_lora ? QfnRuntime::atomic_lora_scale : 0.0f, r.err)) {
+        std::printf("ERR AtomicChat draft scale: %s\n", r.err.c_str());
+        return Flow::error;
+    }
+    if (key == r.active_cache) return Flow::proceed;
+    if (!deferred && !r.park_current(0, 0, profile_switch)) {
+        std::printf("ERR could not park the outgoing request session\n");
+        return Flow::error;
+    }
+    if (mode != r.active_adapter) {
+        const float scale = req_atomic_lora ? QfnRuntime::atomic_lora_scale : 0.0f;
+        try {
+            const auto sync = [](int device) {
+                const basalt::core::OnDevice on(device);
+                const auto status = cudaDeviceSynchronize();
+                if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
+            };
+            sync(0);
+            if (r.peer.valid() && (r.lora_peer || r.swift_peer)) sync(r.peer.device());
+            if (r.lora_main) r.lora_main->set_scale(scale);
+            if (r.lora_peer) r.lora_peer->set_scale(scale);
+            const float swift = req_swift_lora ? QfnRuntime::swift_lora_scale : 0.0f;
+            if (r.swift_main) r.swift_main->set_scale(swift);
+            if (r.swift_peer && r.peer.valid()) r.swift_peer->set_scale(swift);
+        } catch (const std::exception& error) {
+            std::printf("ERR LoRA scale switch: %s\n", error.what());
+            return Flow::error;
+        }
+        r.ver.set_solo_swift(req_swift_lora);
+        if (r.thinking_ver) r.thinking_ver->set_solo_swift(req_swift_lora);
+        r.sp.bind_swift_lora(req_swift_lora ? r.swift_main : nullptr);
+        r.sp.set_cpu_lora(r.lora_host.get(), scale);
+        for (auto& stage : r.pstages) {
+            stage->sp.bind_swift_lora(req_swift_lora ? r.swift_peer : nullptr);
+            stage->sp.set_cpu_lora(r.lora_host.get(), scale);
+        }
+        r.drive.d.cpu_lora = r.lora_host.get();
+        r.drive.d.cpu_lora_scale = scale;
+    }
+    r.conversations->drop_reuse_unless(nullptr);
+    r.conversations.swap(r.parked_conversations[r.active_cache]);
+    r.conversations.swap(r.parked_conversations[key]);
+    r.live.clear();
+    r.live_imgs.clear();
+    r.checks.clear();
+    r.live_ok = false;
+    r.active_adapter = mode;
+    r.active_cache = key;
+    return Flow::proceed;
+}
+
 float QfnRequest::default_relax() const { return runtime_.o.relaxed_drafting; }
+
+Flow QfnRequest::check_prepared_capacity(int64_t cells) {
+    const int slot = runtime_.solo_slot >= 0 ? runtime_.solo_slot : runtime_.admit_slot;
+    const bool own_slot = runtime_.slot0_solo() && slot > 0;
+    const int64_t page_cells = basalt::kernels::qsa_real_shapes().page_size;
+    const auto pages = size_t(1 + (cells - 1) / page_cells);
+    if (runtime_.shared_pages) {
+        if (pages > runtime_.shared_pages->capacity()) {
+            std::printf("ERR shared KV: request exceeds pool capacity\n");
+            std::fflush(stdout);
+            return Flow::next;
+        }
+        if (const auto result = runtime_.publish_shared_request(own_slot ? slot : 0, static_cast<uint32_t>(pages),
+                                                               request_adapter());
+            result != Flow::proceed) return result;
+    }
+    const auto covered = [pages](const basalt::core::SessionState& session) {
+        for (int64_t i = 0; i < session.qsa_alloc; ++i) {
+            const auto& state = session.qsa_states[session.qsa_ord0 + i];
+            if (state.shared_residency &&
+                (!state.host.fp16_host_pages || !state.host_page_ids || pages > state.host_page_count))
+                return false;
+        }
+        return true;
+    };
+    const auto all_covered = [&] {
+        if (own_slot) {
+            for (const auto& stage : runtime_.bslot_ss)
+                if (!covered(*stage[(size_t) slot])) return false;
+            return true;
+        }
+        if (!covered(runtime_.ss)) return false;
+        for (const auto& stage : runtime_.stages)
+            if (!covered(stage->ss)) return false;
+        return true;
+    };
+    if (all_covered()) return Flow::proceed;
+    std::printf("ERR shared KV: request pages were not published before generation\n");
+    std::fflush(stdout);
+    return Flow::next;
+}
 
 Flow QfnRequest::prepare_image() {
     if (const Flow flow = begin_quality_gate(runtime_.ppl_base, runtime_.ppl_out, runtime_.S); flow != Flow::proceed) return flow;

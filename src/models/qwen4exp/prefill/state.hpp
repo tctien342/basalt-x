@@ -29,11 +29,16 @@ struct Prefill::Impl {
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
     bool borrowed = false;
+    uint64_t layout_bytes = 0;
     uint32_t* hist = nullptr;                // routed-entry counts per (layer, expert); see route_hist_reset
     int64_t hist_n = 0, hist_tokens = 0;
     bool hist_on = false;
     cudaStream_t cs = nullptr, copy = nullptr;
+    cudaEvent_t kv_copy_start = nullptr, kv_copy_done = nullptr;
     Gemm gemm;
+    const basalt::qwen4exp::AtomicLoraDevice* peer_lora = nullptr;
+    const basalt::qwen4exp::AtomicLora* cpu_lora = nullptr;
+    float cpu_lora_scale = 0;
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;

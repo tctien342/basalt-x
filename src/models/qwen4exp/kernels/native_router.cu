@@ -99,11 +99,13 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
 }
 // The residency-biased router: the weights are `route`'s, the selection ranks the resident experts' probabilities times
 // `boost`. One warp a token.
+template<int FixedK>
 __launch_bounds__(32, 1)
 __global__ void route_prior(const float* __restrict__ logits, ResidentTabs held, float boost, int32_t* __restrict__ ids,
-                            float* __restrict__ weights, unsigned long long* counts) {
+                            float* __restrict__ weights, unsigned long long* counts, int k) {
     pdl_wait();
-    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
+    const int K = FixedK != 0 ? FixedK : k;
+    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * K; weights += (size_t) blockIdx.x * K;
     const int lane = threadIdx.x;
     float values[16];
 #pragma unroll
@@ -130,18 +132,18 @@ __global__ void route_prior(const float* __restrict__ logits, ResidentTabs held,
         resident |= (uint32_t) in << i;
         score[i] = in ? values[i] * boost : values[i];
     }
-    // the tenth largest probability of the unbiased router, to count the picks the bias changed
-    float tenth = 0.0f;
+    // the Kth largest probability of the unbiased router, to count the picks the bias changed
+    float cutoff = 0.0f;
     if (counts != nullptr) {
         float u[16];
 #pragma unroll
         for (int i = 0; i < 16; ++i) u[i] = values[i];
-        for (int rank = 0; rank < 10; ++rank) {
+        for (int rank = 0; rank < K; ++rank) {
             float best = u[0];
 #pragma unroll
             for (int i = 1; i < 16; ++i) best = max(best, u[i]);
             best = warp_max(best);
-            tenth = best;
+            cutoff = best;
             int hit = 16;
 #pragma unroll
             for (int i = 15; i >= 0; --i) if (u[i] == best) hit = i;
@@ -154,7 +156,7 @@ __global__ void route_prior(const float* __restrict__ logits, ResidentTabs held,
     }
     float selected = 0.0f, selected_sum = 0.0f;
     int selected_res = 0;
-    for (int rank = 0; rank < 10; ++rank) {
+    for (int rank = 0; rank < K; ++rank) {
         float best = score[0], prob = values[0];
         int expert = lane, in = (int) (resident & 1u);
 #pragma unroll
@@ -178,12 +180,12 @@ __global__ void route_prior(const float* __restrict__ logits, ResidentTabs held,
     }
     selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
     const float inverse_selected_sum = 1.0f / selected_sum;
-    if (lane < 10) weights[lane] = selected * inverse_selected_sum;
+    if (lane < K) weights[lane] = selected * inverse_selected_sum;
     if (counts != nullptr) {
-        const unsigned changed = __ballot_sync(0xffffffffu, lane < 10 && selected < tenth);
-        const unsigned outside = __ballot_sync(0xffffffffu, lane < 10 && selected_res == 0);
+        const unsigned changed = __ballot_sync(0xffffffffu, lane < K && selected < cutoff);
+        const unsigned outside = __ballot_sync(0xffffffffu, lane < K && selected_res == 0);
         if (lane == 0) {
-            atomicAdd(&counts[3], 10ull);
+            atomicAdd(&counts[3], (unsigned long long) K);
             atomicAdd(&counts[4], (unsigned long long) __popc(changed));
             atomicAdd(&counts[5], (unsigned long long) __popc(outside));
         }
@@ -215,13 +217,14 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
-void route_prior_top10(const float* logits, const ResidentTabs& held, float lambda, int32_t* ids, float* weights, int n_tok,
+void route_prior_topk(const float* logits, const ResidentTabs& held, float lambda, int32_t* ids, float* weights, int n_tok, int k,
                        unsigned long long* counts, void* stream) {
-    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
-        !valid(weights, (size_t) n_tok * 10 * 4))
-        throw std::invalid_argument("route prior requires a stream and aligned [n,512]/[n,10] buffers");
-    launch_pdl(route_prior, dim3((unsigned) n_tok), dim3(32), 0, static_cast<cudaStream_t>(stream), logits, held,
-               std::exp(lambda), ids, weights, counts);
+    if (!stream || n_tok < 1 || (k < 10 || k > 23) || !valid(logits, (size_t) n_tok * 512 * 4) || !valid(ids, (size_t) n_tok * k * 4) ||
+        !valid(weights, (size_t) n_tok * k * 4))
+        throw std::invalid_argument("route prior requires a stream and aligned [n,512]/[n,k] buffers");
+    const auto kernel = k == 10 ? route_prior<10> : k == 23 ? route_prior<23> : route_prior<0>;
+    launch_pdl(kernel, dim3((unsigned) n_tok), dim3(32), 0, static_cast<cudaStream_t>(stream), logits, held,
+               std::exp(lambda), ids, weights, counts, k);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

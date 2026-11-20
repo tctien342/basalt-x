@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
+#include <optional>
 #include <mutex>
 #include <new>
 #include <type_traits>
@@ -108,7 +110,64 @@ private:
         return *p;
     }
 };
-using CheckpointBytes = std::vector<uint8_t, PooledAlloc<uint8_t>>;
+class CheckpointBytes {
+    using Storage = std::vector<uint8_t, PooledAlloc<uint8_t>>;
+
+public:
+    using allocator_type = Storage::allocator_type;
+
+    CheckpointBytes() = default;
+    CheckpointBytes(size_t n, uint8_t value) : owned_(n, value) {}
+    CheckpointBytes(const CheckpointBytes& other) : owned_(other.storage()) {}
+    CheckpointBytes& operator=(const CheckpointBytes& other) {
+        if (this != &other) *this = CheckpointBytes(other);
+        return *this;
+    }
+    CheckpointBytes(CheckpointBytes&&) noexcept = default;
+    CheckpointBytes& operator=(CheckpointBytes&&) noexcept = default;
+
+    // Only completed host snapshots can share. Ordinary copies keep their
+    // independent backing. A mutable accessor detaches before returning.
+    CheckpointBytes shared_copy() {
+        CheckpointBytes out;
+        if (empty()) return out;
+        if (!shared_) shared_ = std::make_shared<Storage>(std::move(owned_));
+        out.shared_ = shared_;
+        return out;
+    }
+
+    size_t size() const { return storage().size(); }
+    size_t capacity() const { return storage().capacity(); }
+    bool empty() const { return storage().empty(); }
+    const uint8_t* data() const { return storage().data(); }
+    uint8_t* data() { return writable().data(); }
+    auto begin() const { return storage().begin(); }
+    auto end() const { return storage().end(); }
+    auto begin() { return writable().begin(); }
+    auto end() { return writable().end(); }
+    const uint8_t& operator[](size_t i) const { return storage()[i]; }
+    uint8_t& operator[](size_t i) { return writable()[i]; }
+    bool operator==(const CheckpointBytes& other) const { return storage() == other.storage(); }
+    void resize(size_t n) { writable().resize(n); }
+    void resize(size_t n, uint8_t value) { writable().resize(n, value); }
+    void assign(size_t n, uint8_t value) { writable().assign(n, value); }
+    void push_back(uint8_t value) { writable().push_back(value); }
+    void pop_back() { writable().pop_back(); }
+
+private:
+    const Storage& storage() const { return shared_ ? *shared_ : owned_; }
+    Storage& writable() {
+        if (shared_) {
+            if (shared_.use_count() == 1) owned_ = std::move(*shared_);
+            else owned_ = *shared_;
+            shared_.reset();
+        }
+        return owned_;
+    }
+
+    Storage owned_;
+    std::shared_ptr<Storage> shared_;
+};
 
 struct ConversationImageKey {
     int64_t start = 0;
@@ -129,6 +188,22 @@ struct ConversationCheckpoint {
     // Whole-session parking is currently single-GPU and rejects these parts.
     std::vector<ConversationCheckpoint> stage_parts;
 
+    ConversationCheckpoint shared_copy() {
+        ConversationCheckpoint out;
+        out.source = source;
+        out.ids = ids;
+        out.imgs = imgs;
+        out.state_a = state_a.shared_copy();
+        out.state_b = state_b.shared_copy();
+        out.state_c = state_c.shared_copy();
+        out.state_d = state_d.shared_copy();
+        out.state_e = state_e.shared_copy();
+        out.used = used;
+        out.stage_parts.reserve(stage_parts.size());
+        for (auto& part : stage_parts) out.stage_parts.push_back(part.shared_copy());
+        return out;
+    }
+
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
                state_a.capacity() + state_b.capacity() + state_c.capacity() + state_d.capacity() + state_e.capacity() +
@@ -144,8 +219,13 @@ struct ConversationKv {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     ConversationBuffer k, v, k_scale, v_scale, pooled;
-    size_t bytes() const {
-        return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();
+    size_t bytes(bool only_unique = false) const {
+        return k.bytes(only_unique) + v.bytes(only_unique) + k_scale.bytes(only_unique) +
+               v_scale.bytes(only_unique) + pooled.bytes(only_unique);
+    }
+    ConversationKv shared_copy() const {
+        return {format, cells, heads, head_dim, page_size, pooled_rows, idx_dim,
+                k.shared_copy(), v.shared_copy(), k_scale.shared_copy(), v_scale.shared_copy(), pooled.shared_copy()};
     }
 };
 
@@ -155,10 +235,10 @@ struct ConversationKvReuse {
     int64_t captured_tokens = 0, unchanged_tokens = 0;
     // With a layer split: the later stages' own retained K/V, one per stage, same extents (empty: none)
     std::vector<ConversationKvReuse> stages;
-    size_t bytes() const {
+    size_t bytes(bool only_unique = false) const {
         size_t n = kv.capacity() * sizeof(ConversationKv) + stages.capacity() * sizeof(ConversationKvReuse);
-        for (const auto& layer : kv) n += layer.bytes();
-        for (const auto& s : stages) n += s.bytes();
+        for (const auto& layer : kv) n += layer.bytes(only_unique);
+        for (const auto& s : stages) n += s.bytes(only_unique);
         return n;
     }
 };
@@ -233,6 +313,27 @@ struct SavedConversation {
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
+    // The recovery writer only accepts unsplit images. Give it independent
+    // metadata while sharing the completed host payload with the live cache.
+    std::optional<SavedConversation> shared_recovery_view() {
+        if (!stage_images.empty() || !live.stage_parts.empty() ||
+            std::any_of(checkpoints.begin(), checkpoints.end(),
+                        [](const auto& checkpoint) { return !checkpoint.stage_parts.empty(); }))
+            return std::nullopt;
+        SavedConversation out;
+        out.geometry = geometry;
+        out.layer_lo = layer_lo;
+        out.layer_hi = layer_hi;
+        out.live = live.shared_copy();
+        out.cvec = cvec;
+        out.from_slot = from_slot;
+        out.checkpoints.reserve(checkpoints.size());
+        for (auto& checkpoint : checkpoints) out.checkpoints.push_back(checkpoint.shared_copy());
+        out.kv.reserve(kv.size());
+        for (const auto& layer : kv) out.kv.push_back(layer.shared_copy());
+        return out;
+    }
+
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
                    kv.capacity() * sizeof(ConversationKv);
@@ -285,7 +386,7 @@ public:
 
     ConversationCache(size_t budget, size_t slots) : budget_(budget), slots_(slots) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
-    size_t bytes() const { return bytes_ + reuse_.bytes(); }
+    size_t bytes() const { return bytes_ + retained_bytes(); }
     size_t size() const { return entries_.size(); }
     /// the idle slots' conversations among them (put_slot) and their bytes
     size_t slot_size() const { return slot_count_; }
@@ -298,27 +399,76 @@ public:
     // `owner`: the session the buffers were restored into; only that session's own state may be captured with them.
     void retain(std::vector<ConversationKv>&& kv, int64_t tokens,
                 std::vector<std::vector<ConversationKv>>&& stage_kv = {}, const void* owner = nullptr) {
-        reuse_ = {};
+        clear_retained();
         reuse_owner_ = owner;
+        donor_ = {};
         ConversationKvReuse candidate{std::move(kv), tokens, tokens, {}};
         for (auto& k : stage_kv) candidate.stages.push_back(ConversationKvReuse{std::move(k), tokens, tokens, {}});
         if (enabled() && candidate.bytes() <= budget_ - (bytes_ - slot_bytes_)) reuse_ = std::move(candidate);
     }
+    bool can_retain_complete(size_t bytes) const {
+        return enabled() && bytes <= budget_ - (bytes_ - slot_bytes_);
+    }
+    // The accepted writer has its own metadata and shares the backing bytes.
+    // Allow full reuse only on the next command and charge it as one
+    // retained allocation. Later use can still reuse just the K/V.
+    void retain_complete(SavedConversation&& image, const void* owner, uint64_t next_dispatch) {
+        const bool complete = can_retain_complete(image.bytes());
+        const auto tokens = static_cast<int64_t>(image.live.ids.size());
+        retain(std::exchange(image.kv, {}), tokens, {}, owner);
+        if (complete && !reuse_.kv.empty()) {
+            ready_.emplace(std::move(image));
+            ready_dispatch_ = next_dispatch;
+        }
+    }
+    std::optional<SavedConversation> take_complete(const void* owner, uint64_t dispatch,
+                                                   const std::vector<int32_t>& ids,
+                                                   const std::vector<ConversationImageKey>& imgs, bool cvec) {
+        if (!ready_ || !owner || owner != reuse_owner_ || dispatch != ready_dispatch_ ||
+            ready_->live.ids != ids || ready_->live.imgs != imgs || ready_->cvec != cvec) return std::nullopt;
+        ready_->kv = std::move(reuse_.kv);
+        auto image = std::exchange(ready_, std::nullopt);
+        reuse_ = {};
+        return image;
+    }
     void limit_reuse(int64_t first_dirty) {
+        ready_.reset();
         reuse_.unchanged_tokens = std::min(reuse_.unchanged_tokens, first_dirty);
         for (auto& s : reuse_.stages) s.unchanged_tokens = std::min(s.unchanged_tokens, first_dirty);
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
+        donor_.unchanged = std::min(donor_.unchanged, first_dirty);
+        if (donor_.unchanged <= 0) donor_ = {};
     }
     // Buffers retained for another session (a batch slot's, or the one a slot's copy has since overwritten) hold
     // another conversation's K/V: they are dropped, never handed to this session's capture.
     void drop_reuse_unless(const void* owner) {
-        if (owner != reuse_owner_) reuse_ = {};
+        if (owner != reuse_owner_) clear_retained();
+        if (owner != donor_.owner) donor_ = {};
+    }
+    const ConversationKvReuse* retained_reuse(const void* owner) const {
+        return owner && owner == reuse_owner_ && !reuse_.kv.empty() ? &reuse_ : nullptr;
     }
     ConversationKvReuse take_reuse(const void* owner = nullptr) {
         drop_reuse_unless(owner);
+        ready_.reset();
         return std::exchange(reuse_, {});
     }
-    size_t retained_bytes() const { return reuse_.bytes(); }
+    size_t retained_bytes() const { return reuse_.bytes() + (ready_ ? ready_->bytes() : 0); }
+    // Call after ordinary eviction. A donor still in the cache keeps its image
+    // and every borrower detaches before writing any shared segment.
+    ConversationKvReuse share_donor(const void* owner) const {
+        if (spill_ || !owner || owner != donor_.owner || donor_.unchanged < 32768) return {};
+        for (const auto& entry : entries_) {
+            if (entry.live.ids.data() != donor_.ids) continue;
+            ConversationKvReuse shared;
+            shared.captured_tokens = (int64_t) entry.live.ids.size();
+            shared.unchanged_tokens = donor_.unchanged;
+            shared.kv.reserve(entry.kv.size());
+            for (const auto& layer : entry.kv) shared.kv.push_back(layer.shared_copy());
+            return shared;
+        }
+        return {};
+    }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() - slot_count_ < slots_ && budgeted_bytes() <= budget_ - held - incoming;
@@ -353,11 +503,26 @@ public:
     // with take() but still alive during the exchange; count it against RAM too.
     // The idle slots' conversations are outside the budget: they stay.
     bool make_room(size_t incoming, size_t held = 0) {
+        return make_room(incoming, held, nullptr, nullptr);
+    }
+
+    // The regular victim still leaves. Its payload can be reused only for the
+    // active session that kept an unchanged prefix when that entry was parked.
+    bool make_room(size_t incoming, size_t held, const void* owner, ConversationKvReuse* reuse) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
-        if (budgeted_bytes() > budget_ - held - incoming) reuse_ = {};
+        if (spill_ || !owner || owner != donor_.owner) reuse = nullptr;
+        if (budgeted_bytes() > budget_ - held - incoming) clear_retained();
         while (entries_.size() - slot_count_ >= slots_ || bytes_ - slot_bytes_ > budget_ - held - incoming)
-            if (!evict_oldest(false)) break;
+            if (!evict_oldest(false, reuse)) break;
         return true;
+    }
+
+    void remember_park(const void* owner, int64_t kept) {
+        donor_ = {};
+        if (spill_ || !owner || kept <= 0 || entries_.empty()) return;
+        const auto& e = entries_.back();
+        if (!e.from_slot && e.stage_images.empty() && !e.kv.empty() && kept <= (int64_t) e.live.ids.size())
+            donor_ = {e.live.ids.data(), owner, kept};
     }
 
     /// An idle batch slot's conversation, out of VRAM: kept whatever the byte budget (the caller has admitted its
@@ -422,8 +587,9 @@ public:
         bytes_ = 0;
         slot_bytes_ = 0;
         slot_count_ = 0;
-        reuse_ = {};
+        clear_retained();
         reuse_owner_ = nullptr;
+        donor_ = {};
         return freed;
     }
 
@@ -439,20 +605,31 @@ public:
     }
 
 private:
-    size_t budgeted_bytes() const { return bytes_ - slot_bytes_ + reuse_.bytes(); }
+    size_t budgeted_bytes() const { return bytes_ - slot_bytes_ + retained_bytes(); }
+    void clear_retained() {
+        ready_.reset();
+        reuse_ = {};
+    }
     // the bookkeeping of an entry that has left `entries_`
     void forget(const SavedConversation& e) {
+        if (e.live.ids.data() == donor_.ids) donor_ = {};
         const size_t n = e.bytes();
         bytes_ -= n;
         if (e.from_slot) { slot_bytes_ -= n; --slot_count_; }
     }
     // the oldest entry of one kind (an idle slot's or a budgeted one) leaves; false when there is none
-    bool evict_oldest(bool from_slot) {
+    bool evict_oldest(bool from_slot, ConversationKvReuse* reuse = nullptr) {
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].from_slot != from_slot) continue;
             SavedConversation gone = std::move(entries_[i]);
             entries_.erase(entries_.begin() + (std::ptrdiff_t) i);
+            const int64_t unchanged = reuse && gone.live.ids.data() == donor_.ids ? donor_.unchanged : 0;
             forget(gone);
+            if (unchanged > 0) {
+                reuse->captured_tokens = (int64_t) gone.live.ids.size();
+                reuse->unchanged_tokens = unchanged;
+                reuse->kv = std::move(gone.kv);
+            }
             if (spill_) spilled_.push_back(std::move(gone));
             ++evictions_;
             return true;
@@ -465,7 +642,14 @@ private:
     bool spill_ = false;
     std::vector<SavedConversation> spilled_;
     ConversationKvReuse reuse_;
+    std::optional<SavedConversation> ready_;   // complete recovery metadata; its KV lives in reuse_
+    uint64_t ready_dispatch_ = 0;
     const void* reuse_owner_ = nullptr;
+    struct EvictionDonor {
+        const int32_t* ids = nullptr;
+        const void* owner = nullptr;
+        int64_t unchanged = 0;
+    } donor_;
 };
 
 } // namespace basalt::core

@@ -77,12 +77,14 @@ class SwapEngine(ProcessEngine):
 
 class Base(unittest.TestCase):
     NAMES = ("A", "B")
+    SERVICE_OPTIONS = {}
 
     def setUp(self):
         tok = ByteTokenizer()
         self.events = []
         self.engines = {n: SwapEngine(tok, n, self.events) for n in self.NAMES}
-        self.svcs = {n: Service(e, tok, ChatTemplate.from_file(TEMPLATE), model_name=n) for n, e in self.engines.items()}
+        self.svcs = {n: Service(e, tok, ChatTemplate.from_file(TEMPLATE), model_name=n, **self.SERVICE_OPTIONS)
+                     for n, e in self.engines.items()}
         for e in self.engines.values():
             e.model_path = f"/packs/{e.name}.basalt"
         self.router = Router(list(self.svcs.values()))
@@ -145,6 +147,31 @@ class Base(unittest.TestCase):
 
     def order(self, kinds=("start", "end")):
         return [e for e in self.events if e[0] in kinds]
+
+
+class AdapterAliases(Base):
+    NAMES = ("qwen3.8-flash-next",)
+    SERVICE_OPTIONS = {"atomic_lora": True, "swift_lora": True}
+
+    def test_alias_list_and_private_native_selectors(self):
+        base, = self.NAMES
+        selectors = {
+            base: "",
+            f"{base}-swift": " swift_lora=1",
+            f"{base}-uncen": " atomic_lora=1",
+            f"{base}-uncen-swift": " atomic_lora=1 swift_lora=1",
+        }
+        status, models = self.get("/v1/models")
+        self.assertEqual(status, 200)
+        self.assertEqual([entry["id"] for entry in models["data"]], list(selectors))
+        engine = self.engines[base]
+        with mock.patch.object(engine, "generate", wraps=engine.generate) as generate:
+            for name, keys in selectors.items():
+                with self.subTest(model=name):
+                    status, body = self.chat(name)
+                    self.assertEqual(status, 200, body)
+                    self.assertEqual(json.loads(body)["model"], name)
+                    self.assertEqual(ProcessEngine.sampling_keys(generate.call_args.args[2] or {}), keys)
 
 
 class Routing(Base):

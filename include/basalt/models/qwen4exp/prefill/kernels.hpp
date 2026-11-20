@@ -82,6 +82,10 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
 
+/// Same combine with the peer interval stored as compact FP16 at the start of its FP32 allocation.
+void moe_combine_peer_fp16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                          float* bo, int64_t T, int64_t peer_begin, int64_t peer_rows, void* stream);
+
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream);
@@ -104,6 +108,9 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
 
 /// fp32 -> fp16 bits and fp32 -> bf16, n elements (the two activation images of the prompt GEMMs).
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
+void from_f16(const uint16_t* x, float* y, int64_t n, void* stream);
+void expand_f16_in_place(float* storage, int64_t n, void* stream);
+void quantize_cpu_q8k(const float* x, void* packed, int64_t n, void* stream);
 void to_bf16(const float* x, uint16_t* y, int64_t n, void* stream, uint16_t* ylo = nullptr);
 /// y = fp32(fp16(x)): what an FP16 store of x would read back (the FP16 indexer-key experiment)
 void round_f16(const float* x, float* y, int64_t n, void* stream);

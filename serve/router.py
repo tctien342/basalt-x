@@ -78,6 +78,8 @@ class Router:
             if why and model["status"]["value"] == "unloaded":
                 model["status"] = {"value": "failed", "error": why}
             out.append(model)
+            out.extend({**model, "id": name, "meta": {**model["meta"], "n_ctx": svc.model_context(name)}}
+                       for name in svc.adapted_models)
         return out
 
     def swap_status(self) -> dict | None:

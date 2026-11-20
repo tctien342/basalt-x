@@ -2,8 +2,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
+
+namespace basalt::qwen4exp { class AtomicLoraDevice; }
 
 namespace basalt::core {
 
@@ -58,8 +61,10 @@ public:
     NativeEmbed(const NativeEmbed&) = delete;
     NativeEmbed& operator=(const NativeEmbed&) = delete;
     bool load(const std::vector<std::string>& shards, int64_t n_embd, int64_t n_vocab, std::string& err);
+    /// Bind before capture. The device factors must outlive graphs using this embedding.
+    void bind_lora(int device, const basalt::qwen4exp::AtomicLoraDevice& adapter);
     /// Rows for device token ids.
-    void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const;
+    void gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream, const float* adapter_rows = nullptr) const;
     /// One row for a host token id.
     void gather_one(int64_t token, float* out, void* stream) const;
     uint64_t bytes() const { return bytes_; }
@@ -70,6 +75,8 @@ public:
     static constexpr int64_t kHotRows = 8192;
 
 private:
+    struct LoraFactors { const float* a; const float* b; const float* scale; };
+    std::map<int, LoraFactors> lora_;
     void* host_ = nullptr;
     const void* dev_ = nullptr;
     void* hot_ = nullptr;
@@ -80,7 +87,7 @@ private:
     int64_t n_embd_ = 0, n_vocab_ = 0;
     int type_ = -1;
 };
-void set_native_embed(const NativeEmbed* e);
-const NativeEmbed* native_embed();
+void set_native_embed(NativeEmbed* e);
+NativeEmbed* native_embed();
 
 }  // namespace basalt::core

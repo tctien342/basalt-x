@@ -4,6 +4,17 @@
 
 namespace basalt::models::qwen4exp::serve {
 
+bool QfnRequest::slot_prefix_compatible(int slot, int64_t tokens) const {
+    if (!runtime_.shared_pages) return true;
+    const auto& sequence = *runtime_.shared_sequences[(size_t) slot];
+    if (sequence.adapter != request_adapter() || sequence.rope_context != basalt::kernels::rope_context())
+        return false;
+    if (tokens <= 0) return true;
+    const int64_t page = basalt::kernels::qsa_real_shapes().page_size;
+    return basalt::core::SharedKvTable::covers_prefix(sequence.lease, sequence.stages,
+                                                     static_cast<uint32_t>((tokens + page - 1) / page));
+}
+
 bool QfnRequest::cvec_wanted() const { return basalt::kernels::cvec().loaded() ? req_cvec != 0 : true; }
 void QfnRequest::set_cvec() { if (basalt::kernels::cvec().loaded()) basalt::kernels::cvec_set_enabled(want_cvec); }
 void QfnRequest::select_view() { rview = &(runtime_.rviews[(size_t) std::max(slot_b, 0)]); }
@@ -30,7 +41,8 @@ bool QfnRequest::restore_begin() {
     // the last request's final commit may still be running on the verifier's stream (set_commit_async):
     // everything below reads, restores or zeroes the session from other streams and the host (the end of the
     // last request waited already; this covers a request that ended on an error path)
-    if (!runtime_.ver.wait_commit(runtime_.err)) {
+    if ((runtime_.thinking_ver && !runtime_.thinking_ver->wait_commit(runtime_.err)) ||
+        !runtime_.ver.wait_commit(runtime_.err)) {
         return false;
     }
     return true;
@@ -60,6 +72,34 @@ Flow QfnRequest::slot_bind() {
 }
 
 void QfnRequest::validate_incoming() {
+    if (incoming && runtime_.shared_pages && runtime_.stages.empty() && !in_live &&
+        in_tokens > 0 && in_tokens < (int64_t) incoming->live.ids.size()) {
+        const auto& target = *runtime_.rsp;
+        const int64_t page_size = basalt::kernels::qsa_real_shapes().page_size;
+        const size_t required = (incoming->live.ids.size() + page_size - 1) / page_size;
+        const size_t prefix = (in_tokens + page_size - 1) / page_size;
+        bool short_mapping = false, prefix_covered = true;
+        for (int64_t i = 0; i < target.qsa_alloc; ++i) {
+            const auto& state = target.qsa_states[target.qsa_ord0 + i];
+            if (!state.host.fp16_host_pages) continue;
+            short_mapping |= state.host_page_count < required;
+            prefix_covered &= state.host_page_ids && state.host_page_count >= prefix;
+        }
+        // Keep the admitted request lease. Only the checkpoint prefix is
+        // needed, even if a longer parked branch supplied its running state.
+        if (short_mapping && prefix_covered) {
+            if (!basalt::core::conversation_snapshot_trim_to_checkpoint(
+                    *incoming, target, runtime_.g, runtime_.mtp_kv, in_tokens, runtime_.err)) {
+                basalt::log::warn("basalt serve", "conversation cache: cannot trim snapshot to shared prefix (%s)",
+                                  runtime_.err.c_str());
+                incoming.reset();
+                runtime_.err.clear();
+            } else {
+                basalt::log::info("basalt serve", "conversation cache: trimmed parked snapshot to %lld shared KV tokens",
+                                  (long long) in_tokens);
+            }
+        }
+    }
     // Reject the entire image before parking/overwriting the outgoing
     // state. Invalid entries can safely fall back to its existing prefix.
     if (incoming && incoming->stage_images.size() != runtime_.stages.size()) {
@@ -173,6 +213,10 @@ Flow QfnRequest::make_room() {
 Flow QfnRequest::restore_image() {
         // the draft layer's K/V goes to the main sequence, which then holds it as written
         if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) {
+            std::printf("ERR %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
+        if (runtime_.mtp_kv && !runtime_.mtp.before_draft_write(0, (int64_t) incoming->live.ids.size(), runtime_.err)) {
             std::printf("ERR %s\n", runtime_.err.c_str());
             return Flow::error;
         }

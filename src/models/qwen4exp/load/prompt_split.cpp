@@ -6,6 +6,7 @@
 namespace basalt::models::qwen4exp::generate {
 
 int split_plan(Context& context) {
+    const auto probe_started = Clock::now();
     auto& o = *context.o;
     auto& chosen_cards = *context.chosen_cards;
     auto& pack_files = *context.pack_files;
@@ -23,7 +24,7 @@ int split_plan(Context& context) {
     double split_host_gbps = 0;   // the host's bandwidth to the main card and every tier card at once
     if (split_want) {
         const char* off = o.peer_exclusive ? "the tier's experts have no RAM copy (--peer-exclusive)"
-                        : !o.resident_cpu_experts ? "no RAM copy of the experts" : nullptr;
+                        : !o.resident_cpu_experts && o.shared_expert_arena.empty() ? "no RAM copy of the experts" : nullptr;
         if (off == nullptr && main_link_gbps <= 0) main_link_gbps = probe_pcie_h2d_gbps();   // (a set --pcie-frac skips it)
         if (off == nullptr) {
             std::vector<double> bw;
@@ -53,9 +54,13 @@ int split_plan(Context& context) {
             for (const auto& st : pstages) devs.push_back(st->dev);
             split_host_gbps = probe_h2d_together_gbps(devs);
             if (split_host_gbps <= 0) off = "a link probe failed";
-            else
+            else {
                 basalt::log::info("basalt generate", "prompt split: %.1f GB/s host->device with %zu cards copying at once",
                                   split_host_gbps, devs.size());
+                if (o.serve)
+                    std::printf("INFO pcie_h2d_combined_mbps=%lld pcie_h2d_combined_devices=%zu\n",
+                                (long long) (split_host_gbps * 1000.0 + 0.5), devs.size());
+            }
         }
         if (off != nullptr) {
             basalt::log::info("basalt generate", "prompt split: off (%s)", off);
@@ -63,23 +68,52 @@ int split_plan(Context& context) {
             pstages.clear();
         }
     }
+    log_expert_load_phase(context, "split link probes", probe_started);
+    const auto budget_started = Clock::now();
     // the RAM its page-locked buffers take at their most, held before the RAM copy is sized: each stage's weights for
     // the widest window (every layer past the second), the hand-off buffers of the main card and of every stage that
     // hands chunks on for the longest chunk a split reads, the stages' staging rings and their state copies
+    std::future<bool> ram_reservation;
     if (o.serve && !pstages.empty()) {
         std::vector<uint64_t> pool_l, nat_l;
         uint64_t pool_sh = 0, nat_sh = 0;
-        bool ok = basalt::core::WeightTable::pool_bytes_by_layer(pack_files, g.n_layers, pool_l, pool_sh, err, &skip_base) &&
-                  basalt::core::NativeDense::plan_bytes_by_layer(o.native_shards, true, g.n_layers, nat_l, nat_sh, err);
+        const bool ok = basalt::core::WeightTable::pool_bytes_by_layer(pack_files, g.n_layers, pool_l, pool_sh, err, &skip_base) &&
+                        basalt::core::NativeDense::plan_bytes_by_layer(o.native_shards, true, g.n_layers, nat_l, nat_sh, err);
         uint64_t widest = pool_sh + nat_sh;
         for (int64_t l = 2; ok && l < g.n_layers; ++l) widest += pool_l[(size_t) l] + nat_l[(size_t) l];
         const int64_t rows = o.prefill_auto_fit ? std::min<int64_t>(o.prefill_chunk, kMaxAutoChunk) : o.prefill_chunk;
-        for (size_t j = 0; ok && j < pstages.size(); ++j) {
-            ok = basalt::core::host_plan((size_t) widest) && basalt::core::host_plan(256u << 20);
-            for (int b = 0; ok && b < 2; ++b) ok = basalt::core::host_plan((size_t) rows * (size_t) (g.hc * g.n_embd) * sizeof(float));
-            for (int b = 0; ok && b < 2 * basalt::core::StagedCopy::kBufs; ++b) ok = basalt::core::host_plan(8u << 20);
-        }
-        if (!ok) {
+        const size_t handoff_bytes = (size_t) rows * (size_t) (g.hc * g.n_embd) * sizeof(float);
+        const int touch_flag = basalt::core::exp_flag("startup_split_reserve_page_touch", 0);
+        using Touch = basalt::core::HostPlanTouch;
+        const Touch touch = touch_flag == 2 ? Touch::Prefault : touch_flag != 0 ? Touch::Page : Touch::Zero;
+        auto reserve = [widest, handoff_bytes, touch, stages = pstages.size()] {
+            const auto started = Clock::now();
+            bool held = true;
+            for (size_t j = 0; held && j < stages; ++j) {
+                held = basalt::core::host_plan((size_t) widest, touch) && basalt::core::host_plan(256u << 20, touch);
+                for (int b = 0; held && b < 2; ++b) held = basalt::core::host_plan(handoff_bytes, touch);
+                for (int b = 0; held && b < 2 * basalt::core::StagedCopy::kBufs; ++b)
+                    held = basalt::core::host_plan(8u << 20, touch);
+            }
+            basalt::log::info("basalt startup", "split RAM reserve work: %.3f s, page-touch=%d",
+                              std::chrono::duration<double>(Clock::now() - started).count(), (int) touch);
+            return held;
+        };
+        // The shared arena already holds all experts. The file-backed complement still needs the reservation first.
+        const bool overlap = context.expert_fill_started != Clock::time_point{} &&
+                             basalt::core::exp_flag("startup_parallel_split_reserve", 0) != 0;
+        const bool after_peer = touch == Touch::Prefault &&
+                                basalt::core::exp_flag("startup_split_prefault_after_peer_alloc", 0) != 0;
+        if (ok && overlap) {
+            if (after_peer) {
+                context.before_peer_upload = [&ram_reservation, reserve] {
+                    basalt::log::info("basalt startup", "split RAM prefault launched after peer allocation");
+                    ram_reservation = std::async(std::launch::async, reserve);
+                };
+            } else {
+                ram_reservation = std::async(std::launch::async, reserve);
+            }
+        } else if (!ok || !reserve()) {
             basalt::log::info("basalt generate", "prompt split: off (RAM for its buffers)");
             err.clear();
             split_want = false;
@@ -88,7 +122,9 @@ int split_plan(Context& context) {
     }
 
     context.pstages = &pstages;
+    context.split_ram_reservation = &ram_reservation;
     context.split_host_gbps = &split_host_gbps;
+    log_expert_load_phase(context, "split RAM planning", budget_started);
     return resident_load(context);
 }
 
@@ -117,14 +153,43 @@ int prompt_split(Context& context) {
     auto& split_host_gbps = *context.split_host_gbps;
 
     // the split reads the experts its cards lack from the RAM copy: without one it is off
-    if (split_want && !src.complement_ready()) {
+    if (split_want && o.shared_expert_arena.empty() && !src.complement_ready()) {
         basalt::log::info("basalt generate", "prompt split: off (no RAM copy of the experts)");
         split_want = false;
         pstages.clear();
     }
     // ---- the peer's experts: the ranked pairs the primary does not hold.  Without --peer-exclusive they are copies of
     // experts the RAM complement holds, so with the complement built they are read from it, not from the file.
+    const bool parallel_banks = static_cast<bool>(context.primary_expert_fill);
+    std::future<int> primary_fill;
+    if (parallel_banks) primary_fill = std::async(std::launch::async, std::move(context.primary_expert_fill));
     if (o.peer_device >= 1 && !peer.valid() && !open_peer(false)) return 1;
+    context.before_peer_upload = {};
+    const auto join_started = Clock::now();
+    if (parallel_banks) {
+        if (const int status = primary_fill.get(); status != 0) return status;
+    }
+    if (context.expert_fill_started != Clock::time_point{}) {
+        using Seconds = std::chrono::duration<double>;
+        const auto finished = Clock::now();
+        basalt::log::info("basalt startup", "expert banks: %.3f s (primary join %.3f s), parallel=%d",
+                          Seconds(finished - context.expert_fill_started).count(),
+                          parallel_banks ? Seconds(finished - join_started).count() : 0.0, (int) parallel_banks);
+    }
+    const bool parallel_ram = context.split_ram_reservation->valid();
+    const auto ram_join_started = Clock::now();
+    if (parallel_ram && !context.split_ram_reservation->get()) {
+        basalt::log::info("basalt generate", "prompt split: off (RAM for its buffers)");
+        split_want = false;
+        pstages.clear();
+    }
+    if (context.expert_fill_started != Clock::time_point{}) {
+        using Seconds = std::chrono::duration<double>;
+        const auto ready = Clock::now();
+        basalt::log::info("basalt startup", "split RAM and banks ready: %.3f s (RAM join %.3f s), parallel=%d",
+                          Seconds(ready - context.expert_fill_started).count(),
+                          parallel_ram ? Seconds(ready - ram_join_started).count() : 0.0, (int) parallel_ram);
+    }
     for (auto& st : pstages) st->tier = st->tier_at == 0 ? &peer : xpeers[st->tier_at - 1].get();
     // ---- the prompt-time split's price (price_prompt_split): each card's side of a part read, from what its slots hold
     // The largest chunk a read alone takes now (the loan's chunk follows the slots left: see relend).  The split reads a
@@ -342,30 +407,45 @@ int prompt_split(Context& context) {
         }
         if (split_stages == 0) pstages.clear();
     }
-    // each stage's weights are loaded where a split read places them, in tier slots lent for the load, copied into pinned
-    // RAM, and the slots get their experts back: the tiers are as without the split
+    // Both builders bind references to the same cache tail. A split request uploads the completed pinned image there.
+    const bool direct_image = basalt::core::exp_flag("startup_direct_prompt_image", 0) != 0;
     for (size_t j = 0; j < pstages.size(); ++j) {
+        const auto image_started = std::chrono::steady_clock::now();
         PromptStage& st = *pstages[j];
         const basalt::core::OnDevice on(st.dev);
         const basalt::core::ExpertCache& pc = st.tier->cache();
         uint8_t* base = const_cast<uint8_t*>(pc.device_slot(0));
         uint8_t* w_at = (uint8_t*) ((uintptr_t) (base + pc.bytes() - st.image_bytes) & ~(uintptr_t) 255);
         const int64_t k = serve_loans::cache_slots_for(pc, (uint64_t) (base + pc.bytes() - w_at));
-        bool ok = k > 0 && k < pc.slots() / 2 && st.tier->lend((int32_t) (pc.slots() - k), st.lent, err) &&
-                  st.wt.load(pack_files, w_at, st.pool, err, &st.skip, false);
+        bool ok = k > 0 && k < pc.slots() / 2;
+        if (ok && direct_image) {
+            ok = basalt::core::host_alloc((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess;
+            if (ok) std::memset(st.image, 0, st.image_bytes);
+        } else if (ok) {
+            ok = st.tier->lend((int32_t) (pc.slots() - k), st.lent, err);
+        }
+        uint8_t* host = direct_image ? static_cast<uint8_t*>(st.image) : nullptr;
+        ok = ok && st.wt.load(pack_files, w_at, st.pool, err, &st.skip, false, host);
         if (ok) {
             basalt::core::NativeDense::set_layer_range((int) st.lo, (int) st.hi);
             ok = st.dense.load(o.native_shards, st.wt, err, true, 0, -1, w_at + st.arena_bytes,
-                               st.image_bytes - st.arena_bytes);
+                               st.image_bytes - st.arena_bytes, host ? host + st.arena_bytes : nullptr);
             basalt::core::NativeDense::set_layer_range(-1, -1);
         }
-        ok = ok && cudaDeviceSynchronize() == cudaSuccess &&   // (the uploads ran on their own streams)
-             basalt::core::host_alloc((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
-             cudaMemcpy(st.image, w_at, st.image_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
-        std::string ge;
-        if (!(st.tier->give_back(st.lent, ge) && st.tier->give_back_wait(st.lent, ge))) {
-            basalt::log::error("basalt generate", "prompt split: refilling the tier: %s", ge.c_str());
-            return 1;
+        if (!direct_image) {
+            ok = ok && cudaDeviceSynchronize() == cudaSuccess &&   // (the uploads ran on their own streams)
+                 basalt::core::host_alloc((void**) &st.image, st.image_bytes, cudaHostAllocPortable) == cudaSuccess &&
+                 cudaMemcpy(st.image, w_at, st.image_bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+            std::string ge;
+            if (!(st.tier->give_back(st.lent, ge) && st.tier->give_back_wait(st.lent, ge))) {
+                basalt::log::error("basalt generate", "prompt split: refilling the tier: %s", ge.c_str());
+                return 1;
+            }
+        }
+        if (ok) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - image_started).count();
+            basalt::log::info("basalt startup", "prompt split CUDA%d image: %.1f MiB, %.3f s, direct=%d",
+                              st.dev, st.image_bytes / 1048576.0, seconds, (int) direct_image);
         }
         if (!ok) {
             (void) cudaGetLastError();

@@ -125,6 +125,41 @@ bool QfnRuntime::kv_drain(std::string& e) {
     return true;
 }
 
+bool QfnRuntime::shared_expert_room(uint64_t bytes, std::string& e, bool lend_another_segment) {
+    if (!shared_pages || !basalt::core::exp_flag("shared_kv_expert_lending") || !xcache.segmented())
+        return true;
+    const basalt::core::OnDevice device(0);
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) {
+        e = "shared KV: cannot read available device memory";
+        return false;
+    }
+    if (bytes <= free_b && !lend_another_segment) return true;
+    const int64_t before = xcache.slots();
+    const int64_t mapped = xcache.mapped_bytes();
+    const uint64_t deficit = bytes > free_b ? bytes - free_b : 1;
+    if (deficit >= (uint64_t) mapped) return true;
+    const int64_t want = mapped - (int64_t) deficit;
+    // The cache retains the segment intersecting keep. Round down to its grid.
+    const int64_t segment = xcache.segment_bytes();
+    const int64_t keep = want / segment * segment;
+    if (xcache.slots_after_shrink(keep) < cache_floor_slots()) return true;
+    if (ba_job) { ba_thr.join(); ba_job = false; }
+    if (!kv_drain(e)) return false;
+    const bool shrunk = xcache.shrink(keep, e);
+    const int64_t live = xcache.slots();
+    for (size_t i = 0; i < host_res.size(); ++i) {
+        if (host_res[i] < live) continue;
+        vram_evicted.emplace_back((int32_t) i, host_res[i]);
+        host_res[i] = basalt::core::kNotResident;
+    }
+    res_upload();
+    relend();
+    basalt::log::info("basalt serve", "shared KV expert lending: %lld -> %lld primary slots",
+                      (long long) before, (long long) live);
+    return shrunk;
+}
+
 // maps the cache's tail again as far as the free VRAM above the reserve allows, and refills the slots it gets
 // back: each with the expert it held, or (when that one is resident again, or has no RAM copy any more) the
 // layer's most-routed expert that no GPU holds and RAM does
@@ -177,7 +212,8 @@ bool QfnRuntime::cache_regrow(std::string& e) {
 // then the profile's rank), so the next most-routed experts stay on a GPU while the KV holds CUDA0's tail.  Between
 // windows: the copies come from the RAM copy and land before it returns.
 bool QfnRuntime::peer_take(const std::vector<int32_t>& off, std::string& e) {
-    if (off.empty() || !peer.valid() || peer.exclusive() || peer.asleep() || !xpeers.empty()) return true;
+    if (off.empty() || !peer.valid() || peer.exclusive() || peer.asleep() || !xpeers.empty() ||
+        vision_decode_lease.load()) return true;
     const auto t0 = Clock::now();
     auto used = [&](int32_t i) { return drive.d.usage.empty() ? 0.0f : drive.d.usage[(size_t) i]; };
     auto rank = [&](int32_t i) { return prof_rank.empty() ? 0 : prof_rank[(size_t) i]; };
@@ -360,7 +396,7 @@ bool QfnRuntime::kv_fit(basalt::core::SessionState& s, int64_t cells, std::strin
 }
 
 bool QfnRuntime::kv_release(basalt::core::SessionState& s, int64_t cells, std::string& e) {
-    if (kv_floor <= 0) return true;
+    if (kv_floor <= 0 || (frozen_recovery.valid() && s.qsa_states == ss.qsa_states)) return true;
     cells = std::min<int64_t>(std::max<int64_t>(cells, kv_floor), s.max_cells);
     if (basalt::core::session_kv_bytes_for(s, basalt::core::session_kv_cells(s)) <=
         basalt::core::session_kv_bytes_for(s, cells)) return true;

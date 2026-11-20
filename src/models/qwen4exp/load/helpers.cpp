@@ -1,4 +1,5 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
+#include "basalt/core/diag.hpp"
 #include "helpers.hpp"
 
 namespace basalt::models::qwen4exp::generate {
@@ -62,11 +63,11 @@ int argmax(const std::vector<float>& v) {
 //
 // A single timed burst can read a link that is still in a low-power state, or sharing DMA, far too low, and the low
 // reading would set the share.  Such a disturbance only ever slows a copy: nothing makes a correctly timed copy
-// faster than the link carries.  So 1 GiB is copied as four bursts of 256 MiB, timed one by one, and the fastest is
-// the link's figure (the median would still follow a disturbance that lasts through half the bursts).  `samples`,
+// faster than the link carries.  Four bursts are timed individually, and the fastest is the link's figure
+// (the median would still follow a disturbance that lasts through half the bursts).  `samples`,
 // when given, gets every burst's reading for the log.
 double probe_pcie_h2d_gbps(std::string* samples) {
-    constexpr size_t kBytes = 256ull << 20;
+    const size_t kBytes = (basalt::core::exp_flag("startup_pcie_probe_64m") != 0.0 ? 64ull : 256ull) << 20;
     constexpr int kBursts = 4;
     void* h = nullptr;
     void* d = nullptr;
@@ -114,7 +115,8 @@ double probe_pcie_h2d_gbps(std::string* samples) {
 // two rounds); -1 when a buffer or a copy fails.  Cards that share a switch, a root port or the RAM read below the sum
 // of their own links.
 double probe_h2d_together_gbps(const std::vector<int>& devs) {
-    constexpr size_t kBytes = 256ull << 20;
+    const size_t kBytes = (basalt::core::exp_flag("startup_pcie_probe_64m") != 0.0 ? 64ull : 256ull) << 20;
+    basalt::log::info("basalt startup", "PCIe transfer probe buffer: %zu MiB", kBytes >> 20);
     constexpr int kBursts = 4;
     struct Card { int dev; void* h = nullptr; void* d = nullptr; cudaStream_t s = nullptr; };
     std::vector<Card> cards;

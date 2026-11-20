@@ -227,6 +227,19 @@ int Runtime::init_protocol() {
         while (getline_fd(l)) {
             if (!l.empty() && l.back() == '\r') l.pop_back();
             if (l == "STOP") { stop_req.store(true); continue; }
+            if (l.rfind("SCHEDQ ", 0) == 0) {
+                SchedulerQueue next;
+                std::istringstream payload(l.substr(7));
+                if (payload >> next.control >> next.admission >> next.parked >> next.oldest_ms >> next.free_pages &&
+                    next.control >= 0 && next.parked >= 0 && next.admission >= next.parked &&
+                    next.oldest_ms >= 0 && next.free_pages >= -1) {
+                    next.received = Clock::now();
+                    std::lock_guard<std::mutex> lk(in_mu);
+                    scheduler_queue = next;
+                }
+                continue;
+            }
+            if (l.rfind("ENCA ", 0) == 0 && submit_async_image(l)) continue;
             if (l.rfind("GENT ", 0) == 0 || l.rfind("SGENT ", 0) == 0 || l.rfind("BGENT ", 0) == 0) {
                 std::string rewritten;
                 const bool framed = take_text(l, rewritten);

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -141,7 +142,9 @@ constexpr uint64_t kSlabAlign = 256;   // matrices start at 256-byte offsets, as
 uint64_t NativeDense::slab_bytes(uint64_t plan_total) { return plan_total + kSlabAlign * 1024; }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi, void* slab_at, uint64_t slab_cap,
+                       void* host_image) {
+    if (host_image && !slab_at) { err = "native dense: host image requires a device slab"; return false; }
     auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
         if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
         const long l = std::strtol(name.c_str() + 4, nullptr, 10);
@@ -262,6 +265,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 void* where = nullptr;
                 DevicePtr own;
+                const uint64_t dst_offset = slab_used;
                 if (slab_base != nullptr && slab_used + bytes <= slab_bytes) {
                     where = (char*) slab_base + slab_used;
                     slab_used += (bytes + kAlign - 1) / kAlign * kAlign;
@@ -274,7 +278,21 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     where = allocation;
                 }
                 std::string upload_err;
-                if (where == nullptr || !uploader.upload(gguf.path(), gguf.data_start() + tensor.offset, bytes, where, upload_err)) {
+                const uint64_t file_offset = gguf.data_start() + tensor.offset;
+                bool loaded = where != nullptr;
+                if (loaded && host_image) {
+                    auto* dst = static_cast<uint8_t*>(host_image) + dst_offset;
+                    for (uint64_t done = 0; done < bytes;) {
+                        const uint64_t chunk = std::min<uint64_t>(DirectUploader::kChunk, bytes - done);
+                        const auto* src = uploader.staged(gguf.path(), file_offset + done, chunk, upload_err);
+                        if (!src) { loaded = false; break; }
+                        std::memcpy(dst + done, src, chunk);
+                        done += chunk;
+                    }
+                } else if (loaded) {
+                    loaded = uploader.upload(gguf.path(), file_offset, bytes, where, upload_err);
+                }
+                if (!loaded) {
                     err = "native dense upload " + tensor.name + ": " +
                           (where == nullptr ? std::string("no device memory") : upload_err);
                     return false;

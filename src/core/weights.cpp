@@ -172,7 +172,7 @@ bool WeightTable::index_code_bits(const PackFiles& pack, const std::string& name
 }
 
 bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
-                       const std::set<std::string>* skip, bool report_progress) {
+                       const std::set<std::string>* skip, bool report_progress, void* host_image) {
     IndexText idx;
     if (!idx.open(pack.index, err)) { err = "cannot open " + pack.index.path; return false; }
 
@@ -460,14 +460,18 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
                     }
                 }
 
-                const double u0 = now_ms();
-                if (cudaMemcpy(dst_base + r.dst_off + out_at, host_src, out_bytes, cudaMemcpyHostToDevice) !=
-                    cudaSuccess) {
-                    err = "cudaMemcpy failed for " + r.name;
-                    cudaFreeHost(stage_out);
-                    return false;
+                if (host_image) {
+                    std::memcpy(static_cast<uint8_t*>(host_image) + r.dst_off + out_at, host_src, out_bytes);
+                } else {
+                    const double u0 = now_ms();
+                    if (cudaMemcpy(dst_base + r.dst_off + out_at, host_src, out_bytes, cudaMemcpyHostToDevice) !=
+                        cudaSuccess) {
+                        err = "cudaMemcpy failed for " + r.name;
+                        cudaFreeHost(stage_out);
+                        return false;
+                    }
+                    upload_ms += now_ms() - u0;
                 }
-                upload_ms += now_ms() - u0;
                 if (progress) progress->add(out_bytes);
                 done += n;
             }
@@ -507,7 +511,9 @@ bool WeightTable::load(const PackFiles& pack, void* arena_base, uint64_t arena_b
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    if (!host_image && cudaDeviceSynchronize() != cudaSuccess) {
+        err = "cudaDeviceSynchronize after the load failed"; return false;
+    }
     return true;
 }
 

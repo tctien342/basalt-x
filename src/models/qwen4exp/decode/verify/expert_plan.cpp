@@ -181,8 +181,10 @@ unsigned int* Verifier::landed_words() const { return dm_ != nullptr && dm_->lan
 
 bool Verifier::landed_ok() const {
     if (landed_words() == nullptr || !landed_glue_) return false;
-    for (int t = 1; t <= max_t_; ++t)
-        if ((ar_off_ ? exec_nr_[t] : exec_[t]) == nullptr) return false;
+    for (int t = 1; t <= max_t_; ++t) {
+        const auto index = solo_graph_index(t);
+        if ((ar_off_ ? exec_nr_[index] : exec_[index]) == nullptr) return false;
+    }
     return true;
 }
 

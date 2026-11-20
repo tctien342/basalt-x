@@ -188,6 +188,19 @@ td, th, .v, .num { font-family: var(--font-mono); font-variant-numeric: tabular-
 .tabs button:hover { color: var(--fg); }
 .tabs button[aria-selected="true"] { background: var(--surface); color: var(--fg); }
 .pane { flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.tabs { overflow-x: auto; }
+.tabs button { flex: none; white-space: nowrap; }
+.sched { padding: 14px 16px 16px; min-width: 0; }
+.sched-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.sched-head strong { color: var(--accent); font-size: 15px; font-weight: 600; }
+.sched-head span { color: var(--fg-3); font: 12px var(--font-mono); }
+.sched-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr)); gap: 10px; align-items: start; }
+.sched-box { min-width: 0; border: 1px solid var(--line); border-radius: 3px; padding: 10px 12px; }
+.sched-box h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; }
+.sched-box dl { margin: 0; font: 12px/1.35 var(--font-mono); }
+.sched-box dl > div { display: flex; justify-content: space-between; align-items: baseline; padding: 5px 0; gap: 10px; border-top: 1px solid var(--line-soft); }
+.sched-box dt { color: var(--fg-3); min-width: 0; }
+.sched-box dd { text-align: right; margin: 0; }
 .empty { padding: 14px 20px; color: var(--fg-3); font-size: 13px; }
 table { width: 100%; border-collapse: collapse; }
 th { font-weight: 400; color: var(--fg-3); text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }

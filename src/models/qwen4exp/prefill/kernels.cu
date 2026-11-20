@@ -3,6 +3,7 @@
 #include "basalt/models/qwen4exp/kernels/mrope.hpp"
 #include "basalt/models/qwen4exp/kernels/router_top10.hpp"
 
+#include "cpu_q8_k.cuh"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -495,15 +496,27 @@ __global__ void gather_rows16_kernel(const uint16_t* __restrict__ x, const int32
     const int64_t r = i / per, j = i % per;
     reinterpret_cast<uint4*>(dst)[r * per + j] = reinterpret_cast<const uint4*>(x)[(int64_t) src[r] * per + j];
 }
+template <bool PeerFP16>
 __global__ void moe_combine_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ slot,
                                    const float* __restrict__ w, const float* __restrict__ shared,
-                                   const float* __restrict__ sg, float* __restrict__ bo, int64_t T) {
+                                   const float* __restrict__ sg, float* __restrict__ bo, int64_t T,
+                                   int64_t peer_begin, int64_t peer_end) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
     float s = 0.0f;
 #pragma unroll
-    for (int k = 0; k < 10; ++k) s = fmaf(w[t * 10 + k], Dm[(int64_t) slot[t * 10 + k] * N + d], s);
+    for (int k = 0; k < 10; ++k) {
+        const int64_t row = slot[t * 10 + k];
+        float value;
+        if (PeerFP16 && row >= peer_begin && row < peer_end) {
+            const auto* packed = reinterpret_cast<const uint16_t*>(Dm + peer_begin * N);
+            value = __half2float(__ushort_as_half(packed[(row - peer_begin) * N + d]));
+        } else {
+            value = Dm[row * N + d];
+        }
+        s = fmaf(w[t * 10 + k], value, s);
+    }
     bo[i] = s + shared[i] * sigm(sg[t]);
 }
 
@@ -567,13 +580,18 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const int d = g * 64 + threadIdx.x;
     const float x = (is_v ? V : K)[t * 512 + kvh * 256 + d];
     const int64_t pos = pos0 + t;
-    const int64_t page = table[pos / page_size];
+    const int64_t logical = pos / page_size;
+    const int64_t physical = host.fp16_host_pages ? host.fp16_host_pages[logical] : logical;
+    const int64_t page = table[host.fp16_shared_residency ? physical : logical];
     const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
-    const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
+    const int64_t row_id = (logical * 2 + kvh) * page_size + pos % page_size;
+    const int64_t host_row = (physical * 2 + kvh) * page_size + pos % page_size;
     if (k_pool != nullptr) {
         const uint16_t h = hf(x);
         if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;
-        if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = h;
+        if (host.k_pool != nullptr) {
+            (is_v ? host.v_pool : host.k_pool)[host_row * 256 + d] = h;
+        }
         if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
         return;
     }
@@ -592,8 +610,8 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
     }
     if (host.k_q != nullptr) {
-        (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) q;
-        if (threadIdx.x == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+        (is_v ? host.v_q : host.k_q)[host_row * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0) (is_v ? host.v_scale : host.k_scale)[host_row * 4 + g] = sb;
     }
     if (stage.k_q != nullptr) {
         (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) q;
@@ -628,6 +646,36 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
         host ? *host : basalt::kernels::KvHostPools{}, stage ? *stage : basalt::kernels::KvHostPools{});
     check("kv_append");
 }
+__global__ void from_f16_kernel(const uint16_t* x, float* y, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (int64_t) blockDim.x * gridDim.x) {
+        y[i] = __half2float(__ushort_as_half(x[i]));
+    }
+}
+
+void from_f16(const uint16_t* x, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    from_f16_kernel<<<blocks_for(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
+    check("prefill from_f16");
+}
+
+void expand_f16_in_place(float* storage, int64_t n, void* stream) {
+    // Expand from the tail. Each launch writes beyond all remaining packed input.
+    auto* half = reinterpret_cast<const uint16_t*>(storage);
+    while (n > 1) {
+        const int64_t begin = (n + 1) / 2;
+        from_f16(half + begin, storage + begin, n - begin, stream);
+        n = begin;
+    }
+    from_f16(half, storage, n, stream);
+}
+
+void quantize_cpu_q8k(const float* x, void* packed, int64_t n, void* stream) {
+    detail::quantize_q8k<<<(unsigned)(n / detail::kQ8KBlock), detail::kQ8KBlock, 0, (cudaStream_t) stream>>>(
+        x, static_cast<detail::CpuQ8K*>(packed));
+    check("prefill cpu_q8k");
+}
+
 void to_f16(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_f16_kernel<<<(unsigned) ((n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096), 256, 0, (cudaStream_t) stream>>>(x, y, n);
@@ -778,8 +826,14 @@ void gather_rows16(const uint16_t* x16, const int32_t* src, uint16_t* dst16, int
 }
 void moe_combine(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream) {
-    moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T);
+    moe_combine_kernel<false><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, 0, 0);
     check("moe_combine");
+}
+void moe_combine_peer_fp16(const float* Dm, const int32_t* slot, const float* w, const float* shared, const float* sg,
+                          float* bo, int64_t T, int64_t peer_begin, int64_t peer_rows, void* stream) {
+    moe_combine_kernel<true><<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(
+        Dm, slot, w, shared, sg, bo, T, peer_begin, peer_begin + peer_rows);
+    check("moe_combine_peer_fp16");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;

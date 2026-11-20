@@ -2,6 +2,8 @@
 
 A fake engine script speaking GEN / BGEN / BT / BDONE / BADM / BSTOP runs behind the real ProcessEngine and Service."""
 import json
+import os
+import queue
 import subprocess
 import sys
 import tempfile
@@ -14,7 +16,7 @@ from pathlib import Path
 from unittest import mock
 
 from serve.frontend import ChatTemplate
-from serve.engine.process import ProcessEngine
+from serve.engine.process import EngineDied, ProcessEngine
 from serve.handler import serve
 from serve.service import Service
 from serve.util.text import ByteTokenizer
@@ -55,7 +57,7 @@ def reader():
             lines.put(l)
     lines.put(None)
 threading.Thread(target=reader, daemon=True).start()
-print("INFO engine=0.0.1" + (f" batch_slots={fit}" if fit >= 2 else "") +
+print("INFO engine=0.0.1" + (f" batch_slots={fit}" if fit >= 2 or (s0 and fit == 1) else "") +
       (" slot_cache=1" if "--slotcache" in args else "") + (" slot0_solo=1" if s0 else "") +
       (" solo_any_slot=1" if s0 and "--soloany" in args else ""), flush=True)
 print(f"READY {ready} stop", flush=True)
@@ -230,6 +232,66 @@ class PickSlot(unittest.TestCase):
         e.slot_busy = [False] * 3
         self.assertEqual(e.pick_slot([1, 2, 3]), 1)                 # a held prompt is never the WHOLE prompt
 
+
+    def test_shared_prefix_affinity_matches_adapter(self):
+        e = self.engine(3)
+        e.slot_adapters = [True, False, False]
+        e.slot_held = [[1, 2, 3], [1, 2], []]
+        e.claim_slot(0, "same-session")
+        prompt = [1, 2, 3, 4]
+        self.assertEqual(e.pick_slot(prompt, "same-session", adapter=False), 1)
+        self.assertEqual(e.pick_slot(prompt, "same-session", adapter=True), 0)
+        e.slot_busy[1] = True
+        self.assertEqual(e.pick_slot(prompt, "same-session", adapter=False), 2)
+
+    def test_shared_prefix_affinity_matches_full_adapter_combination(self):
+        e = self.engine(4)
+        e.slot_adapters = [0, 1, 2, 3]
+        e.slot_held = [[7, 8, 9], [7, 8, 9], [7, 8, 9], [7, 8, 9]]
+        e.claim_slot(3, "same-session")
+        for adapter in range(4):
+            self.assertEqual(e.pick_slot([7, 8, 9, 10], "same-session", adapter=adapter), adapter)
+
+    def test_shared_cold_admission_preserves_the_larger_idle_prefix(self):
+        e = self.engine(2)
+        e.slot_adapters = [False, False]
+        e.slot_held = [[1] * 285669, [2] * 22986]
+        e.slot_used = [1.0, 2.0]
+        prompt = [2] * 22497 + [3] * 837
+        # The oldest slot's large prefix must survive a missed bridge hint
+        # when the shorter conversation rewrote its previous turn.
+        self.assertEqual(e.pick_slot(prompt, adapter=False), 1)
+        self.assertEqual(e.pick_slot(e.slot_held[0] + [4], adapter=False), 0)
+        e.slot_busy[1] = True
+        self.assertEqual(e.pick_slot(prompt, adapter=False), 0)
+
+    def test_shared_long_continuation_uses_the_slot_with_a_rewritten_tail(self):
+        e = self.engine(2)
+        e.slot_adapters = [False, False]
+        common = [1] * 19419
+        long_prefix = common + [2] * 336000
+        e.slot_held = [common + [3] * 30000, long_prefix + [4] * 1747]
+        prompt = long_prefix + [5] * 2538
+        self.assertEqual(e.pick_slot(prompt, adapter=False), 1)
+        e.slot_adapters[1] = True
+        self.assertEqual(e.pick_slot(prompt, adapter=True), 1)
+        self.assertEqual(e.pick_slot(prompt, adapter=False), 0)
+
+    def test_shared_long_slot_zero_prefix_can_match_without_session_key(self):
+        e = self.engine(2)
+        e.info["cold_shared_recovery_min_tokens"] = 8192
+        e.slot_adapters = [4, 2]
+        e.slot_held = [[7] * 9000, [1, 2]]
+        e.claim_slot(0, "yarn-owner")
+        self.assertEqual(e.pick_slot([7] * 8900 + [3], adapter=4), 0)
+        self.assertEqual(e.pick_slot([7] * 8900 + [3], adapter=2), 1)
+        self.assertEqual(e.pick_slot([7] * 4000 + [3], adapter=4), 1)
+
+    def test_shared_common_system_prefix_does_not_displace_a_long_conversation(self):
+        e = self.engine(2)
+        e.slot_adapters = [False, False]
+        e.slot_held = [[1] * 19419 + [2] * 336000, []]
+        self.assertEqual(e.pick_slot([1] * 19419 + [3], adapter=False), 1)
 
 class ParallelService(unittest.TestCase):
     """The real ProcessEngine and Service over HTTP, the fake engine behind them."""
@@ -450,6 +512,576 @@ class ParallelService(unittest.TestCase):
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
         with self.engine.slot_cv:
             self.engine.slot_busy[0] = False
+
+    def test_incremental_pool_three_requests_continue_after_partial_grants(self):
+        self._exercise_incremental_three(cancel_parked=False)
+
+    def test_incremental_pool_cancels_parked_stream(self):
+        self._exercise_incremental_three(cancel_parked=True)
+
+    def _exercise_incremental_three(self, *, cancel_parked):
+        with mock.patch(__name__ + ".FAKE_BATCH", FAKE_BATCH.replace('b"la " * 15', 'b"la " * 400')):
+            self.start(3, multi=64)
+        engine = self.engine
+        engine.info.update(shared_kv_pages=704, shared_kv_page_cells=4, shared_kv_mixed_adapters=1)
+        with engine.slot_cv:
+            engine.slot_busy[0] = True
+            engine.slot_kv_pages[0] = 352
+            engine.slot_kv_full[0] = object()
+
+        prompt = list(b"LONGREPLY xyz")
+        want = list(b"ok, " + b"la " * 400 + b"done.") + [257]
+        cancel = [threading.Event(), threading.Event()]
+        out = [[], []]
+        failures = []
+        sent = []
+        original = engine._send
+
+        def record(line):
+            sent.append(line)
+            return original(line)
+
+        def stream(i):
+            try:
+                out[i].extend(int(t) for t in engine.generate(
+                    prompt, 1500, {"_atomic_lora": bool(i), "temperature": 0.5, "seed": i + 11},
+                    cancel[i]) if t is not None)
+            except Exception as err:
+                failures.append(err)
+
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_KV_INCREMENTAL": "1"}), \
+                mock.patch.object(engine, "_send", side_effect=record):
+            threads = [threading.Thread(target=stream, args=(i,), daemon=True) for i in range(2)]
+            try:
+                for th in threads:
+                    th.start()
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    with engine.slot_cv:
+                        if all(engine.slot_busy):
+                            self.assertEqual([bool(owner) for owner in engine.slot_kv_full], [True, False, False])
+                            self.assertLessEqual(sum(engine.slot_kv_pages), 704)
+                            break
+                    time.sleep(0.005)
+                else:
+                    self.fail(f"three owners never overlapped: {sent}")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    with engine.slot_cv:
+                        if engine.slot_busy == [True, False, False] and len(engine.admission) == 2:
+                            break
+                    time.sleep(0.005)
+                else:
+                    self.fail(f"both bounded streams did not park beside the full owner: {sent}")
+                if cancel_parked:
+                    cancel[1].set()
+                    threads[1].join(3)
+                    self.assertFalse(threads[1].is_alive())
+                    with engine.slot_cv:
+                        self.assertEqual(engine.slot_kv_pages, [352, 0, 0])
+                        self.assertEqual(len(engine.admission), 1)
+            finally:
+                with engine.slot_cv:
+                    engine.slot_kv_pages[0] = 0
+                    engine.slot_busy[0] = False
+                    engine.slot_cv.notify_all()
+                if not cancel_parked:
+                    deadline = time.monotonic() + 5
+                    while time.monotonic() < deadline:
+                        with engine.slot_cv:
+                            if sum(engine.slot_busy) >= 2:
+                                break
+                        time.sleep(0.005)
+                    else:
+                        failures.append("the resumed streams did not overlap")
+                for th in threads:
+                    th.join(15)
+        self.assertFalse(any(th.is_alive() for th in threads), sent)
+        self.assertEqual(failures, [])
+        self.assertEqual(out[0], want)
+        if cancel_parked:
+            self.assertGreater(len(out[1]), 0)
+            self.assertLess(len(out[1]), len(want))
+            self.assertEqual(out[1], want[:len(out[1])])
+            self.assertEqual(sum(" seed=12 " in line for line in sent), 1)
+        else:
+            self.assertEqual(out[1], want)
+        for seed in ((11,) if cancel_parked else (11, 12)):
+            runs = [line.split() for line in sent if line.startswith("BGEN ") and f" seed={seed} " in line]
+            self.assertGreaterEqual(len(runs), 2, sent)
+            self.assertLess(int(runs[0][2]), 1500)
+            self.assertTrue(runs[-1][-1].startswith(runs[0][-1] + ","))
+        self.assertEqual(sum(engine.slot_kv_pages), 0)
+        self.assertEqual(engine.queue_depth(), 0)
+
+    def test_shared_indexer_retry_after_other_slot_is_reused(self):
+        self._exercise_shared_backing_retry("indexer backing unavailable: the driver has no VRAM for the KV pools")
+
+    def test_shared_draft_retry_after_other_slot_is_reused(self):
+        self._exercise_shared_backing_retry("draft backing unavailable: mtp: allocating the slot's draft K/V failed")
+
+    def _exercise_shared_backing_retry(self, detail):
+        fake = FAKE_BATCH.replace("active = {}", "refused = False\nactive = {}")
+        fake = fake.replace(
+            '        ids = f[-1].split(",")',
+            '        if bslot == 1 and not refused:\n'
+            '            refused = True\n'
+            f'            print({("ERR shared KV: " + detail)!r}, flush=True)\n'
+            '            continue\n'
+            '        ids = f[-1].split(",")')
+        with mock.patch(__name__ + ".FAKE_BATCH", fake):
+            self.start(2)
+        engine = self.engine
+        engine.info.update(shared_kv_pages=128, shared_kv_page_cells=4, shared_kv_mixed_adapters=1)
+        with engine.slot_cv:
+            engine.slot_busy[0] = True
+            engine.slot_kv_pages[0] = 32
+        outputs, errors = [], []
+        cancel = threading.Event()
+        first_send = threading.Event()
+        send = engine._send
+
+        def record(line):
+            send(line)
+            if line.startswith("BGEN 1 "):
+                first_send.set()
+
+        def generate():
+            try:
+                outputs.extend(t for t in engine.generate([1, 2, 3], 20, {}, cancel) if t is not None)
+            except Exception as err:
+                errors.append(err)
+
+        with mock.patch.object(engine, "_send", side_effect=record):
+            thread = threading.Thread(target=generate, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(first_send.wait(3))
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    with engine.slot_cv:
+                        if engine.slot_kv_pages[1] == 0:
+                            # Slot 0 finished and was reclaimed before the waiting stream could observe it idle.
+                            engine.slot_used[0] += 1
+                            engine.slot_cv.notify_all()
+                            break
+                    time.sleep(.01)
+                else:
+                    self.fail("native refusal did not release the provisional grant")
+                thread.join(3)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(outputs, list(b"ok, done.") + [257])
+            finally:
+                cancel.set()
+                with engine.slot_cv:
+                    engine.slot_busy[0] = False
+                    engine.slot_kv_pages[0] = 0
+                    engine.slot_cv.notify_all()
+                thread.join(3)
+        self.assertEqual(engine.queue_depth(), 0)
+
+    def test_shared_slot_zero_returns_to_solo_after_peer_drains(self):
+        self._exercise_shared_solo_return("solo")
+
+    def test_shared_solo_return_keeps_slot_when_a_waiter_arrives(self):
+        self._exercise_shared_solo_return("waiter")
+
+    def test_shared_solo_return_checks_cancellation_after_bdone(self):
+        self._exercise_shared_solo_return("cancel")
+
+    def test_shared_solo_return_checks_ledger_after_restart(self):
+        self._exercise_shared_solo_return("restart")
+
+    def _exercise_shared_solo_return(self, case):
+        self.start(2, slot_cache=True, slot0_solo=True, solo_any=True)
+        engine = self.engine
+        engine.info.update(shared_kv_pages=1024, shared_kv_page_cells=4, shared_kv_mixed_adapters=1)
+        engine.slot_busy[1] = True
+        engine.slot_kv_pages[1] = 32
+        send, take_control = engine._send, engine._take_control
+        old_busy, old_pages = engine.slot_busy, engine.slot_kv_pages
+        cancel = threading.Event()
+        sent, charges, tickets, outputs = [], [], [], []
+        stopped = False
+
+        def record(line):
+            nonlocal stopped
+            if line.startswith(("BGEN 0 ", "BSTOP 0", "SGEN 0 ")):
+                sent.append(line.split()[0])
+                charges.append(engine.slot_kv_pages[0])
+            if line.startswith("BSTOP 0"):
+                stopped = True
+            send(line)
+
+        def take(*args, **kwargs):
+            acquired = yield from take_control(*args, **kwargs)
+            if acquired and stopped:
+                with engine.slot_cv:
+                    if case == "waiter" and not tickets:
+                        tickets.append(engine.admission.join(1))
+                    elif case == "cancel":
+                        cancel.set()
+                    elif case == "restart":
+                        engine.slot_busy = [True, False]
+                        engine.slot_kv_pages = [22, 0]
+            return acquired
+
+        def consume():
+            for token in engine.generate(list(b"LONGREPLY"), 80, {"seed": 41}, cancel):
+                if token is not None:
+                    outputs.append(int(token))
+                    if len(outputs) == 1:
+                        with engine.slot_cv:
+                            engine.slot_busy[1] = False
+                            engine.slot_kv_pages[1] = 0
+                            engine.slot_cv.notify_all()
+
+        try:
+            with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1", "BASALT_SHARED_KV_INCREMENTAL": "1"}), \
+                    mock.patch.object(engine, "_send", side_effect=record), \
+                    mock.patch.object(engine, "_take_control", side_effect=take):
+                if case == "restart":
+                    with self.assertRaisesRegex(EngineDied, "restarted during shared solo transition"):
+                        consume()
+                else:
+                    consume()
+            self.assertEqual(sent[:2], ["BGEN", "BSTOP"])
+            if case in ("solo", "waiter"):
+                self.assertEqual(sent, ["BGEN", "BSTOP", "SGEN" if case == "solo" else "BGEN"])
+                self.assertEqual(outputs, list(b"ok, " + b"la " * 15 + b"done.") + [257])
+            else:
+                self.assertEqual(len(sent), 2)
+                self.assertGreater(len(outputs), 0)
+            self.assertEqual(len(set(charges)), 1)
+            self.assertGreater(charges[0], 0)
+            self.assertEqual(engine.slot_busy, [True, False] if case == "restart" else [False, False])
+            self.assertEqual(engine.slot_kv_pages, [22, 0] if case == "restart" else [0, 0])
+        finally:
+            for ticket in tickets:
+                engine.admission.leave(ticket)
+            if case == "restart":
+                engine.slot_busy, engine.slot_kv_pages = old_busy, old_pages
+                old_busy[0], old_pages[0] = False, 0
+
+    def test_shared_pool_admits_other_adapter_while_first_is_active(self):
+        self.start(2)
+        self.engine.info.update(shared_kv_pages=128, shared_kv_page_cells=4,
+                                shared_kv_mixed_adapters=1)
+        with self.engine.slot_cv:
+            self.engine.slot_busy[0] = True
+            self.engine.slot_kv_pages[0] = 32
+            self.engine.slot_adapters[0] = False
+        tokens = [1, 2, 3]
+        with mock.patch.object(self.engine, "_send", wraps=self.engine._send) as send:
+            list(self.engine.generate(tokens, 12, {"_atomic_lora": True}, threading.Event()))
+        lines = [call.args[0] for call in send.call_args_list]
+        self.assertTrue(any(line.startswith("BGEN 1 ") and " atomic_lora=1 " in line
+                            for line in lines), lines)
+        self.assertEqual(self.engine.slot_kv_pages, [32, 0])
+        self.assertTrue(self.engine.slot_busy[0])
+
+    def test_shared_profile_affinity_and_mixed_admission(self):
+        self.start(3)
+        self.engine.info.update(shared_kv_pages=128, shared_kv_page_cells=4, rope_context_profiles=1)
+        with self.engine.slot_cv:
+            self.engine.slot_busy[0] = True
+            self.engine.slot_kv_pages[0] = 32
+            self.engine.slot_held[:] = [[1, 2], [1, 2], [1, 2]]
+            self.engine.slot_adapters[:] = [0, 0, 4]
+            self.engine.claim_slot(1, "same-session")
+        sampling = {"_rope_profile": 1, "_context_limit": 524288}
+        with mock.patch.object(self.engine, "_send", wraps=self.engine._send) as send:
+            list(self.engine.generate([1, 2, 3], 12, sampling, threading.Event(), session="same-session"))
+        lines = [call.args[0] for call in send.call_args_list]
+        self.assertTrue(any(line.startswith("BGEN 2 ") and " rope_profile=1 " in line for line in lines), lines)
+        self.assertEqual(self.engine.slot_kv_pages, [32, 0, 0])
+        self.assertTrue(self.engine.slot_busy[0])
+
+    def test_cancellation_during_shared_growth_keeps_new_slot_idle(self):
+        self.start(2)
+        self.engine.info.update(shared_kv_pages=128, shared_kv_page_cells=4, shared_kv_grow=1)
+        with self.engine.slot_cv:
+            self.engine.slot_busy[:] = [True, True]
+            self.engine.slot_kv_pages[:] = [20, 20]
+        cancel = threading.Event()
+
+        def reply(line, **kwargs):
+            self.assertEqual(line, "BGROW")
+            cancel.set()
+            self.engine.lines.put("BGROWN 2")
+
+        with mock.patch.object(self.engine, "_send", side_effect=reply) as send:
+            self.assertEqual(list(self.engine.generate([1, 2, 3], 12, {}, cancel)), [])
+            send.assert_called_once_with("BGROW", proc=self.engine.proc)
+        self.assertEqual(self.engine.slot_busy, [True, True, False])
+        self.assertEqual(self.engine.slot_kv_pages, [20, 20, 0])
+        self.assertEqual(len(self.engine.admission), 0)
+        self.assertFalse(self.engine.ctl.locked())
+        self.assertTrue(list(self.engine.generate([1, 2, 3], 12, {}, threading.Event())))
+        self.assertEqual(self.engine.slot_kv_pages, [20, 20, 0])
+
+    def cold_routing_setup(self):
+        self.start(1, slot0_solo=True, solo_any=True)
+        self.engine.info.update(shared_kv_pages=8192, shared_kv_page_cells=4, shared_kv_grow=1,
+                                rope_context_profiles=1, cold_shared_recovery_min_tokens=8192)
+        self.engine.slot_adapters[0] = 4
+        self.engine.slot_held[0] = [7] * 9000
+        self.engine.claim_slot(0, "long-yarn-owner")
+
+    def test_cold_profile_grows_before_replacing_slot_zero(self):
+        self.cold_routing_setup()
+        send = self.engine._send
+        outgoing = self.engine.slot_held[0]
+
+        def reply(line, **kwargs):
+            if line == "BGROW 0":
+                self.engine.lines.put("BGROWN 1")
+            else:
+                send(line, **kwargs)
+
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            with mock.patch.object(self.engine, "_send", side_effect=reply) as transport:
+                self.assertTrue(list(self.engine.generate([1, 2, 3], 12, {"_rope_profile": 0, "_context_limit": 262144}, threading.Event())))
+        lines = [call.args[0] for call in transport.call_args_list]
+        self.assertEqual(lines[0], "BGROW 0")
+        self.assertTrue(any(line.startswith("BGEN 1 ") for line in lines), lines)
+        self.assertIs(self.engine.slot_held[0], outgoing)
+        self.assertEqual(self.engine.slot_owner[0], "long-yarn-owner")
+        self.assertEqual(self.engine.slot_kv_pages, [0, 0])
+        self.assertFalse(self.engine.ctl.locked())
+
+    def test_mixed_alias_grows_and_returns_to_warm_slot_zero(self):
+        self.cold_routing_setup()
+        engine = self.engine
+        engine.max_context = 1 << 20
+        outgoing = engine.slot_held[0]
+        send = engine._send
+        swift = {"_rope_profile": 0, "_swift_lora": True, "_context_limit": 262144}
+        yarn = {"_rope_profile": 1, "_context_limit": 524288}
+
+        def reply(line, **kwargs):
+            if line == "BGROW":
+                engine.lines.put("BGROWN 1")
+            else:
+                send(line, **kwargs)
+
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            with mock.patch.object(engine, "_send", side_effect=reply) as transport:
+                self.assertTrue(list(engine.generate([1, 2, 3], 12, swift, threading.Event(), session="swift")))
+                self.assertIs(engine.slot_held[0], outgoing)
+                self.assertEqual(engine.slot_owner[0], "long-yarn-owner")
+                self.assertTrue(list(engine.generate(outgoing + [8], 12, yarn, threading.Event(),
+                                                     session="long-yarn-owner")))
+        lines = [call.args[0] for call in transport.call_args_list]
+        self.assertEqual(lines[0], "BGROW")
+        self.assertTrue(any(line.startswith("BGEN 1 ") for line in lines))
+        self.assertTrue(any(line.startswith("SGEN 0 ") for line in lines))
+
+    def test_mixed_alias_uses_available_peer_without_growth(self):
+        self.start(2, slot0_solo=True, solo_any=True)
+        engine = self.engine
+        engine.info.update(shared_kv_pages=8192, shared_kv_page_cells=4, shared_kv_grow=1,
+                           rope_context_profiles=1, cold_shared_recovery_min_tokens=8192)
+        engine.slot_adapters[:] = [4, 2]
+        outgoing = [7] * 9000
+        engine.slot_held[:] = [outgoing, [1, 2]]
+        engine.claim_slot(1, "prior-swift")
+        swift = {"_rope_profile": 0, "_swift_lora": True, "_context_limit": 262144}
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            with mock.patch.object(engine, "_send", wraps=engine._send) as transport:
+                self.assertTrue(list(engine.generate([1, 2, 3], 12, swift, threading.Event())))
+        lines = [call.args[0] for call in transport.call_args_list]
+        self.assertTrue(lines[0].startswith("BGEN 1 "))
+        self.assertIs(engine.slot_held[0], outgoing)
+
+    def test_mixed_alias_retires_source_when_both_reservations_cannot_fit(self):
+        self.cold_routing_setup()
+        engine = self.engine
+        engine.info["shared_kv_pages"] = 2250
+        swift = {"_rope_profile": 0, "_swift_lora": True, "_context_limit": 262144}
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            with mock.patch.object(engine, "_send", wraps=engine._send) as transport:
+                self.assertTrue(list(engine.generate([1, 2, 3], 12, swift, threading.Event())))
+        self.assertTrue(transport.call_args_list[0].args[0].startswith("SGEN 0 "))
+
+    def test_second_replacement_prefers_nonzero_slot_while_source_is_frozen(self):
+        self.check_second_frozen_replacement(2200, False, 2)
+
+    def test_second_replacement_falls_back_when_frozen_pages_fill_the_pool(self):
+        self.check_second_frozen_replacement(8190, False, 0)
+
+    def test_second_replacement_falls_back_when_extra_growth_is_refused(self):
+        self.check_second_frozen_replacement(2200, True, 0)
+
+    def check_second_frozen_replacement(self, pages, refuse, expected):
+        fake = FAKE_BATCH.replace(
+            '    if line.startswith("BSTOP "):',
+            '    if line.startswith("BGROW"):\n'
+            f'        if slots == 2 and {refuse!r}:\n'
+            '            print("BGROWN -1", flush=True)\n'
+            '        else:\n'
+            '            print(f"BGROWN {slots}", flush=True)\n'
+            '            slots += 1\n'
+            '        continue\n'
+            '    if line.startswith("BSTOP "):')
+        fake = fake.replace('    for b in sorted(active):',
+                            '    for b in sorted(active):\n        if b == 1 and b not in stopped:\n            continue')
+        fake = fake.replace('            print(f"BADM {slot} {1 if cont else 0}", flush=True)',
+                            f'            if slot == 1:\n'
+                            f'                print("INFO frozen_shared_kv_pages={pages} frozen_shared_kv_cache=4", flush=True)\n'
+                            '            print(f"BADM {slot} {1 if cont else 0}", flush=True)')
+        with mock.patch(__name__ + ".FAKE_BATCH", fake):
+            self.cold_routing_setup()
+
+        engine = self.engine
+        seed = {"_rope_profile": 0, "_context_limit": 262144}
+        cancel = threading.Event()
+        first = threading.Event()
+        errors = []
+
+        def generate():
+            try:
+                for token in engine.generate(list(b"LONGREPLY"), 64, seed, cancel, session="B"):
+                    if token is not None:
+                        first.set()
+            except Exception as err:
+                errors.append(err)
+                first.set()
+
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            thread = threading.Thread(target=generate, daemon=True)
+            thread.start()
+            try:
+                self.assertTrue(first.wait(3))
+                self.assertFalse(errors)
+                self.assertTrue(engine.slot_busy[1])
+                self.assertTrue(list(engine.generate([1, 2, 3], 16, seed, threading.Event(), session="C")))
+                self.assertTrue(engine.slot_busy[1])
+                admitted = [int(row.split()[1]) for row in self.log.read_text().splitlines() if row.startswith("BGEN ")]
+                self.assertEqual(admitted, [1, expected])
+            finally:
+                cancel.set()
+                engine._send("BSTOP 1")
+                thread.join(3)
+        self.assertFalse(errors)
+        self.assertFalse(thread.is_alive())
+
+    def test_cold_growth_refusal_reuses_original_slot(self):
+        self.cold_routing_setup()
+        send = self.engine._send
+
+        def reply(line, **kwargs):
+            if line == "BGROW 0":
+                self.engine.lines.put("BGROWN -1")
+            else:
+                send(line, **kwargs)
+
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            with mock.patch.object(self.engine, "_send", side_effect=reply) as transport:
+                self.assertTrue(list(self.engine.generate([1, 2, 3], 12, {"_rope_profile": 0, "_context_limit": 262144}, threading.Event())))
+        lines = [call.args[0] for call in transport.call_args_list]
+        self.assertEqual(lines[0], "BGROW 0")
+        self.assertTrue(any(line.startswith("BGEN 0 ") for line in lines), lines)
+        self.assertEqual(self.engine.slot_kv_pages, [0])
+        self.assertEqual(len(self.engine.admission), 0)
+
+    def test_cold_growth_accounts_for_outgoing_prefix(self):
+        self.cold_routing_setup()
+        self.engine.info["shared_kv_pages"] = 2250
+        with mock.patch.dict(os.environ, {"BASALT_SHARED_SOLO": "1"}):
+            with mock.patch.object(self.engine, "_send", wraps=self.engine._send) as transport:
+                self.assertTrue(list(self.engine.generate([1, 2, 3], 12, {"_rope_profile": 0, "_context_limit": 262144}, threading.Event())))
+        lines = [call.args[0] for call in transport.call_args_list]
+        self.assertFalse(any(line.startswith("BGROW") for line in lines), lines)
+        self.assertTrue(any(line.startswith("SGEN 0 ") for line in lines), lines)
+
+    def test_shared_growth_does_not_apply_reply_from_previous_generation(self):
+        self.cold_routing_setup()
+        previous_lines = self.engine.lines
+
+        def reply(line, **kwargs):
+            self.assertEqual(line, "BGROW 0")
+            self.engine.gen += 1
+            self.engine.lines = queue.Queue()
+            previous_lines.put("BGROWN 1")
+
+        with mock.patch.object(self.engine, "_send", side_effect=reply):
+            with self.assertRaisesRegex(EngineDied, "restarted during shared slot growth"):
+                self.engine._grow_shared_slot(0)
+        self.assertEqual(self.engine.slot_busy, [False])
+        self.assertEqual(self.engine.slot_kv_pages, [0])
+
+    def test_restart_drops_unadvertised_cold_growth_capability(self):
+        self.cold_routing_setup()
+        script = Path(self.tmp.name) / "fake_engine.py"
+        real = subprocess.Popen
+        with mock.patch.object(subprocess, "Popen",
+                               lambda cmd, **kw: real([sys.executable, str(script), *cmd[1:]], **kw)):
+            self.engine.restart(tries=1)
+        self.assertNotIn("cold_shared_recovery_min_tokens", self.engine.info)
+
+    def test_shared_growth_refusal_waits_for_existing_slot(self):
+        self.start(2)
+        self.engine.info.update(shared_kv_pages=128, shared_kv_page_cells=4, shared_kv_grow=1)
+        with self.engine.slot_cv:
+            self.engine.slot_busy[:] = [True, True]
+            self.engine.slot_kv_pages[:] = [20, 20]
+        result = []
+        refused = threading.Event()
+        send = self.engine._send
+
+        def reply(line, **kwargs):
+            if line == "BGROW":
+                self.engine.lines.put("BGROWN -1")
+                refused.set()
+            else:
+                send(line, **kwargs)
+
+        thread = threading.Thread(target=lambda: result.append(self.chat("wait after growth refusal")))
+        with mock.patch.object(self.engine, "_send", side_effect=reply) as transport:
+            thread.start()
+            try:
+                self.assertTrue(refused.wait(5))
+                with self.engine.slot_cv:
+                    self.assertEqual(len(self.engine.admission), 1)
+                    self.assertEqual(self.engine.slot_kv_pages, [20, 20])
+                    self.assertFalse(self.engine.ctl.locked())
+                transport.assert_called_once_with("BGROW", proc=self.engine.proc)
+            finally:
+                with self.engine.slot_cv:
+                    self.engine.slot_busy[1] = False
+                    self.engine.slot_kv_pages[1] = 0
+                    self.engine.slot_cv.notify_all()
+                thread.join(15)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(result[0]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(self.engine.slot_kv_pages, [20, 0])
+
+    def test_shared_pool_waits_even_when_a_slot_is_free(self):
+        self.start(2)
+        self.engine.info.update(shared_kv_pages=128, shared_kv_page_cells=4)
+        with self.engine.slot_cv:
+            self.engine.slot_busy[0] = True
+            self.engine.slot_kv_pages[0] = 127
+        result = {}
+        thread = threading.Thread(target=lambda: result.setdefault("r", self.chat("waits for pages")))
+        thread.start()
+        try:
+            end = time.monotonic() + 5
+            while time.monotonic() < end and not len(self.engine.admission):
+                time.sleep(0.01)
+            self.assertEqual(len(self.engine.admission), 1)
+            self.assertFalse(self.engine.slot_busy[1])
+            self.assertFalse(any(x.startswith("BGEN") for x in self.log.read_text().splitlines()))
+        finally:
+            with self.engine.slot_cv:
+                self.engine.slot_busy[0] = False
+                self.engine.slot_kv_pages[0] = 0
+                self.engine.slot_cv.notify_all()
+            thread.join(15)
+        self.assertEqual(result["r"]["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(self.engine.slot_kv_pages, [0, 0])
 
     def test_reads_that_gave_way_in_every_slot_do_not_stall(self):
         """Two long reads, then short requests: no read gives way to a request that finds no free slot, and

@@ -1,3 +1,6 @@
+#include "basalt/log.hpp"
+#include "basalt/core/direct_peer.hpp"
+#include "basalt/core/diag.hpp"
 #include "run.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
@@ -6,6 +9,7 @@
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/core/peer_experts.hpp"
 #include <algorithm>
+#include <atomic>
 #include <utility>
 #include <vector>
 
@@ -46,8 +50,17 @@ void Prefill::Run::Chunk::copy_ahead(int64_t L) {
     m.ahead_layer[b] = L;
     cudaEventRecord(m.ahead_ev, m.cs);
     cudaStreamWaitEvent(m.copy, m.ahead_ev, 0);
+    int budget = ahead_n;
+    if (budget > 32 && T <= 4096 && ppc && ppc->peer &&
+        core::exp_flag("peer_cold_mmq") != 0 && core::direct_peer_enabled(m.device, ppc->dev) &&
+        core::exp_flag("peer_ahead_cap") != 0) {
+        budget = 32;
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true))
+            basalt::log::info("basalt prefill", "primary expert lookahead capped at %d of %d", budget, ahead_n);
+    }
     int k = 0;
-    for (size_t i = 0; i < want.size() && k < ahead_n; ++i) {
+    for (size_t i = 0; i < want.size() && k < budget; ++i) {
         const int32_t e = want[i].second;
         const uint8_t* bl = m.src->blob(L, e);
         if (bl == nullptr) continue;

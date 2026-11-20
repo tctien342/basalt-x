@@ -80,7 +80,8 @@ public:
             std::optional<basalt::program::grammar::PackVocab>& vocab_tables)
         : o(options), model_file(file), err(error), n_vocab(vocab), grammar_vocab(vocab_tables) {}
     // the stdin reader thread uses this object's state: it ends before the object does
-    virtual ~Runtime() {
+    virtual ~Runtime() { stop_input(); }
+    void stop_input() {
         reader_stop_.store(true);
         if (reader_.joinable()) reader_.join();
     }
@@ -103,10 +104,12 @@ public:
     virtual bool windows_in_flight() = 0;
     virtual bool next_batch_window() = 0;
     virtual bool drain_windows() = 0;
+    virtual int grow_batch_slot() { return -1; }
     virtual void script_command(const std::string& line) = 0;
     virtual void probe_command(const std::string& line, std::string& e) = 0;
     virtual bool vram_command(const std::string& cmd, std::string& e, bool for_sleep, std::string* reply = nullptr) = 0;
     virtual void sleep_command(bool down, std::string& e) = 0;
+    virtual bool before_command() { return true; }
     virtual void between_requests(const std::string& line) = 0;
     virtual Flow run_request() = 0;
     virtual void solo_draft_back(bool) {}
@@ -130,6 +133,9 @@ public:
     virtual bool slots_share_cells() const { return true; }   // one slot's positional state can be copied to another
     virtual bool slot0_solo() const = 0;   // slot 0 of the batch windows is the solo session
     virtual void enc_command(const std::string& cmd) = 0;
+    virtual bool submit_async_image(const std::string&) { return false; }
+    virtual bool async_image_active() const { return false; }
+    virtual bool tick_async_image() { return true; }
     virtual size_t spill_to_disk(bool at_exit, size_t limit) = 0;
     virtual bool park_idle_engine(std::string& e) = 0;
     virtual void kv_ceiling_note() {}   // a model with an elastic KV sends its ceiling again when it moves
@@ -156,11 +162,16 @@ public:
     // the disk tier under it (--conversation-cache-dir): what leaves the session or the RAM cache is written there,
     // and a prompt that starts with a stored conversation reads it back, after a restart too
     basalt::core::ConversationStore disk{};
+    virtual basalt::core::ConversationStore& disk_store() { return disk; }
+    virtual basalt::core::ConversationStore* ram_checkpoint_store() { return nullptr; }
+    virtual size_t checkpoint_for_recovery() { return 0; }
     virtual int64_t disk_min_tokens() const = 0;
     static constexpr int64_t kDiskStaleTokens = 4096;   // a stored copy this close to the chain's end is kept
     static constexpr uint64_t kDiskQueueCap = 4ull << 30;   // images waiting for the writer, in RAM
     uint64_t disk_floor{};
-    bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs, const std::vector<ConvCheckpoint>& cks, bool cvec);
+    bool disk_has(const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                  const std::vector<ConvCheckpoint>& cks, bool cvec,
+                  basalt::core::ConversationStore* store = nullptr);
     int64_t pp_total{};
     int64_t pp_from{};
     int64_t pp_next_check{};
@@ -181,8 +192,15 @@ public:
     std::thread reader_{};
     std::atomic<bool> reader_stop_{};
     std::mutex in_mu{};
+    struct SchedulerQueue {
+        int control = 0, admission = 0, parked = 0;
+        long long oldest_ms = 0, free_pages = -1;
+        Clock::time_point received{};
+    };
+    SchedulerQueue scheduler_queue{};                // guarded by in_mu
     std::condition_variable in_cv{};
     std::deque<std::string> in_lines{};
+    uint64_t dispatch_epoch{};   // scheduler thread, once per dispatched protocol command
     bool in_eof{};
     std::atomic<bool> ram_stop{};
     uint64_t guard_floor{};
@@ -197,10 +215,14 @@ public:
         int64_t p = 0;                 ///< its position
         int64_t produced = 0, max_new = 0;
         Clock::time_point t0;
+        Clock::time_point last_emit{};  // scheduler uses it only when it belongs to the current request
         // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
         // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
         // instead of reading its history again (see `slot_source` in the request path).
         std::vector<int32_t> ids;
+        std::vector<int32_t> short_prompt;   // deferred known rows followed by the first decode input
+        Clock::time_point prompt_started{};
+        int64_t prompt_reused = 0;
         bool cached = false;           ///< idle, and its sessions still hold `ids`
         double idle_busy = 0;          ///< the busy clock (busy_now) when it last became idle holding `ids`
         double park_noted = -1;        ///< the idle_busy whose stay in VRAM for want of RAM was logged

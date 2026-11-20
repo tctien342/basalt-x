@@ -1,5 +1,6 @@
 // src/models/qwen4exp/decode/expert_dispatch.cpp - the pool's side of a layer: which routed experts go where.
 #include "basalt/core/expert_source.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
 #include "basalt/models/qwen4exp/decode/expert_dispatch.hpp"
 #include "basalt/core/load_progress.hpp"
 #include "basalt/core/peer_experts.hpp"
@@ -103,6 +104,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (native && d.nact_multi.size() < (size_t) MAXT * kNativeActBytes) d.nact_multi.resize((size_t) MAXT * kNativeActBytes);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
+    const bool adapted = d.cpu_lora && (d.cpu_lora_rows || d.cpu_lora_scale != 0);
+    const float* lora_a = adapted ? d.cpu_lora->input_factor(
+        "blk." + std::to_string(d.layers) + ".ffn_down_exps.weight").data() : nullptr;
+    const float* lora_b = adapted ? d.cpu_lora->output_factor().data() : nullptr;
     const auto c0 = std::chrono::steady_clock::now();
     if (!d.usage.empty())
         for (int64_t i = 0; i < n_tok * k; ++i)
@@ -277,8 +282,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ExpertJobMulti& nj = d.jobs_multi[(size_t) jo];
                 nj.blob = b;
                 nj.nt = 0;
+                nj.lora_a = lora_a ? lora_a + (size_t) e * lay.fmt[(size_t) d.layers].n_ff : nullptr;
+                nj.lora_b = lora_b;
+                nj.lora_scale = d.cpu_lora_scale;
+                nj.lora_per_row = d.cpu_lora_rows != nullptr;
             }
             ExpertJobMulti& jb = d.jobs_multi[(size_t) jo];
+            if (jb.lora_per_row) jb.lora_rows[jb.nt] = d.cpu_lora_rows[t];
             jb.act[jb.nt] = &d.act_multi[(size_t) t];
             jb.nact[jb.nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
             jb.out[jb.nt] = row;
@@ -286,8 +296,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++d.multi_entries;
         }
     const auto c3 = std::chrono::steady_clock::now();
+    static const auto route_trace = [] {
+        const char* path = std::getenv("BASALT_QFN_ROUTE_TRACE");
+        auto* file = path ? std::fopen(path, "wbx") : nullptr;
+        if (file) std::setvbuf(file, nullptr, _IONBF, 0);
+        if (path && !file) basalt::log::error("basalt", "cannot open expert route trace %s", path);
+        return std::unique_ptr<std::FILE, decltype(&std::fclose)>(file, &std::fclose);
+    }();
     if (njobs > 0) {
         d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+    }
+    if (route_trace) {
+        const auto elapsed = njobs == 0 ? 0 : std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - c3).count();
+        int32_t record[4 + 2 * kMaxWindowEntries]{(int32_t) d.layers, (int32_t) n_tok, (int32_t) k, (int32_t) elapsed};
+        std::copy_n(ids, n, record + 4);
+        std::copy_n(kind, n, record + 4 + n);
+        std::fwrite(record, sizeof(record[0]), (size_t) (4 + 2 * n), route_trace.get());
     }
     if (d.peer != nullptr && !ext) {         // multi-GPU: the second GPU's rows, into the same mapped rows
         std::string perr;

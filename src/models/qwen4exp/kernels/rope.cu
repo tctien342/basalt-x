@@ -39,11 +39,29 @@ namespace basalt::kernels {
 namespace {
 // The process's rope config (rope_scaling.hpp).  One writer - the engine's startup thread, before
 // session_init builds any table or captures any graph - and readers after it.
-RopeScaling g_rope_scaling;
+RopeScaling g_rope_scaling[kRopeContexts];
+thread_local RopeContext g_rope_context = RopeContext::Startup;
 }  // namespace
 
-void rope_scaling_set(const RopeScaling& scaling) { g_rope_scaling = scaling; }
-const RopeScaling& rope_scaling() { return g_rope_scaling; }
+void rope_scaling_set(const RopeScaling& scaling) {
+    g_rope_scaling[static_cast<int>(RopeContext::Startup)] = scaling;
+    RopeScaling native;
+    native.freq_base = scaling.freq_base;
+    g_rope_scaling[static_cast<int>(RopeContext::Native)] = native;
+    RopeScaling yarn = native;
+    yarn.type = RopeScalingType::YaRN;
+    yarn.factor = 2.0;
+    yarn.ext_factor = 1.0;
+    g_rope_scaling[static_cast<int>(RopeContext::YaRN2)] = yarn;
+}
+
+RopeContext rope_context() { return g_rope_context; }
+const RopeScaling& rope_scaling() { return g_rope_scaling[rope_context_index()]; }
+
+RopeContextScope::RopeContextScope(RopeContext context) : previous_(g_rope_context) {
+    g_rope_context = context;
+}
+RopeContextScope::~RopeContextScope() { g_rope_context = previous_; }
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;

@@ -88,6 +88,7 @@ class LoadBars:
         self.drawn = 0                                 # lines of bars on screen
         self.shown: list[str] = []                     # the rows on screen
         self.kv: list[tuple[str, int, int, str, int]] = []  # (target, bytes, tokens, kind, max bytes): allocated only
+        self.kv_allocations = []
 
     def name(self, target: str) -> str:
         if target == "ram":
@@ -219,7 +220,7 @@ class LoadBars:
             have = {self.key(tg): round((t["done"] + t["last"]) / 2**30, 1)
                     for (tg, c), t in self.targets.items() if not c and tg != self.TABLE and t["start"] is not None}
             pct = min(99, int(100 * self.done() / want)) if want > 0 else None
-            return {"percent": pct, "gib": have}
+            return {"percent": pct, "gib": have, "kv_allocations": list(self.kv_allocations)}
 
     def lines(self) -> list[str]:
         return [text for _, text in self._rows()]
@@ -279,7 +280,10 @@ class LoadBars:
             self._draw()
 
     def set_kv(self, target: str, nbytes: int, tokens: int, kind: str = "", max_bytes: int = 0) -> None:
-        self.kv.append((target, nbytes, tokens, kind, max(max_bytes, nbytes)))
+        limit = max(max_bytes, nbytes)
+        self.kv.append((target, nbytes, tokens, kind, limit))
+        self.kv_allocations.append({"device": target, "bytes": nbytes, "context": tokens,
+                                    "kind": kind or "target", "configured_bytes": limit})
 
     def kv_lines(self) -> list[str]:
         """One line per device: all the session state allocated there (solo, batch slots, draft K/V).  An elastic

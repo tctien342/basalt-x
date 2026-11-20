@@ -24,6 +24,11 @@ using namespace detail;
 
 bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                        std::string& err) {
+    return draft_kv(mtp, R_rows, next_tokens, n, cell0, err, false);
+}
+
+bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                       std::string& err, bool fp16_rows) {
     Impl& m = *impl_;
     // A ring (KV streaming: the drafter's window, page p in slot p % n_slots over a host copy) takes the same appends
     // with its own page table and host copy, as a streamed main layer does; the cells written are those the window can
@@ -89,7 +94,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return false;
-    if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
+    if (!mtp.before_draft_write(cell0 + r0, cell0 + n, err) || !mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
     basalt::kernels::QsaShapes s = basalt::kernels::qsa_real_shapes();
     s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
     s.idx_dim = g.idx_key_dim;
@@ -137,7 +142,13 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         rms_rows(emb, w_ne, nb, Nn, Nn, EPS, m.cs);
         if (!q8) to_f16(emb, en16, nb * Nn, m.cs);
         proj(emb, en16, w_fe, e2, nb, Nn, Nn, 0);
-        cudaMemcpyAsync(hn, R_rows + (size_t) b0 * HCN, (size_t) nb * HCN * 4, cudaMemcpyDefault, m.cs);   // (or pinned host rows)
+        const size_t off = (size_t) b0 * HCN, count = (size_t) nb * HCN;
+        const auto copy = fp16_rows
+            ? cudaMemcpyAsync(hn16, reinterpret_cast<const uint16_t*>(R_rows) + off, count * sizeof(uint16_t),
+                              cudaMemcpyHostToDevice, m.cs)
+            : cudaMemcpyAsync(hn, R_rows + off, count * sizeof(float), cudaMemcpyDefault, m.cs);
+        if (copy != cudaSuccess) { err = "prefill: draft residual upload failed"; return false; }
+        if (fp16_rows) from_f16(hn16, hn, (int64_t) count, m.cs);
         rms_rows(hn, w_nh, nb, HCN, HCN, EPS, m.cs);
         if (!q8) to_f16(hn, hn16, nb * HCN, m.cs);
         proj(hn, hn16, w_fh, h2, nb * g.hc, Nn, Nn, 1);   // every stream through fc_hidden
@@ -154,7 +165,8 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         rope(Kc, nb, g.n_head_kv, g.head_dim, KV, c0, basalt::kernels::rope_scaling(), m.cs);
         if (st.kv_rot) {   // rotated as the drafter's own decode stores them (src/models/qwen4exp/decode/mtp/forward.cpp)
             basalt::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
-            basalt::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
+            basalt::kernels::fwht_value_inplace_cuda(Vc, nb * g.n_head_kv, m.cs,
+                                                     basalt::kernels::kv_value_rotation_width(st.kv_int8 && !st.kv_q4));
         }
         if (st.kv_q4) {
             basalt::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);

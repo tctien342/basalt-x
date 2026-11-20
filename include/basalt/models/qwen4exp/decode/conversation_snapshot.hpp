@@ -4,10 +4,21 @@
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
 
+#include <array>
+#include <functional>
+#include <span>
 #include <string>
 #include <thread>
 
 namespace basalt::core {
+
+using ConversationCaptureStop = std::function<bool()>;
+inline constexpr char kCaptureInterrupted[] = "conversation snapshot interrupted";
+inline bool conversation_capture_interrupted(const ConversationCaptureStop* stop, std::string& error) {
+    if (!stop || !(*stop)()) return false;
+    error = kCaptureInterrupted;
+    return true;
+}
 
 // Caller synchronizes the device before saving, and after restoring all layers.
 // include_index is false for the draft layer (its attention has no indexer).
@@ -17,9 +28,25 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
+                          const ConversationCaptureStop* stop = nullptr);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
+// The scheduler keeps the source lease and backing read-only until the worker
+// finishes. The job owns the copied page directory, never the GPU page table.
+struct ConversationSharedKvSource {
+    std::array<const uint8_t*, 4> host{};
+    std::array<size_t, 4> logical_bytes{};
+    const void* pooled = nullptr;
+    size_t pooled_bytes = 0;
+};
+bool conversation_kv_seal_shared(ConversationKv& image, ConversationSharedKvSource& copy,
+                                 const QsaState& state, const ModelGeometry& g, int64_t upto,
+                                 std::span<const uint32_t> pages, std::string& error, bool frozen_index);
+bool conversation_kv_finish_shared(ConversationKv& image, const ConversationSharedKvSource& copy,
+                                   std::span<const uint32_t> pages, std::string& error,
+                                   const ConversationCaptureStop* stop = nullptr);
+
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
@@ -83,6 +110,37 @@ private:
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 
+struct ConversationSharedDraftTail {
+    std::array<const uint8_t*, 4> host{};
+    int64_t first_cell = 0;
+    int64_t end_cell = 0;
+};
+bool conversation_kv_seal_shared_draft(ConversationKv& image, ConversationSharedDraftTail& tail,
+                                       const QsaState& state, const ModelGeometry& g, int64_t upto,
+                                       int64_t prefix, std::string& error);
+
+struct ConversationSharedSnapshot {
+    SavedConversation image;
+    std::vector<uint32_t> pages;
+    std::vector<ConversationSharedKvSource> sources;
+    int index_device = -1;
+    ConversationSharedDraftTail draft_tail;
+};
+// Seal the private chain, running state and draft under the outgoing profile.
+// The caller has made the draft history current and reserved the snapshot budget.
+// With frozen_index, the caller also keeps the pooled device rows immutable
+// through read_shared_index. Otherwise the seal copies them before returning.
+bool conversation_snapshot_seal_shared(ConversationSharedSnapshot& job, SavedConversation&& chain,
+                                       const SessionState& session, const ModelGeometry& g,
+                                       const QsaState* draft, std::string& error, bool frozen_index = false,
+                                       int64_t draft_prefix = -1);
+// The owner protects the page-rounded draft range until this copy completes.
+bool conversation_snapshot_read_shared_draft(ConversationSharedSnapshot& job, std::string& error);
+bool conversation_snapshot_read_shared_index(ConversationSharedSnapshot& job, std::string& error);
+// The finish step reads the frozen target host pages and requires completed index copies.
+bool conversation_snapshot_finish_shared(SavedConversation& result, ConversationSharedSnapshot&& job,
+                                         std::string& error, const ConversationCaptureStop* stop = nullptr);
+
 struct ConversationView {
     const std::vector<int32_t>& ids;
     const std::vector<ConversationImageKey>& images;
@@ -105,6 +163,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+// Narrow a validated single-stage host image to a checkpoint without writing any device state.
+bool conversation_snapshot_trim_to_checkpoint(SavedConversation& image, const SessionState& session,
+                                              const ModelGeometry& g, const QsaState* draft,
+                                              int64_t upto, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
@@ -123,7 +185,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
                                          size_t& bytes, std::string& error);
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                const ConversationCaptureStop* stop = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

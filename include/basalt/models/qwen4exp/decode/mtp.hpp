@@ -21,6 +21,7 @@
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/core/model_file.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
+#include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 #include "basalt/kernels/sampler.hpp"
 
 #include <cuda_runtime.h>
@@ -28,6 +29,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <string>
 #include <vector>
 
@@ -136,7 +138,16 @@ public:
     /// as long as a store's over a host copy that every sequence's appends share.
     /// `cells[i]` (optional) is slot i's context, the main store's the full state's.  With a draft window a store
     /// keeps only its sequence's last cells (the window and a turn's roll-back), as a ring.
-    void set_stores(int n, std::vector<int64_t> cells = {}) { n_stores_ = n; store_cells_ = std::move(cells); }
+    void set_stores(int n, std::vector<int64_t> cells = {}, bool lazy = false) {
+        n_stores_ = n;
+        store_cells_ = std::move(cells);
+        lazy_stores_ = lazy;
+    }
+    bool set_store_adapter_scale(int id, float scale, std::string& err);
+    bool append_shared_store(int64_t cells, std::string& err, cudaError_t& status);
+    uint64_t shared_store_bytes(int slot = -1) const;
+    bool prepare_shared_stores(int slot, std::string& err);
+    bool retire_shared_store(int id, std::string& err);
     int main_store() const { return n_stores_; }
     bool use_store(int id, std::string& err);
     bool use_main(std::string& err) { return use_store(n_stores_, err); }
@@ -183,6 +194,12 @@ public:
     void wrote(int64_t lo, int64_t hi) { note_cells(lo, hi); }
     int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
+    void protect_draft_tail(int64_t first, int64_t end, std::shared_future<bool> ready) {
+        frozen_draft_first_ = first;
+        frozen_draft_end_ = end;
+        frozen_draft_ready_ = std::move(ready);
+    }
+    bool before_draft_write(int64_t first, int64_t end, std::string& err);
     bool idle(std::string& err) {
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
         return true;
@@ -201,12 +218,12 @@ private:
     bool record_step(int j, bool copy_records, std::string& err);
     bool capture_round(int T, std::string& err);
     bool capture_step(int j, std::string& err);
-    cudaGraphExec_t step_exec_[2][kMtpChainMax + 1] = {};   ///< [tier_][chain step]
+    cudaGraphExec_t step_exec_[basalt::kernels::kRopeContexts][2][kMtpChainMax + 1] = {};   ///< [tier_][chain step]
     /// The round and `steps - 1` chain steps in one graph, step j an IF node on draft j-1's
     /// probability passing the cumulative rule; false (with the per-step path from then on) where it cannot be built
     bool capture_cond(int T, int steps);
-    cudaGraphExec_t cond_exec_[2][9] = {};   ///< [tier_]
-    int cond_steps_[2][9] = {};
+    cudaGraphExec_t cond_exec_[basalt::kernels::kRopeContexts][2][9] = {};   ///< [tier_]
+    int cond_steps_[basalt::kernels::kRopeContexts][2][9] = {};
     bool cond_off_ = false;
     int chain_j_ = 0;   ///< record_forward: the chain step being recorded (the diagnostic logits' slot)
     const float* f32(const char* name) const;
@@ -250,11 +267,11 @@ private:
     /// q8_1 row in xqr_); joined before the draft row's attention
     bool kv_defer_ = false, kv_open_ = false;
     uint8_t* xqr_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
+    cudaGraphExec_t prefill_exec_[basalt::kernels::kRopeContexts][9] = {};
+    cudaGraphExec_t prefill_dev_exec_[basalt::kernels::kRopeContexts][9] = {};
     int32_t* pf_dev_ = nullptr;   ///< a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaGraphExec_t round_exec_[2][9] = {};   ///< [tier_]
+    cudaGraphExec_t round_exec_[basalt::kernels::kRopeContexts][2][9] = {};   ///< [tier_]
 
     struct Tensor {
         std::string name, kind;
@@ -276,6 +293,10 @@ private:
     struct KvArr { void* p = nullptr; uint64_t page_bytes = 0; };
     int kv_layout(KvArr* out) const;
     void* store_ptr(int id, int i, const KvArr* lay) const { return id == cur_ ? lay[i].p : stores_[(size_t) id][(size_t) i]; }
+    bool ensure_store(int id, const KvArr* layout, int arrays, std::string& err, cudaError_t* status = nullptr);
+    bool lazy_stores_ = false;
+    std::vector<float> store_adapter_scale_;
+    float *h_adapter_rows_ = nullptr, *m_adapter_rows_ = nullptr;
     std::vector<std::array<void*, 4>> stores_;
     int n_stores_ = 0, cur_ = 0;
     std::vector<int64_t> store_hi_;
@@ -291,6 +312,8 @@ private:
     /// host copy (which every sequence appends to), so a conversation image read from that copy has the sequence's
     /// own window.  Waits for the drafter's stream; a no-op without a ring or stores.
     bool ring_to_host(std::string& err);
+    int64_t frozen_draft_first_ = 0, frozen_draft_end_ = 0;
+    std::shared_future<bool> frozen_draft_ready_;
     int64_t dirty_lo_ = 0, dirty_hi_ = 0;   // empty when hi <= lo
     static constexpr int kKeepRows = 16;
     float* rkeep_ = nullptr;    ///< a window's rows, kept while the slots draft one after another

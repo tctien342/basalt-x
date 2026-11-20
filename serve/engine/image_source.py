@@ -70,6 +70,8 @@ class Kind:
 
 
 IMAGE = Kind("image", "IMAGE_MAX_BYTES", USAGE)
+AUDIO_MAX_BYTES = 64 << 20
+AUDIO = Kind("audio", "AUDIO_MAX_BYTES", "audio requires a data: URL or an HTTP(S) URL")
 VIDEO = Kind("video", "VIDEO_MAX_BYTES", "a video must be a data: URL, an http(s) URL or a local file path")
 
 

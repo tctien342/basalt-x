@@ -4,6 +4,9 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "../../../program/serve/request.hpp"
 #include "qfn_state.hpp"
+#include <tuple>
+
+namespace basalt::core { class Dflash2; }
 
 namespace basalt::models::qwen4exp::serve {
 
@@ -18,7 +21,13 @@ public:
     void decode_state_begin();
     void decode_stats_begin();
     int max_window() const { return runtime_.S; }
+    int thinking_window_cap() const;
     int draft_window();
+    int dflash_count = 0;
+    int dflash_suffix_window = 0, dflash_suffix_match = 0;
+    int dflash_suffix_skipped = 0;
+    int dflash_commit = 0;
+    basalt::core::Dflash2* dflash = nullptr;
     void lookup_window(int& T, bool& from_sfx, int& sfx_match);
     void fill_drafts(int T, bool from_sfx);
     int before_window(int T, int64_t pos);
@@ -66,8 +75,14 @@ public:
     bool after_accept(int T, int& a, int e0, bool from_sfx, bool held_run, bool paired, bool& hold);
     void note_draft_probs(bool from_sfx);
     void stamp_before_commit() { basalt::core::decode_events().stamp(9); }
-    bool commit(int keep, std::string& e, int phase) { return cv->commit(keep, e, phase); }
-    void on_token(int32_t tok) { if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(tok); }
+    bool commit(int keep, std::string& e, int phase) {
+        if (dflash && phase == 2) dflash_commit = keep;
+        return cv->commit(keep, e, phase);
+    }
+    void on_token(int32_t tok) {
+        if (max_thinking && tok == req_think_close) max_thinking = false;
+        if (runtime_.o.suffix_draft > 0) runtime_.sfx->append(tok);
+    }
     void count_round() { ++runtime_.rounds; }
     template <class After>
     bool draft_next(int T, int a, int e0, int TB, bool from_sfx, bool hold, bool will_draft, After& after_launch);
@@ -89,6 +104,11 @@ public:
 
 private:
     QfnRuntime& runtime_;
+    std::optional<basalt::kernels::RopeContextScope> rope_scope_;
+    bool max_thinking{};
+    bool thinking_mtp{};
+    int64_t thinking_offered{}, thinking_accepted{}, thinking_close_clips{};
+    bool max_mtp_reported{};
     bool try_pair{};
     bool do_adapt{};
     bool adapt_ok{true};
@@ -119,7 +139,24 @@ private:
     // slots' windows then see the cache without the slots this prompt borrowed (marked missing: those experts
     // run on the CPU), never a prompt buffer.
     static constexpr double decode_share = 0.5;
+    static constexpr int64_t kInterleavedPrefillCap = 2048;
     bool batch_fatal{};
+    struct ShortPrefillSample {
+        ShortPrefillTiming* timing = nullptr;
+        int64_t tokens = 0;
+        bool windows = false;
+        Clock::time_point started;
+    } short_prefill_sample;
+    ShortPrefillTiming* short_prefill_timing(int64_t at);
+    using OverlapDecoder = std::tuple<size_t, Clock::time_point, int64_t, unsigned>;
+    bool overlap_learning_attempted = false;
+    struct OverlapLearningSample {
+        uint64_t scope;
+        int64_t chunk;
+        double gap_limit_ms;
+        std::vector<OverlapDecoder> decoders;
+    };
+    std::optional<OverlapLearningSample> overlap_learning_sample;
     int64_t il_parts{};
     double il_ms{};
     // ---- the prompt-time layer split: a long part of the prompt is read across the cards when its price there
@@ -188,15 +225,22 @@ private:
     bool park_read(int64_t q, int ys, std::string& ye, int64_t chunk = 0);
     SplitPlan split_plan(int64_t a0, int64_t b0, const char* no_split);
     bool read_split(int64_t a0, int64_t b0, const SplitPlan& plan, bool& ran, std::string& e);
-    bool read_part(int64_t a0, int64_t b0, std::string& e);
+    int64_t read_alone_limit() const;
+    bool read_part(int64_t a0, int64_t b0, std::string& e, int64_t* solo_at = nullptr);
     DecSnap dec_snap();
     bool parse_begin() override;
+    Flow bind_context_profile() override;
+    int64_t limit_context(int64_t context) const override;
+    Flow bind_atomic_lora() override;
     float default_relax() const override;
     Flow prepare_image() override;
+    Flow check_prepared_capacity(int64_t cells) override;
+    bool settle_unadmitted_slot(int slot) override { return runtime_.settle_shared_slot(slot, false); }
     bool prompt_begin() override;
     Flow set_sampling() override;
     void limit_parts() override;
     Flow read_to(int64_t to) override;
+    bool defer_short_text() const override;
     Flow prompt_end() override;
     Flow decode() override;
     Flow complete_begin() override;
@@ -210,6 +254,7 @@ private:
     bool slot_leave() override;
     void report_request(const DoneCounts& dc) override;
     bool cvec_wanted() const override;
+    bool slot_prefix_compatible(int slot, int64_t tokens = 0) const override;
     void set_cvec() override;
     void select_view() override;
     bool slot_draft_in(int slot) override;

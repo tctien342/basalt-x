@@ -45,6 +45,12 @@ struct ExpertJobMulti {
     float* out[MAXT] = {};
     /// a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    const float* lora_a = nullptr;
+    const float* lora_b = nullptr;
+    float lora_scale = 0;
+    bool lora_per_row = false;
+    float lora_rows[MAXT] = {};
+    float adapter_scale(int row) const { return lora_per_row ? lora_rows[row] : lora_scale; }
 };
 
 /// How worker threads are allocated across physical/logical CPU cores.  `All` uses every core and is the default; the
@@ -197,6 +203,7 @@ private:
     ExpertJobMulti* mjobs_ = nullptr;
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][kNativeMaxFF];
+        float lora_gain[MAXT];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // native down activations
     };

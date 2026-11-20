@@ -30,6 +30,7 @@ struct Runs {
     uint8_t* dst[4];
     int len[4];
     int n;
+    const int32_t* host_pages;
 };
 
 // The INT8 pools' runs: codes, then the fp16 scales (host and device callers).
@@ -42,6 +43,7 @@ __host__ __device__ Runs runs_int8(const QsaAttnPools& slots, const KvHostPools&
     r.src[2] = (const uint8_t*) host.k_scale; r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
     r.src[3] = (const uint8_t*) host.v_scale; r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
     r.n = 4;
+    r.host_pages = host.fp16_host_pages;
     return r;
 }
 
@@ -60,6 +62,7 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         r.src[0] = (const uint8_t*) host.k_pool; r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;
         r.src[1] = (const uint8_t*) host.v_pool; r.dst[1] = (uint8_t*) slots.v_pool; r.len[1] = bytes;
         r.n = 2;
+        r.host_pages = host.fp16_host_pages;
     }
     return r;
 }
@@ -91,7 +94,7 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
 
 // One map's resolve by the whole block (RT threads): resolve_kernel's body, and each block's of resolve_seg_kernel.
 __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ ids, const int32_t* __restrict__ steps,
-                              int n_q, int cap, int page_size) {
+                              int n_q, int cap, int page_size, QsaSegTable shared = {}, const int32_t* solo_pages = nullptr) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
@@ -100,18 +103,23 @@ __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ 
     // 1. hits take this epoch and their reference bit; a missing block is claimed exactly once (-1 -> -2)
     int lookups = 0;
     for (int q = 0; q < n_q; ++q) {
+        const int32_t* pages = shared.shared_residency
+            ? shared.slots[shared.rows[q].slot].host.fp16_host_pages : solo_pages;
         const int width = steps[q * kStepCount + kStepWidth];
         const int32_t* qi = ids + (long long) q * cap;
         for (int i = threadIdx.x; i < width; i += RT) {
-            const int b = qi[i] / page_size;
-            if (i > 0 && qi[i - 1] / page_size == b) continue;   // ids are ascending: one lookup per block
+            const int logical = qi[i] / page_size;
+            if (i > 0 && qi[i - 1] / page_size == logical) continue;   // ids are ascending: one lookup per block
+            const int b = pages ? pages[logical] : logical;
             ++lookups;
             const int sl = m.page_table[b];
             if (sl >= 0) {
                 m.slot_stamp[sl] = epoch;
                 m.slot_ref[sl] = 1;
             } else if (sl == -1 && atomicCAS(&m.page_table[b], -1, -2) == -1) {
-                m.miss_block[atomicAdd(&s_nmiss, 1)] = b;
+                const int miss = atomicAdd(&s_nmiss, 1);
+                if (miss >= m.n_slots) asm volatile("trap;");
+                m.miss_block[miss] = b;
             }
         }
     }
@@ -145,6 +153,8 @@ __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ 
     }
     // 3. re-point the table; the copy kernel fills the slots
     const int placed = got < need ? got : need;
+    // Missing attention pages cannot be treated as zeros in the shared path.
+    if ((shared.shared_residency || solo_pages) && placed < need) asm volatile("trap;");
     for (int k = threadIdx.x; k < need; k += RT) {
         const int b = m.miss_block[k];
         if (k >= placed) { m.page_table[b] = -1; continue; }   // overflow: never happens with a legal n_slots
@@ -169,8 +179,9 @@ __device__ void resolve_block(const KvStreamMap& m, const int32_t* __restrict__ 
 }
 
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
-                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
-    resolve_block(m, ids, steps, n_q, cap, page_size);
+                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size,
+                                                     const int32_t* pages) {
+    resolve_block(m, ids, steps, n_q, cap, page_size, {}, pages);
 }
 
 // Blocks blk, blk + nblk, ... of a copy: each copies one missed block's runs from the host copy into its slot, 16 B
@@ -178,7 +189,8 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 __device__ void copy_misses(const KvStreamMap& m, const Runs& r, int blk, int nblk) {
     const int need = m.ctl[2];
     for (int k = blk; k < need; k += nblk) {
-        const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        const long long logical = m.miss_block[k], sl = m.miss_slot[k];
+        const long long b = r.host_pages ? r.host_pages[logical] : logical;
         for (int a = 0; a < r.n; ++a) {
             const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
             uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
@@ -188,6 +200,57 @@ __device__ void copy_misses(const KvStreamMap& m, const Runs& r, int blk, int nb
 }
 
 __global__ void copy_kernel(KvStreamMap m, Runs r) { copy_misses(m, r, blockIdx.x, gridDim.x); }
+
+// The indexer returns ascending cell IDs. Mark each page once per query, including a partially filled page.
+__global__ void mark_prefill_pages(uint32_t* pages, const int32_t* ids, const int32_t* steps, int cap, int past) {
+    const int q = blockIdx.x;
+    const int width = steps[q * kStepCount + kStepWidth];
+    ids += q * cap;
+    for (int i = threadIdx.x; i < width; i += blockDim.x) {
+        const int cell = ids[i];
+        if (cell < 0 || cell >= past) continue;
+        const unsigned page = (unsigned) cell >> 2;
+        if (i == 0 || ((unsigned) ids[i - 1] >> 2) != page)
+            atomicOr(pages + (page >> 5), 1u << (page & 31));
+    }
+}
+
+__global__ void stage_prefill_pages(QsaAttnPools stage, QsaAttnPools resident, KvHostPools host,
+                                    const uint32_t* pages, int n_pages) {
+    constexpr int vectors = 2 * 4 * 256 * sizeof(uint16_t) / sizeof(uint4);
+    auto* dst_k = reinterpret_cast<uint4*>(const_cast<uint16_t*>(stage.k_pool));
+    auto* dst_v = reinterpret_cast<uint4*>(const_cast<uint16_t*>(stage.v_pool));
+    for (int page = blockIdx.x; page < n_pages; page += gridDim.x) {
+        if ((pages[page >> 5] & (1u << (page & 31))) == 0) continue;
+        const int slot = resident.page_table[resident.physical_pages ? resident.physical_pages[page] : page];
+        const auto* src_k = reinterpret_cast<const uint4*>(slot >= 0 ? resident.k_pool : host.k_pool);
+        const auto* src_v = reinterpret_cast<const uint4*>(slot >= 0 ? resident.v_pool : host.v_pool);
+        const int host_page = host.fp16_host_pages ? host.fp16_host_pages[page] : page;
+        const int from = (slot >= 0 ? slot : host_page) * vectors, to = page * vectors;
+        for (int i = threadIdx.x; i < vectors; i += blockDim.x) {
+            dst_k[to + i] = src_k[from + i];
+            dst_v[to + i] = src_v[from + i];
+        }
+    }
+}
+
+__global__ void stage_prefill_int8_pages(Runs runs, QsaAttnPools resident, const uint32_t* pages,
+                                         int n_pages) {
+    const void* gpu[] = {resident.k_q, resident.v_q, resident.k_scale, resident.v_scale};
+    for (int page = blockIdx.x; page < n_pages; page += gridDim.x) {
+        if ((pages[page >> 5] & (1u << (page & 31))) == 0) continue;
+        const int slot = resident.page_table[resident.physical_pages ? resident.physical_pages[page] : page];
+        const int host_page = runs.host_pages ? runs.host_pages[page] : page;
+        for (int a = 0; a < runs.n; ++a) {
+            const auto* source = slot >= 0 ? static_cast<const uint8_t*>(gpu[a]) : runs.src[a];
+            const size_t offset = size_t(slot >= 0 ? slot : host_page) * runs.len[a];
+            const auto* from = reinterpret_cast<const uint4*>(source + offset);
+            auto* dst = reinterpret_cast<uint4*>(runs.dst[a] + size_t(page) * runs.len[a]);
+            for (int j = threadIdx.x; j < runs.len[a] / int(sizeof(uint4)); j += blockDim.x)
+                dst[j] = from[j];
+        }
+    }
+}
 
 // Block j: segment j's rows resolve into its slot's map.  A segment without a slot or rows, or a resident slot (null
 // map), does nothing.  The segments name distinct slots, so no two blocks touch one map.
@@ -202,12 +265,31 @@ __global__ void __launch_bounds__(RT) resolve_seg_kernel(QsaSegTable t, const in
 }
 
 // Grid (copy blocks, segments): segment blockIdx.y's misses into its slot's pool.
+__global__ void __launch_bounds__(RT) resolve_shared_seg_kernel(
+        QsaSegTable t, const int32_t* ids, const int32_t* steps, int cap, int page_size) {
+    resolve_block(t.slots[0].map, ids, steps, t.n_rows, cap, page_size, t);
+}
+
 __global__ void copy_seg_kernel(QsaSegTable t, QsaShapes s) {
     const QsaSeg sg = t.segs[blockIdx.y];
-    if (sg.slot < 0 || sg.len <= 0) return;
-    const QsaSegSlot& sl = t.slots[sg.slot];
+    if (!t.shared_residency && (sg.slot < 0 || sg.len <= 0)) return;
+    const QsaSegSlot& sl = t.slots[t.shared_residency ? 0 : sg.slot];
     if (sl.map.ctl == nullptr) return;
-    copy_misses(sl.map, runs_int8(sl.pools(), sl.host, s), blockIdx.x, gridDim.x);
+    Runs r{};
+    if (sl.k_pool) {
+        const int bytes = (int)(s.n_head_kv * s.page_size * s.head_dim * 2);
+        r.src[0] = reinterpret_cast<const uint8_t*>(sl.host.k_pool);
+        r.src[1] = reinterpret_cast<const uint8_t*>(sl.host.v_pool);
+        r.dst[0] = reinterpret_cast<uint8_t*>(sl.k_pool);
+        r.dst[1] = reinterpret_cast<uint8_t*>(sl.v_pool);
+        r.len[0] = r.len[1] = bytes;
+        r.n = 2;
+        r.host_pages = sl.host.fp16_host_pages;
+    } else {
+        r = runs_int8(sl.pools(), sl.host, s);
+    }
+    if (t.shared_residency) r.host_pages = nullptr;  // misses are already physical
+    copy_misses(sl.map, r, blockIdx.x, gridDim.x);
 }
 
 __global__ void reset_kernel(KvStreamMap m) {
@@ -236,6 +318,26 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }
 
+__global__ void invalidate_pages_kernel(KvStreamMap m, const int32_t* pages, int64_t count) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (int64_t) gridDim.x * blockDim.x) {
+        const int page = pages[i];
+        if (page < 0 || page >= m.n_blocks) asm volatile("trap;");
+        const int slot = m.page_table[page];
+        if (slot < 0) continue;
+        m.page_table[page] = -1;
+        m.slot_block[slot] = -1;
+        m.slot_stamp[slot] = -1;
+        m.slot_ref[slot] = 0;
+    }
+}
+
+void kv_stream_invalidate(const KvStreamMap& m, const int32_t* physical_pages, int64_t count, void* stream) {
+    if (count <= 0) return;
+    invalidate_pages_kernel<<<64, 256, 0, (cudaStream_t) stream>>>(m, physical_pages, count);
+    check("invalidate pages");
+}
+
 void kv_stream_reset(const KvStreamMap& m, void* stream) {
     reset_kernel<<<128, 256, 0, (cudaStream_t) stream>>>(m);
     check("reset");
@@ -257,9 +359,12 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                              "slot twice", (long long) m.n_slots, RT);
         std::exit(1);
     }
-    resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
+    const auto* pages = slots.physical_pages;
+    resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size, pages);
     check("resolve");
-    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
+    Runs runs = runs_of(slots, host, fmt, s);
+    if (pages) runs.host_pages = nullptr;  // misses already hold physical IDs
+    copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs);
     check("copy");
 }
 
@@ -272,9 +377,12 @@ void kv_stream_resolve_seg(const QsaSegTable& t, const int32_t* ids, const int32
         std::exit(1);
     }
     // the slots' pool sizes live in the device table: the caller holds every streamed slot to kKvStreamMinSlots
-    resolve_seg_kernel<<<t.n_seg, RT, 0, (cudaStream_t) stream>>>(t, ids, steps, (int) cap, (int) s.page_size);
+    if (t.shared_residency)
+        resolve_shared_seg_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(t, ids, steps, (int) cap, (int) s.page_size);
+    else
+        resolve_seg_kernel<<<t.n_seg, RT, 0, (cudaStream_t) stream>>>(t, ids, steps, (int) cap, (int) s.page_size);
     check("resolve seg");
-    copy_seg_kernel<<<dim3(96, (unsigned) t.n_seg), 128, 0, (cudaStream_t) stream>>>(t, s);
+    copy_seg_kernel<<<dim3(96, t.shared_residency ? 1u : (unsigned) t.n_seg), 128, 0, (cudaStream_t) stream>>>(t, s);
     check("copy seg");
 }
 
@@ -283,9 +391,29 @@ void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void*
     check("ring table");
 }
 
+// Mapped host backing is fragmented. Keep the existing bulk copies for contiguous host backing.
+__global__ void copy_mapped_host(Runs r, int64_t b0, int64_t b1, int64_t n_slots, bool save) {
+    for (int64_t logical = b0 + blockIdx.x; logical < b1; logical += gridDim.x) {
+        const int64_t physical = r.host_pages[logical], slot = logical % n_slots;
+        for (int a = 0; a < r.n; ++a) {
+            auto* host = reinterpret_cast<uint4*>(const_cast<uint8_t*>(r.src[a]) + physical * r.len[a]);
+            auto* device = reinterpret_cast<uint4*>(r.dst[a] + slot * r.len[a]);
+            for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) {
+                if (save) host[i] = device[i];
+                else device[i] = host[i];
+            }
+        }
+    }
+}
+
 void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                      int64_t n_slots, const QsaShapes& s, void* stream) {
     const Runs r = runs_of(slots, host, fmt, s);
+    if (r.host_pages) {
+        if (b1 > b0) copy_mapped_host<<<64, 128, 0, (cudaStream_t) stream>>>(r, b0, b1, n_slots, false);
+        check("mapped ring restore");
+        return;
+    }
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
         for (int a = 0; a < r.n; ++a)
@@ -299,6 +427,11 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
 void kv_ring_save(const QsaAttnPools& slots, const KvHostPools& host, int fmt, int64_t b0, int64_t b1, int64_t n_slots,
                   const QsaShapes& s, void* stream) {
     const Runs r = runs_of(slots, host, fmt, s);   // src: the host copy, dst: the ring
+    if (r.host_pages) {
+        if (b1 > b0) copy_mapped_host<<<64, 128, 0, (cudaStream_t) stream>>>(r, b0, b1, n_slots, true);
+        check("mapped ring save");
+        return;
+    }
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
         for (int a = 0; a < r.n; ++a)
@@ -313,10 +446,39 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
                         const QsaShapes& s, void* stream) {
     if (n_blocks <= 0) return;
     const Runs r = runs_of(stage, host, fmt, s);
+    if (r.host_pages) {
+        copy_mapped_host<<<64, 128, 0, (cudaStream_t) stream>>>(r, 0, n_blocks, n_blocks, false);
+        check("mapped stage");
+        return;
+    }
     for (int a = 0; a < r.n; ++a)
         if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
                             (cudaStream_t) stream) != cudaSuccess)
             check("stage");
+}
+
+bool kv_stage_selected(const QsaAttnPools& stage, const QsaAttnPools& resident, const KvHostPools& host,
+                       int fmt, const QsaShapes& shapes, uint32_t* selected_pages,
+                       const int32_t* ids, const int32_t* steps, int n_q, int cap, int past, void* stream) {
+    if ((fmt != kKvF16 && fmt != kKvInt8) || shapes.n_head_kv != 2 ||
+        shapes.page_size != 4 || shapes.head_dim != 256 || n_q <= 0 || cap <= 0 || past <= 0 ||
+        !resident.page_table) return false;
+    const Runs runs = runs_of(stage, host, fmt, shapes);
+    for (int a = 0; a < runs.n; ++a)
+        if (!runs.src[a] || !runs.dst[a]) return false;
+    if (fmt == kKvInt8 ? !resident.k_q || !resident.v_q || !resident.k_scale || !resident.v_scale
+                      : !resident.k_pool || !resident.v_pool) return false;
+    const int n_pages = (past + 3) / 4;
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (cudaMemsetAsync(selected_pages, 0, (size_t) ((n_pages + 31) / 32) * sizeof(uint32_t), s) != cudaSuccess)
+        return false;
+    mark_prefill_pages<<<n_q, 128, 0, s>>>(selected_pages, ids, steps, cap, past);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (fmt == kKvInt8)
+        stage_prefill_int8_pages<<<512, 128, 0, s>>>(runs, resident, selected_pages, n_pages);
+    else
+        stage_prefill_pages<<<512, 128, 0, s>>>(stage, resident, host, selected_pages, n_pages);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {

@@ -24,9 +24,10 @@ public:
     /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
     /// `slab_at`: the device block (`slab_cap` bytes, `slab_bytes` long at least) the matrices go in instead of one this
     /// object allocates and owns.
+    /// `host_image`: an optional `slab_cap`-byte RAM destination. Matrix references still address `slab_at`.
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
               bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1, void* slab_at = nullptr,
-              uint64_t slab_cap = 0);
+              uint64_t slab_cap = 0, void* host_image = nullptr);
     /// The bytes of the block the matrices of `plan_bytes`' total take (their alignment included).
     static uint64_t slab_bytes(uint64_t plan_total);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,

@@ -77,6 +77,11 @@ Flow Request::read_prompt() {
     prompt_parts_begin();
     for (const int64_t to : {root_at, media_at, turn_at, n - 1}) {
         if (to <= at) continue;
+        if (to == n - 1 && !part_checkpoint(to) && defer_short_text()) {
+            deferred_prompt.assign(ids32.begin() + at, ids32.end());
+            fold_p0 = at;
+            break;
+        }
         const Flow flow = read_to(to);
         if (flow == Flow::quit) break;   // stopped while reading: the rest of the request runs, and ends as cancelled
         if (flow != Flow::proceed) return flow;

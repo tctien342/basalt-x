@@ -75,10 +75,29 @@ __device__ __forceinline__ void rope_row(float* row, int pos, int d, const RopeA
     __syncthreads();
 }
 
+// The same low-to-high butterflies as fwht256_cuda, with one channel per thread.
+__device__ __forceinline__ float hadamard_row(float value, int d, float* row, int width = HD) {
+    value *= width == 64 ? 0.125f : width == 128 ? 0x1.6a09e6p-4f : 0.0625f;
+#pragma unroll
+    for (int bit = 1; bit < 32; bit <<= 1) {
+        const float peer = __shfl_xor_sync(0xffffffffu, value, bit);
+        value = (d & bit) ? peer - value : value + peer;
+    }
+#pragma unroll
+    for (int bit = 32; bit < width; bit <<= 1) {
+        row[d] = value;
+        __syncthreads();
+        const float peer = row[d ^ bit];
+        __syncthreads();
+        value = (d & bit) ? peer - value : value + peer;
+    }
+    return value;
+}
+
 // kv_q8.cu's kv_append_q8_kernel for one row of one KV head: thread d holds value d; groups of 64 are warp pairs
 __device__ __forceinline__ void append_q8_row(float x, int d, long long pos, int h, int n_kv_heads, int page_size,
-                                              const int32_t* table, int8_t* codes, uint16_t* scales, int8_t* host_codes,
-                                              uint16_t* host_scales, float* wmax) {
+                                              long long resident_page, long long host_page, int8_t* codes,
+                                              uint16_t* scales, int8_t* host_codes, uint16_t* host_scales, float* wmax) {
     const int groups = HD / KV_Q8_GROUP, g = d / KV_Q8_GROUP, t = d % KV_Q8_GROUP;
     float a = abs_ieee(x);
     for (int o = 16; o > 0; o >>= 1) a = max_ieee(a, __shfl_xor_sync(0xffffffffu, a, o));
@@ -92,14 +111,13 @@ __device__ __forceinline__ void append_q8_row(float x, int d, long long pos, int
         q = __float2int_rn(div_ieee(x, sf));
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
     }
-    const long long page = (long long) table[pos / page_size];
-    if (page >= 0) {
-        const long long row = (page * n_kv_heads + h) * page_size + (pos % page_size);
+    if (resident_page >= 0) {
+        const long long row = (resident_page * n_kv_heads + h) * page_size + (pos % page_size);
         codes[row * HD + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) scales[row * groups + g] = sbits;
     }
     if (host_codes != nullptr) {
-        const long long row = ((pos / page_size) * n_kv_heads + h) * page_size + (pos % page_size);
+        const long long row = (host_page * n_kv_heads + h) * page_size + (pos % page_size);
         host_codes[row * HD + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) host_scales[row * groups + g] = sbits;
     }
@@ -164,7 +182,7 @@ __device__ __forceinline__ void indexer_append_row(const float* raw, int pos, co
 // indexer tail snapshot and the n indexer appends in row order
 template <bool TAB>
 __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_kv, int page_size, const RopeArgs& ra,
-                                            int b) {
+                                            int b, bool shared_residency = false) {
     __shared__ float row[HD];
     __shared__ float sums[32];
     const int d = threadIdx.x;
@@ -172,16 +190,39 @@ __device__ __forceinline__ void kv_post_dev(const QsaDecKvPost& a, int n, int n_
         const int t = b / n_kv, h = b % n_kv;
         const long long pos = (long long) __ldg(a.steps + (size_t) t * kStepCount + kStepPos);
         float* kp = a.kcur + ((size_t) t * n_kv + h) * HD;
-        const float x = kp[d];
-        const float scale = norm_scale256(x, d, HD, a.eps, sums);
-        row[d] = scale * x * a.k_norm[d];
-        __syncthreads();
-        rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
-        const float y = row[d];
-        kp[d] = y;
-        append_q8_row(y, d, pos, h, n_kv, page_size, a.page_table, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
-        const float v = a.vcur[((size_t) t * n_kv + h) * HD + d];
-        append_q8_row(v, d, pos, h, n_kv, page_size, a.page_table, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
+        float y = kp[d];
+        if (!a.k_prepared) {
+            const float scale = norm_scale256(y, d, HD, a.eps, sums);
+            row[d] = scale * y * a.k_norm[d];
+            __syncthreads();
+            rope_row<TAB>(row, a.pos_k[t * (a.pos_stride > 0 ? a.pos_stride : n_kv) + h], d, ra);
+            y = row[d];
+            if (a.hadamard) __syncthreads();
+            else kp[d] = y;
+        }
+        float v = a.vcur[((size_t) t * n_kv + h) * HD + d];
+        if (a.hadamard) {
+            y = hadamard_row(y, d, row);
+            v = hadamard_row(v, d, row, a.value_hadamard_width);
+        }
+        if (a.k_pool) {
+            const long long logical = pos / page_size;
+            const long long physical = a.host.fp16_host_pages ? a.host.fp16_host_pages[logical] : logical;
+            const long long slot = a.page_table[shared_residency ? physical : logical];
+            const auto write = [&](uint16_t* k, uint16_t* value, long long page) {
+                const long long at = ((page * n_kv + h) * page_size + pos % page_size) * HD + d;
+                k[at] = f16_from_f32(y);
+                value[at] = f16_from_f32(v);
+            };
+            if (slot >= 0) write(a.k_pool, a.v_pool, slot);
+            if (a.host.k_pool) write(a.host.k_pool, a.host.v_pool, physical);
+            return;
+        }
+        const long long logical = pos / page_size;
+        const long long physical = a.host.fp16_host_pages ? a.host.fp16_host_pages[logical] : logical;
+        const long long resident = a.page_table[shared_residency || a.host.fp16_shared_residency ? physical : logical];
+        append_q8_row(y, d, pos, h, n_kv, page_size, resident, physical, a.k_q, a.k_scale, a.host.k_q, a.host.k_scale, sums);
+        append_q8_row(v, d, pos, h, n_kv, page_size, resident, physical, a.v_q, a.v_scale, a.host.v_q, a.host.v_scale, sums);
         return;
     }
     if (a.tail_snap != nullptr)
@@ -209,7 +250,9 @@ __device__ __forceinline__ void q_post_dev(const QsaDecQPost& a, int n, int n_he
         row[d] = scale * x * a.q_norm[d];
         __syncthreads();
         rope_row<TAB>(row, a.pos_q[b], d, ra);
-        a.qcur[(size_t) b * HD + d] = row[d];
+        const float q = row[d];
+        if (a.hadamard) __syncthreads();   // all query channels must be read before reusing the row
+        a.qcur[(size_t) b * HD + d] = a.hadamard ? hadamard_row(q, d, row) : q;
         return;
     }
     b -= n * n_head;
@@ -228,6 +271,7 @@ __global__ void __launch_bounds__(THREADS) kv_post_kernel(QsaDecKvPost a, int n,
 }
 // the per-sequence fields of a post call, from a slot
 __device__ __forceinline__ void take_slot(QsaDecKvPost& a, const QsaSegSlot& sl) {
+    a.k_pool = sl.k_pool; a.v_pool = sl.v_pool;
     a.k_q = sl.k_q; a.v_q = sl.v_q; a.k_scale = sl.k_scale; a.v_scale = sl.v_scale; a.page_table = sl.page_table;
     a.host = sl.host; a.tail = sl.tail; a.dead = sl.dead; a.pooled = sl.pooled; a.block_pos = sl.block_pos;
     a.max_cells = sl.max_cells;
@@ -242,7 +286,7 @@ __global__ void __launch_bounds__(THREADS) kv_post_seg_kernel(QsaDecKvPost a, Qs
     if (b < n * n_kv) {
         take_slot(a, t.slots[t.rows[b / n_kv].slot]);
         a.tail_snap = nullptr;
-        kv_post_dev<TAB>(a, n, n_kv, page_size, ra, b);
+        kv_post_dev<TAB>(a, n, n_kv, page_size, ra, b, t.shared_residency);
         return;
     }
     const QsaSeg sg = t.segs[b - n * n_kv];

@@ -52,15 +52,17 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
         q = __float2int_rn(x / sf);
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
     }
-    // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident
-    const long long page = (long long) table[pos / page_size];
+    const long long logical = pos / page_size;
+    const long long physical = host.fp16_host_pages ? host.fp16_host_pages[logical] : logical;
+    // Shared residency indexes by physical page. Private residency follows the sequence's logical index.
+    const long long page = table[host.fp16_shared_residency ? physical : logical];
     if (page >= 0) {
         const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
         (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
     }
     if (host.k_q != nullptr) {
-        const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+        const long long row = (physical * kv_heads + h) * page_size + (pos % page_size);
         (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
         if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
     }
@@ -71,7 +73,8 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
                                     const uint16_t* __restrict__ k_scale, const uint16_t* __restrict__ v_scale,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
                                     const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
-                                    uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
+                                    uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch,
+                                    const int32_t* physical_pages) {
     const long long n_ids = (long long) __ldg(step + kStepWidth);
     const int per = head_dim / 4;
     const long long total = n_ids * kv_heads * per;
@@ -81,7 +84,8 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
     const int rem = (int) (i % (kv_heads * (long long) per));
     const int h = rem / per, q4 = rem - h * per;
     const int cell = ids[id];
-    const long long page = (long long) table[cell / page_size];
+    const int logical = cell / page_size;
+    const long long page = table[physical_pages ? physical_pages[logical] : logical];
     const long long row = (page * kv_heads + h) * page_size + (cell % page_size);
     const int d = q4 * 4;
     const int groups = head_dim / KV_Q8_GROUP;
@@ -114,14 +118,15 @@ void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_
 
 void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,
                        const int32_t* page_table, const int32_t* ids, const int32_t* step, int64_t max_ids,
-                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+                       const QsaShapes& s, uint16_t* k_scratch, uint16_t* v_scratch, void* stream,
+                       const int32_t* physical_pages) {
     validate(s, "kv_gather_q8");
     if (max_ids <= 0) return;
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     const unsigned blocks = (unsigned) ((total + 255) / 256);
     kv_gather_q8_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(
         k_q, v_q, k_scale, v_scale, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
-        k_scratch, v_scratch);
+        k_scratch, v_scratch, physical_pages);
     check("kv_gather_q8 launch");
 }
 

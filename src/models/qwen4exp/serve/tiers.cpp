@@ -81,6 +81,7 @@ void QfnRuntime::res_upload() {
 // the peer tiers take the next most-routed CPU misses: each passes over what the primary (r0) or another tier
 // holds or takes in this round; with one tier r0 is its whole view
 bool QfnRuntime::adapt_peers(const std::vector<int32_t>& r0, std::string& perr) {
+    if (vision_decode_lease.load()) return true;
     const int swaps_each = o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps;
     if (xpeers.empty()) return peer.adapt(drive.d.usage.data(), r0.data(), swaps_each, perr);
     const size_t nt = 1 + xpeers.size();
@@ -248,6 +249,7 @@ void QfnRuntime::rank_once(std::vector<Swap>& swaps, size_t room) {
 }
 
 bool QfnRuntime::adapt() {
+    if (vision_decode_lease.load()) return true;
     if (!pending.empty()) return true;   // the previous swaps are still in flight
     std::vector<Swap> swaps;
     rank_swaps(swaps, false);
@@ -331,6 +333,7 @@ void QfnRuntime::xq_settle() {
 
 // `ranked`: the round's ranking already made (rank_swaps reads nothing xq_settle changes)
 bool QfnRuntime::xq_round(std::vector<Swap>* ranked) {
+    if (vision_decode_lease.load()) { if (ranked) ranked->clear(); return true; }
     xq_settle();
     std::vector<Swap> swaps;
     if (ranked != nullptr) swaps.swap(*ranked);

@@ -114,6 +114,7 @@ bool Prefill::Run::Chunk::ple_layer(int64_t l) {
             }
             m.gemm.bf16(e16, pw.value_bf16, val, nb, N, N);
             try {
+                basalt::kernels::ple_value_lora(pw, emb, val, (int) nb, (int) N, m.cs);
                 basalt::kernels::native_ple_postops_batch(key, m.R + s0 * D, val, ss.ple.hist, pw, qn, gated,
                                                           gate, (int) nb, m.cs);
             } catch (const std::exception& e) { err = std::string("prefill PLE: ") + e.what(); return false; }

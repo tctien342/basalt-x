@@ -1,5 +1,6 @@
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "context.hpp"
+#include "basalt/models/qwen4exp/decode/dflash2.hpp"
 
 namespace basalt::models::qwen4exp::generate {
 
@@ -252,15 +253,20 @@ int sessions(Context& context) {
     std::vector<std::vector<SlotSession>> bslot_ss;
     std::vector<int64_t> slot_cap;   // each batch slot's context (cells)
     uint64_t slot_kv_cuda0 = 0;      // the batch slots' sessions on CUDA0 beyond the solo one: VRAM the expert cache does not get
+    const bool shared_kv = basalt::core::exp_flag("shared_kv_pool") != 0;
+    std::vector<std::unique_ptr<basalt::core::SharedKvTable>> shared_tables;
+    if (shared_kv && (!o.serve || o.batch < 1 || !stages.empty() || (o.kv != "fp16" && o.kv != "int8") ||
+                      g.n_qsa_layers() <= 0 || ss.qsa_states[ss.qsa_primary()].kv_mode != 1))
+        return fatal_start_error("shared_kv_pool requires serving, at least one slot, streamed FP16 or INT8, and a single decode stage");
     bool slot0_is_solo = false;      // slot 0 is the solo session (no separate solo state)
     if (o.batch != 0) {
         const int cap = basalt::kernels::kVerifyMaxT;
-        const char* off = !o.serve ? "it needs --serve" : o.batch < 2 ? "it needs 2 or more slots"
+        const char* off = !o.serve ? "it needs --serve" : !shared_kv && o.batch < 2 ? "it needs 2 or more slots"
                         : split_same ? "it needs each stage of a layer split on its own GPU" : nullptr;
         if (off != nullptr) {
             basalt::log::warn("basalt generate", "--batch %d is off: %s", o.batch, off);
             o.batch = 0;
-        } else if (o.batch > cap) {
+        } else if (!shared_kv && o.batch > cap) {
             basalt::log::warn("basalt generate", "--batch %d: a batch window holds at most %d rows, so %d "
                                  "slots", o.batch, cap, cap);
             o.batch = cap;
@@ -275,6 +281,14 @@ int sessions(Context& context) {
         bslot_ss.resize(1 + stages.size());
         slot_cap.assign((size_t) o.batch, o.max_context);
         slot0_is_solo = stages.empty();   // one GPU: the solo session's state is slot 0's
+        if (shared_kv) {
+            for (int b = 0; b < o.batch; ++b) {
+                auto table = std::make_unique<basalt::core::SharedKvTable>();
+                if (table->allocate((uint32_t) ss.qsa_states[ss.qsa_primary()].n_pages) != cudaSuccess)
+                    return fatal_start_error("shared_kv_pool: page table allocation failed");
+                shared_tables.push_back(std::move(table));
+            }
+        }
         int fit = o.batch;   // the slots every stage could carve
         for (size_t k = 0; k < bslot_ss.size(); ++k) {
             const int dev = k == 0 ? 0 : stages[k - 1]->dev;
@@ -283,7 +297,7 @@ int sessions(Context& context) {
             const basalt::core::OnDevice on_k(dev);
             uint64_t total = 0;
             for (int b = 0; b < fit; ++b) {
-                const uint64_t bytes = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, lo, hi);
+                const uint64_t bytes = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, lo, hi, shared_kv && b != 0);
                 if (k == 0 && b == 0 && slot0_is_solo) {
                     bslot_ss[0].push_back(SlotSession(&ss, SlotDelete{false}));
                     basalt::log::info("basalt generate", "--batch: slot 0 on CUDA%d is the solo session (%.2f GiB)", dev,
@@ -292,7 +306,13 @@ int sessions(Context& context) {
                 }
                 SlotSession u(new basalt::core::SessionState());
                 void* buf = nullptr;
-                if (cudaMalloc(&buf, bytes) != cudaSuccess || basalt::core::session_init(g, slot_cap[(size_t) b], K, buf, *u, lo, hi) == 0) {
+                std::vector<basalt::core::QsaHostBinding> bindings;
+                if (shared_kv)
+                    for (int64_t q = 0; q < ss.qsa_alloc; ++q)
+                        bindings.push_back({ss.qsa_states[ss.qsa_ord0 + q],
+                                            shared_tables[(size_t) b]->device_pages(), nullptr, 0, true});
+                if (cudaMalloc(&buf, bytes) != cudaSuccess ||
+                    basalt::core::session_init(g, slot_cap[(size_t) b], K, buf, *u, lo, hi, bindings) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
                     size_t fb = 0, tb = 0;
@@ -316,7 +336,18 @@ int sessions(Context& context) {
                          (int) bslot_ss[k].size(), dev, (double) total / 1073741824.0, (double) fb / 1073741824.0);
         }
         for (auto& v : bslot_ss) if ((int) v.size() > fit) v.resize((size_t) fit);   // the same count on every stage
-        if (fit < 2) {
+        if (shared_kv) {
+            if (fit != o.batch) return fatal_start_error("shared_kv_pool: requested startup sessions did not fit");
+            // Slot zero owns the backing. Attach its logical table only after all borrowers captured its pointers.
+            for (int64_t q = 0; q < ss.qsa_alloc; ++q) {
+                auto& state = ss.qsa_states[ss.qsa_ord0 + q];
+                state.shared_residency = true;
+                state.host.fp16_shared_residency = true;
+                state.host.fp16_host_pages = shared_tables[0]->device_pages();
+                state.host_pool_pages = state.n_pages;
+            }
+        }
+        if (fit < 2 && !shared_kv) {
             basalt::log::warn("basalt generate", "--batch is off: not two slot sessions fit (a smaller "
                                  "--max-context, or KV streaming, --kv-resident, makes them smaller)");
             bslot_ss.clear();
@@ -329,7 +360,7 @@ int sessions(Context& context) {
                 for (int b = 0; b < o.batch; ++b)
                 {
                     const uint64_t sb = basalt::core::session_bytes(g, slot_cap[(size_t) b], K, k == 0 ? 0 : stages[k - 1]->lb,
-                                                                    k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le);
+                                                                    k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le, shared_kv && b != 0);
                     const basalt::core::SessionState& u = *bslot_ss[k][(size_t) b];
                     basalt::core::LoadProgress::kv(
                         basalt::core::LoadProgress::cuda(k == 0 ? 0 : stages[k - 1]->dev),
@@ -342,7 +373,7 @@ int sessions(Context& context) {
             // were first carved when a later stage ran out)
             uint64_t kept = 0;
             for (int b = slot0_is_solo ? 1 : 0; b < o.batch; ++b)
-                kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1);
+                kept += basalt::core::session_bytes(g, slot_cap[(size_t) b], K, 0, multi_gpu ? split_at[0] : -1, shared_kv);
             slot_kv_cuda0 = kept;
             const uint64_t per_slot = basalt::core::session_bytes(g, slot_cap[0], K, 0, multi_gpu ? split_at[0] : -1);
             basalt::log::info("basalt generate", "--batch %d: %.2f GiB of KV cache and state per slot (%lld tokens), "
@@ -359,13 +390,41 @@ int sessions(Context& context) {
         basalt::core::LoadProgress::kv(basalt::core::LoadProgress::cuda(0),
                                        solo_kv_bytes + basalt::core::session_kv_mapped_bytes(ss), o.max_context, "",
                                        solo_kv_bytes + basalt::core::session_kv_bytes_for(ss, ss.max_cells));
+    std::optional<SharedArenaStartup> shared_arena_startup;
+#if defined(__linux__)
+    if (o.serve && !multi_gpu && !o.mmap_experts && !o.shared_expert_arena.empty() &&
+        basalt::core::exp_flag("startup_shared_arena_read_prefault") != 0.0 &&
+        basalt::core::exp_flag("startup_early_shared_arena") != 0.0) {
+        basalt::log::info("basalt startup", "shared arena CPU prep queued after text KV allocation");
+        auto& staged = shared_arena_startup.emplace();
+        staged.worker = std::async(std::launch::async,
+            [files = context.expert_files, layers = g.n_layers, experts = g.n_expert,
+             file = o.shared_expert_arena, permit = staged.permit.get_future()]() mutable {
+                auto source = std::make_unique<basalt::core::ArenaExpertSource>();
+                std::string stage_error;
+                const auto before_register = [&] {
+                    try {
+                        permit.get();
+                    } catch (const std::future_error&) {
+                        return false;
+                    }
+                    return cudaSetDevice(0) == cudaSuccess;
+                };
+                if (!source->open(*files, layers, experts, /*threads=*/6, stage_error, file, before_register))
+                    source.reset();
+                return source;
+            });
+        context.shared_arena_startup = &staged;
+    }
+#endif
+
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts: the driver can
     // refuse the draft weights after mapping tens of GiB of host pages.
     basalt::core::MtpDrafter mtp;
     if (!o.mtp.empty()) {
         if (o.spec < 2) o.mtp.clear();
         if (!o.mtp.empty()) mtp.set_prompt_len((int64_t) o.tokens.size());
-        if (o.batch > 0) mtp.set_stores(o.batch, slot_cap);   // a draft K/V per batch slot
+        if (o.batch > 0) mtp.set_stores(o.batch, slot_cap, shared_kv);   // a draft K/V per batch slot
         // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned,
         // so it always sees the canonical geometry; `static` because MtpDrafter keeps a reference
         static const basalt::core::ModelGeometry draft_geometry{};
@@ -420,6 +479,11 @@ int sessions(Context& context) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
+    basalt::core::Dflash2 dflash2;
+    if (!o.dflash2.empty() && (g.n_embd != 2560 || g.n_layers != 48 || g.hc != 4 || n_vocab != 248320 ||
+        !dflash2.load(o.dflash2, native_head, basalt::core::native_embed(), 0, err))) {
+        return fatal_start_error(err.empty() ? "DFlash2 requires Flash-Next geometry" : err);
+    }
     std::vector<float> logits((size_t) n_vocab);
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
@@ -438,6 +502,7 @@ int sessions(Context& context) {
     context.slot_cap = &slot_cap;
     context.slot_kv_cuda0 = &slot_kv_cuda0;
     context.slot0_is_solo = &slot0_is_solo;
+    context.shared_tables = &shared_tables;
     context.mtp = &mtp;
     context.mtp_on = &mtp_on;
     context.mtp_kv = &mtp_kv;

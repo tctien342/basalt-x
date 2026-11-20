@@ -1,11 +1,18 @@
 // src/models/qwen4exp/serve/qfn_decode.cpp - Flash-Next's side of the window loop: verify windows, drafts, adaptive rounds.
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "qfn_request.hpp"
+#include "basalt/models/qwen4exp/decode/dflash2.hpp"
 #include "../../../program/serve/decode_loop.hpp"
 
 namespace basalt::models::qwen4exp::serve {
 
 namespace {
+// Tune proposal length without changing target verification or sampling.
+float proposal_threshold(const basalt::core::DraftCumAdapt& adaptive) {
+    static const float scale = basalt::core::exp_flag("mtp_longer_proposals") != 0 ? 0.85f : 1.0f;
+    return adaptive.th() * scale;
+}
+
 // --draft-log FILE: one line per window (T, accepted, draft probabilities, ms) for draft-policy study
 FILE* draft_log_file() {
     static FILE* const f = basalt::core::diagnostics().draft_log.empty() ? nullptr
@@ -31,6 +38,7 @@ QfnRequest::DecSnap QfnRequest::dec_snap() {
 Flow QfnRequest::decode_begin() {
     if (runtime_.mtp_on && !runtime_.mtp.use_main(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }   // the windows between prompt chunks swapped it
     if (!runtime_.peer_due_apply(runtime_.err)) { std::printf("ERR %s\n", runtime_.err.c_str()); return Flow::error; }
+    runtime_.observe_scheduler(QfnRuntime::SchedulerPhase::solo_decode);
     return Flow::proceed;
 }
 
@@ -43,6 +51,16 @@ void QfnRequest::seed_tiers() {
         if (seeded && runtime_.split_hist.size() == hist.size())
             for (size_t i = 0; i < hist.size(); ++i) hist[i] += runtime_.split_hist[i];
         runtime_.split_hist.clear();
+        if (seeded && basalt::core::exp_flag("prefill_route_log") != 0 &&
+            !basalt::core::diagnostics().draft_log.empty()) {
+            static FILE* const f = std::fopen((basalt::core::diagnostics().draft_log + ".prefill").c_str(), "ab");
+            if (f != nullptr) {
+                const uint64_t header[] = {(uint64_t) hist_tokens, (uint64_t) hist.size()};
+                std::fwrite(header, sizeof(header), 1, f);
+                std::fwrite(hist.data(), sizeof(hist[0]), hist.size(), f);
+                std::fflush(f);
+            }
+        }
         if (seeded) seed_usage_from_prompt(runtime_.drive.d.usage, hist, hist_tokens, runtime_.host_res, runtime_.g.n_expert, runtime_.peer);
     }
 }
@@ -52,7 +70,10 @@ void QfnRequest::decode_state_begin() {
     dprob = std::vector<float>((size_t) std::max(runtime_.S, basalt::core::kMtpChainMax), 0.0f);
     sbuf = std::vector<int32_t>((size_t) runtime_.S, 0);
     if (runtime_.o.suffix_draft > 0) {
-        runtime_.sfx->reset();
+        const int64_t context = runtime_.o.max_context;
+        const int64_t output = std::min<int64_t>(max_new, context);
+        const size_t capacity = (size_t) std::min(context + 4096, n + output + 1);
+        runtime_.sfx.emplace(std::max(1, runtime_.o.suffix_draft), 64, capacity);
         for (int64_t t : ids) runtime_.sfx->append((int32_t) t);
     }
     sfx_windows = 0;
@@ -61,6 +82,10 @@ void QfnRequest::decode_state_begin() {
     // pipelined windows: `cv` runs the next window, `ov` is the other chain; a guess that held leaves the next
     // window's verdict in `held`
     cv = &runtime_.ver;
+    max_thinking = req_think_close >= 0;
+    thinking_mtp = max_thinking && runtime_.thinking_ver->max_t() > 2 &&
+                   !geni && !req_bias_present && gguard == nullptr && ppl == nullptr;
+    thinking_offered = thinking_accepted = thinking_close_clips = 0;
     ov = &runtime_.ver_b;
 
     held.win.assign((size_t) runtime_.S, 0);
@@ -110,21 +135,61 @@ void QfnRequest::decode_stats_begin() {
     if (tk_log != nullptr) { std::fprintf(tk_log, "R temp=%g S=%d\n", (double) req_temperature, runtime_.S_mtp); std::fflush(tk_log); }
 }
 
+inline int QfnRequest::thinking_window_cap() const {
+    return (int) std::min<int64_t>({runtime_.thinking_ver->max_t(), runtime_.S_mtp,
+                                    runtime_.o.max_context - p, max_new - produced_n});
+}
+
 inline int QfnRequest::draft_window() {
+    if (max_thinking) {
+        if (!thinking_mtp) return 1;
+        const int cap = thinking_window_cap();
+        int T = 1;
+        while (T < cap && basalt::core::draft_keep(dprob.data(), T - 1, proposal_threshold(cum_adapt))) {
+            // The target can emit the close from the previous row. The K=10 verifier consumes it next.
+            if (drafts[(size_t) T - 1] == req_think_close) {
+                ++thinking_close_clips;
+                break;
+            }
+            ++T;
+        }
+        return T;
+    }
+    if (dflash) return 1 + dflash_count;
     int T = 1;
         if (held.on) T = held.T;
         else
-        while (T < runtime_.S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, cum_adapt.th())) ++T;
+        while (T < runtime_.S_mtp && basalt::core::draft_keep(dprob.data(), T - 1, proposal_threshold(cum_adapt))) ++T;
     return T;
 }
 
 inline void QfnRequest::lookup_window(int& T, bool& from_sfx, int& sfx_match) {
+        if (max_thinking && !thinking_mtp) return;
+        if (dflash_suffix_window > 0) {
+            T = dflash_suffix_window;
+            from_sfx = true;
+            sfx_match = dflash_suffix_match;
+            dflash_suffix_window = 0;
+            return;
+        }
         if (runtime_.o.suffix_draft > 0 && !first_window && ppl == nullptr && !held.on) {
             const int k = runtime_.sfx->propose(runtime_.S - 1, sbuf.data());
             sfx_match = runtime_.sfx->last_match();
-            if (k > 0 && sbuf[0] == drafts[0]) {
+            if (k > 0 && ((dflash && T == 1) || sbuf[0] == drafts[0])) {
                 const basalt::spec::DraftPolicy::Pick pk = runtime_.policy->choose(T, k, sfx_match);
-                if (pk.lookup) { T = pk.t; from_sfx = true; }
+                if (pk.lookup) {
+                    int width = pk.t;
+                    if (max_thinking) {
+                        width = std::min(width, thinking_window_cap());
+                        for (int i = 0; i < width - 1; ++i) {
+                            if (sbuf[(size_t) i] != req_think_close) continue;
+                            width = i + 1;
+                            ++thinking_close_clips;
+                            break;
+                        }
+                    }
+                    if (width > 1) { T = width; from_sfx = true; }
+                }
             }
         }
 }
@@ -136,6 +201,10 @@ inline void QfnRequest::fill_drafts(int T, bool from_sfx) {
 }
 
 inline int QfnRequest::before_window(int T, int64_t) {
+    if (runtime_.scheduler_enabled) {
+        runtime_.scheduler_rows = T;
+        runtime_.observe_scheduler(QfnRuntime::SchedulerPhase::solo_decode);
+    }
         runtime_.drive.d.layers = 0;
         runtime_.drive.d.experts = 0;
         runtime_.drive.d.failed = false;
@@ -156,6 +225,11 @@ inline int QfnRequest::before_window(int T, int64_t) {
             if (!runtime_.pending.empty()) basalt::core::decode_events().tag(1u << 1);
             runtime_.apply_pending(true);
         }
+        if (!held.on && (runtime_.vision_queued.load() || runtime_.vision_decode_lease.load())) {
+            if (adapt_thr.joinable()) adapt_thr.join();
+            if (copy_live) { runtime_.src.commit_exchanges(); copy_live = false; }
+            if (!cv->wait_commit(runtime_.err) || !runtime_.service_vision()) return 2;
+        }
         // the elastic KV: the next window's cells backed before it runs (between windows, rare)
         if (runtime_.kv_floor > 0 && p + T + 64 > basalt::core::session_kv_cells(*runtime_.rsp)) {
             if (adapt_thr.joinable()) adapt_thr.join();
@@ -166,6 +240,18 @@ inline int QfnRequest::before_window(int T, int64_t) {
                     return 1;
                 }
                 return 2;
+            }
+        }
+        if (req_think_close >= 0) {
+            auto* next = !first_window && max_thinking ? runtime_.thinking_ver.get() : &runtime_.ver;
+            if (next != cv) {
+                if (!cv->wait_commit(runtime_.err)) return 2;
+                cv = next;
+                if (max_thinking)
+                    basalt::log::info("basalt serve", "thinking max: decode K=%d on the last %d layers at position %lld",
+                                      runtime_.o.target_k_thinking_num, runtime_.o.target_k_last_layer_num, (long long) p);
+                else
+                    basalt::log::info("basalt serve", "thinking max: decode K=10 at position %lld", (long long) p);
             }
         }
         basalt::core::decode_gaps().mark(18);
@@ -195,7 +281,7 @@ inline void QfnRequest::spawn_adapt(bool early) {
                     adapt_ok = runtime_.xq_stage != 0 ? runtime_.xq_advance(false) : runtime_.xq_round(pre ? &ranked : nullptr);
                     basalt::core::decode_events().stamp(6);
                     std::string perr;
-                    if (adapt_ok && !runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                    if (adapt_ok && !cv->dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                     basalt::core::decode_events().stamp(7);
                     basalt::core::decode_gaps().hms[20] += ms_pre + ms(tb);
                 });
@@ -208,7 +294,7 @@ inline void QfnRequest::spawn_adapt(bool early) {
                 adapt_ok = runtime_.adapt();
                 if (adapt_ok) {   // the evictions' residency, uploaded beside the draft
                     std::string perr;
-                    if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                    if (!cv->dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                 }
                 basalt::core::decode_gaps().hms[20] += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
             });
@@ -234,7 +320,6 @@ inline void QfnRequest::tier_before(int T, int e0, bool from_sfx) {
 }
 
 inline void QfnRequest::tier_after_commit() {
-        
             if (adapt_early) adapt_go.store(1, std::memory_order_release);
             else spawn_adapt(false);
             // the swaps' residency at the next window, then their RAM copies a share per draft
@@ -250,7 +335,7 @@ inline void QfnRequest::tier_after_commit() {
                     if (boundary) {
                         runtime_.apply_pending(true, false);
                         std::string perr;
-                        if (!runtime_.ver.dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
+                        if (!cv->dm_presync(perr)) basalt::log::warn("basalt serve", "%s", perr.c_str());
                     }
                     if (copies) copy_done = !runtime_.src.exchanges_staged() || runtime_.src.copy_exchanges(8ull << 20);
                 });
@@ -264,11 +349,19 @@ inline void QfnRequest::tier_finish() {
 }
 
 inline bool QfnRequest::run_window(int T, int e0, int& TB) {
+        if (cv == runtime_.thinking_ver.get()) {
+            auto* plan = runtime_.drive.d.plan;
+            runtime_.drive.d.plan = cv->plan_sink();
+            const bool ok = cv->run(T, window.data(), p, runtime_.win_pool_fn, runtime_.win_pool_user,
+                                    outv.data(), runtime_.err);
+            runtime_.drive.d.plan = plan;
+            return ok;
+        }
         const std::function<int(int32_t*)> guess = [&](int32_t* wb) -> int {
             n_chain = runtime_.mtp.draft_more(n_chain, drafts.data(), dprob.data());   // made beside this window's stage 0
             if (n_chain <= T || !basalt::core::draft_keep(dprob.data(), T - 1, kPairTheta)) return 0;
             int tb = 1;
-            while (tb < runtime_.S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, cum_adapt.th()))
+            while (tb < runtime_.S_mtp && T - 1 + tb < n_chain && basalt::core::draft_keep(dprob.data() + T, tb - 1, proposal_threshold(cum_adapt)))
                 ++tb;
             if (tb < 2) return 0;
             wb[0] = drafts[(size_t) T - 1];
@@ -307,7 +400,8 @@ inline void QfnRequest::relax_note_forced(int a) {
 
 inline int QfnRequest::accept_drafts(int T) {
     int a = 0;
-    if (relax_on) {
+    // Keep the target sampler authoritative inside widened thinking.
+    if (relax_on && !max_thinking) {
             // a draft the target's draw disagrees with is kept when the target gives it probability >= P,
             // outside tool calls and never for an added token; the row then emits the draft
             bool call = in_call;
@@ -322,11 +416,14 @@ inline int QfnRequest::accept_drafts(int T) {
                 else if (d == runtime_.o.relax_call_close) call = false;
                 ++a;
             }
+    } else {
+        while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+    }
+    if (relax_on) {
             for (int i = 0; i <= a; ++i)
                 if (outv[(size_t) i] == runtime_.o.relax_call_open) in_call = true;
                 else if (outv[(size_t) i] == runtime_.o.relax_call_close) in_call = false;
-    } else
-            while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+    }
     return a;
 }
 
@@ -399,8 +496,51 @@ inline void QfnRequest::note_draft_probs(bool from_sfx) {
 template <class After>
 inline bool QfnRequest::draft_next(int T, int a, int e0, int TB, bool from_sfx, bool hold, bool will_draft, After& after_launch) {
     basalt::core::decode_gaps().mark(5);
-    if (!from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
-    runtime_.mtp.set_cum_th(cum_adapt.th());
+    if (auto* draft = dflash) {
+        dflash_count = 0;
+        if (ppl != nullptr) return true;
+        static const bool suffix_first = basalt::core::exp_flag("dflash_suffix_first") != 0;
+        static const bool overlap_commit = basalt::core::exp_flag("dflash_overlap_commit") != 0;
+        const bool defer_commit = overlap_commit && !suffix_first && will_draft && produced_n > 0;
+        if (!defer_commit) after_launch();
+        if (!draft->seed_prompt(p, runtime_.err) ||
+            !draft->inject_verified(p, dflash_commit, runtime_.err)) return false;
+        if (!will_draft) return draft->finish(runtime_.err);
+        if (suffix_first && runtime_.o.suffix_draft > 0) {
+            // after_launch has committed the current outputs into the suffix history.
+            const int k = runtime_.sfx->propose(runtime_.S - 1, sbuf.data());
+            const int match = runtime_.sfx->last_match();
+            if (k >= 3 && match >= 8) {
+                const auto pick = runtime_.policy->choose(std::min(runtime_.S, 4), k, match);
+                if (pick.lookup && pick.t >= 4) {
+                    dflash_suffix_window = pick.t;
+                    dflash_suffix_match = match;
+                    ++dflash_suffix_skipped;
+                    return draft->finish(runtime_.err);
+                }
+            }
+        }
+        static const bool cost_based = basalt::core::exp_flag("dflash_cost_policy") != 0;
+        const auto* costs = cost_based && runtime_.policy ? &*runtime_.policy : nullptr;
+        const auto emit = defer_commit ? +[](void* p) { (*static_cast<After*>(p))(); } : nullptr;
+        return draft->draft(outv[(size_t) a], p + dflash_commit, std::min(runtime_.S - 1, basalt::core::Dflash2::kDrafts),
+                            req_sp, costs, drafts.data(), dflash_count, runtime_.err, emit, &after_launch);
+    }
+    const bool thinking_window = max_thinking;
+    if (thinking_window && thinking_mtp) {
+        thinking_offered += T - 1 - e0;
+        thinking_accepted += a - e0;
+    }
+    if (thinking_window && (!thinking_mtp || outv[(size_t) a] == req_think_close)) {
+        // Keep the committed prefix. Proposals from before the closing token cannot cross the K handoff.
+        std::fill(dprob.begin(), dprob.end(), 0.0f);
+        draft_failed = will_draft && runtime_.mtp_on &&
+                       !runtime_.mtp.prefill(cv->final_R_all(), outv.data(), a + 1, p, runtime_.err);
+        if (draft_failed) std::printf("ERR %s\n", runtime_.err.c_str());
+        return !draft_failed;
+    }
+    if ((!thinking_window || thinking_mtp) && !from_sfx && e0 == 0) cum_adapt.observe(dprob.data(), T - 1, a);
+    runtime_.mtp.set_cum_th(proposal_threshold(cum_adapt));
     bool drafted = true;
     draft_failed = false;
         if (hold) {
@@ -435,12 +575,16 @@ inline bool QfnRequest::draft_next(int T, int a, int e0, int TB, bool from_sfx, 
         } else if (will_draft && runtime_.mtp_on) {
             runtime_.mtp.set_launch_hook(after_launch);
             pair_hint = pair_req && full_ema >= kPairFull;
-            runtime_.mtp.set_cum_th(pair_hint ? cum_adapt.th() * kPairChainScale : cum_adapt.th());
-            runtime_.mtp.set_host_th(cum_adapt.th());
+            runtime_.mtp.set_cum_th(pair_hint ? proposal_threshold(cum_adapt) * kPairChainScale : proposal_threshold(cum_adapt));
+            runtime_.mtp.set_host_th(proposal_threshold(cum_adapt));
             if (const int32_t* top = cv->top_ids())
                 runtime_.mtp.note_candidates(top, (a + 1) * basalt::core::Verifier::kTopIds);
             drafted = runtime_.mtp.draft_from(cv->final_R_all(), T, outv.data(), p, a, drafts.data(), runtime_.err, dprob.data(), &n_chain);
             runtime_.mtp.set_launch_hook(nullptr);
+            if (drafted && req_think_close >= 0 && !thinking_window && n_chain > 0 && !max_mtp_reported) {
+                basalt::log::info("basalt serve", "thinking max: MTP resumed with %d proposals", n_chain);
+                max_mtp_reported = true;
+            }
             if (drafted && runtime_.pipe_on) {   // the next window's first stage starts after the chain's kernels
                 const cudaEvent_t ev = runtime_.mtp.done_event();
                 runtime_.ver.set_wait_event(ev);
@@ -474,6 +618,9 @@ inline void QfnRequest::window_timing(int T, int a, bool from_sfx, Clock::time_p
 }
 
 void QfnRequest::decode_end() {
+    if (thinking_mtp)
+        basalt::log::info("basalt serve", "thinking max: inner MTP accepted %lld/%lld, close clips %lld",
+                          (long long) thinking_accepted, (long long) thinking_offered, (long long) thinking_close_clips);
     if (apply_thr.joinable()) apply_thr.join();
     if (copy_live) runtime_.src.commit_exchanges();   // swaps applied early: the rest of their copies
     copy_live = false;

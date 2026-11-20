@@ -45,13 +45,16 @@ public:
     /// Opens the tier on `device`: fills it with the first pairs of `ranked` that `primary` does not hold, as many
     /// as fit in the card's free memory minus `reserve_mib` (`max_slots` > 0 caps the count).  `exclusive`: no
     /// other tier holds these experts, so the fill is reported as model bytes placed, not as a copy.
+    /// `before_upload` runs once after the buffers and slots are allocated and before expert DMA.
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, int reserve_mib,
-              int64_t max_slots, std::string& err, bool exclusive = false);
+              int64_t max_slots, std::string& err, bool exclusive = false,
+              const std::function<void()>& before_upload = {});
     /// `open` in two steps, for several peers sharing out one ranking: `prepare` takes the card's buffers (no slots),
     /// `fill` sizes the slots for exactly `pick` and copies those experts in.
     bool prepare(int device, ExpertSource& src, int64_t n_layers, int64_t n_expert, int64_t n_embd, int64_t n_ff, std::string& err);
-    bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false);
+    bool fill(const std::vector<std::pair<int32_t, int32_t>>& pick, std::string& err, bool exclusive = false,
+              const std::function<void()>& before_upload = {});
     /// A tier whose owner keeps the experts' places and fills the slots itself: no expert source, no adaptation.
     /// `rows`: the pinned, portable, mapped host rows a share lands in; a share's activations are pinned, portable
     /// and mapped too.

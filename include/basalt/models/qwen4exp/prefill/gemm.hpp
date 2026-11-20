@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <string>
 
+namespace basalt::qwen4exp { class AtomicLoraDevice; class SwiftLoraDevice; }
+
 namespace basalt::prefill {
 
 class Gemm {
@@ -57,8 +59,14 @@ public:
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
+    void bind_lora(const basalt::qwen4exp::AtomicLoraDevice* adapter) { lora_ = adapter; }
+    const basalt::qwen4exp::AtomicLoraDevice* lora() const { return lora_; }
+    void bind_swift_lora(const basalt::qwen4exp::SwiftLoraDevice* adapter) { swift_lora_ = adapter; }
+    const basalt::qwen4exp::SwiftLoraDevice* swift_lora() const { return swift_lora_; }
 
 private:
+    const basalt::qwen4exp::AtomicLoraDevice* lora_ = nullptr;
+    const basalt::qwen4exp::SwiftLoraDevice* swift_lora_ = nullptr;
     void* handle_ = nullptr;
     void* stream_ = nullptr;
     uint16_t* scratch_ = nullptr;

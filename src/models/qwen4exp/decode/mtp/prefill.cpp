@@ -35,6 +35,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
 
 bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     const OnDevice on_device(device_);
+    if (!before_draft_write(cell0, cell0 + n, err)) return false;
     note_cells(cell0, cell0 + n);
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -99,7 +100,7 @@ bool MtpDrafter::prefill_cur(const float* R_rows, const int32_t* next_tokens, in
                 cudaMemcpyAsync(pos_, d_ps + c * NHp, (size_t) (T * NHp) * 4, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
                 cudaMemcpyAsync(Rin_, rows, (size_t) T * HCN * sizeof(float), cudaMemcpyDefault,   // (or pinned host rows)
                                 cs_) != cudaSuccess ||
-                cudaGraphLaunch(prefill_dev_exec_[T], cs_) != cudaSuccess) {
+                cudaGraphLaunch(prefill_dev_exec_[basalt::kernels::rope_context_index()][T], cs_) != cudaSuccess) {
                 err = std::string("mtp prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }

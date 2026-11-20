@@ -1,5 +1,7 @@
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/model/adapter.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "basalt/artifact/gguf_reader.hpp"
 #include "basalt/core/direct_upload.hpp"
 #include "basalt/core/load_progress.hpp"
@@ -152,10 +154,10 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
 // ================================ THE NATIVE EMBEDDING ================================
 
 namespace {
-const NativeEmbed* g_embed = nullptr;
+NativeEmbed* g_embed = nullptr;
 }
-void set_native_embed(const NativeEmbed* e) { g_embed = e; }
-const NativeEmbed* native_embed() { return g_embed; }
+void set_native_embed(NativeEmbed* e) { g_embed = e; }
+NativeEmbed* native_embed() { return g_embed; }
 
 NativeEmbed::~NativeEmbed() {
     if (hot_) cudaFree(hot_);
@@ -234,12 +236,22 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
     }
 }
 
-void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream) const {
+void NativeEmbed::bind_lora(int device, const basalt::qwen4exp::AtomicLoraDevice& adapter) {
+    lora_.insert_or_assign(device, LoraFactors{adapter.input_factor("token_embd.weight"),
+                                             adapter.output_factor(), adapter.scale()});
+}
+
+void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, void* stream, const float* adapter_rows) const {
     int dev = 0;
     cudaGetDevice(&dev);
     const bool hot = dev == hot_device_;
     basalt::kernels::iq_embed_rows(type_, dev_, row_, tokens, n_tok, n_embd_, out, stream, hot ? hot_ : nullptr,
                                    hot ? n_hot_ : 0);
+    if (const auto it = lora_.find(dev); it != lora_.end()) {
+        const auto& f = it->second;
+        basalt::kernels::atomic_lora_embedding(tokens, f.a, f.b, (int) n_tok, (int) n_embd_,
+                                               adapter_rows ? adapter_rows : f.scale, out, stream, adapter_rows != nullptr);
+    }
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
@@ -247,6 +259,10 @@ void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
     cudaGetDevice(&dev);
     const uint8_t* table = (const uint8_t*) (token < n_hot_ && dev == hot_device_ ? hot_ : dev_);
     basalt::kernels::iq_dequant_f32(type_, table + (size_t) token * row_, n_embd_, out, stream);
+    if (const auto it = lora_.find(dev); it != lora_.end()) {
+        const auto& f = it->second;
+        basalt::kernels::atomic_lora_embedding_token((int32_t) token, f.a, f.b, (int) n_embd_, f.scale, out, stream);
+    }
 }
 
 }  // namespace basalt::core

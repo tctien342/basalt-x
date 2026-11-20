@@ -29,13 +29,14 @@ def overflow_error(n: int, max_new: int, ctx: int) -> ValueError:
 
 
 class PromptText:
-    def __init__(self, tokenizer, text: str, plain=(), tail: str = "", clip: bool = False):
+    def __init__(self, tokenizer, text: str, plain=(), tail: str = "", clip: bool = False, context_limit: int | None = None):
         self.tok = tokenizer
         self.text = text            # what the engine tokenizes: the rendered prompt, then `tail`
         self.body = text[:len(text) - len(tail)] if tail else text
         self.tail = tail            # the forced opening of a call, encoded on its own like the engine does
         self.plain = list(plain)    # character spans of `body` where special-token text stays text
         self.clip = clip            # max_new is a cap: cut to the room the context leaves
+        self.context_limit = context_limit
         self.n: int | None = None   # prompt tokens, from the engine's PT line
         self.max_new: int | None = None   # the answer cap the engine settled on
         self._ids: list[int] | None = None
@@ -68,6 +69,8 @@ class PromptText:
     def resolve(self, max_new: int, ctx: int) -> tuple[list[int], int]:
         """(ids, max_new) for an engine that takes ids: the answer cap the engine would have settled on."""
         ids = self.ids()
+        if self.context_limit is not None:
+            ctx = min(ctx, self.context_limit)
         room = ctx - CTX_SLACK - len(ids)
         if self.clip:
             if room < 1:

@@ -3,6 +3,7 @@
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/native_head.hpp"
 #include "basalt/models/qwen4exp/decode/kv_arena.hpp"
+#include "basalt/core/diag.hpp"
 #include "basalt/kernels/bf16_bits.hpp"
 #include "basalt/kernels/bf16_gemv.hpp"
 #include "basalt/kernels/elementwise.hpp"
@@ -455,19 +456,21 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells, bool borrow_residency) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     uint64_t n = 0;
     const bool elastic = kv_elastic_state(s, p);   // elastic: pools, pooled keys and rope live in their own ranges
-    if (!elastic)
-        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
-    n += (uint64_t) p.pages * 4;                                               // page_table
-    if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
+    if (!borrow_residency) {
+        if (!elastic)
+            n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
+                               g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
+        n += (uint64_t) p.pages * 4;                                               // page_table
+        if (p.mode == 1) n += basalt::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
+    }
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    if (!elastic) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
+    if (!elastic && !borrow_residency) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;               // pooled
     n += 16;                                                                   // block_pos
     if (with_rope && !elastic) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += basalt::kernels::qsa_step_bytes();                                    // counts
@@ -476,12 +479,33 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, const QsaHostBinding* binding) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
+    const bool borrow_residency = binding && binding->borrow_residency;
+    const bool int8 = g_kv_int8 && !g_kv_q4;
+    if (binding) {
+        const auto& owner = binding->backing;
+        const auto& host = owner.host;
+        const bool host_present = int8 ? host.k_q && host.v_q && host.k_scale && host.v_scale
+                                       : host.k_pool && host.v_pool;
+        if (p.mode != 1 || g_kv_q4 || g_kv_hybrid || owner.kv_mode != 1 ||
+            owner.kv_int8 != int8 || owner.kv_q4 || owner.kv_hybrid || !host_present ||
+            (owner.host.fp16_host_pages && (!borrow_residency || !owner.shared_residency)) ||
+            owner.n_pages <= 0 ||
+            !binding->device_pages || (binding->page_count && !binding->host_pages) ||
+            binding->page_count > (size_t) pages) return 0;
+        if (borrow_residency) {
+            const bool resident_present = int8 ? owner.k_q && owner.v_q && owner.k_scale && owner.v_scale
+                                               : owner.k_pool && owner.v_pool;
+            if (!resident_present || !owner.map.ctl || owner.page_table != owner.map.page_table ||
+                owner.map.n_blocks != owner.n_pages || owner.map.n_slots != owner.n_slots) return 0;
+        }
+    }
+    st.shared_residency = borrow_residency;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
+    st.kv_int8 = int8;
     st.kv_q4 = g_kv_q4;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // core/mtp/load.cpp). Streamed mode is refused outright; program/cli/options.cpp validates it too, this is the backstop.
@@ -494,14 +518,23 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
-    st.kv_rot = st.kv_q4;   // K8V4 rotates only V (below)
+    st.kv_rot = st.kv_q4 || (st.kv_int8 && exp_flag("int8_kv_rot") != 0);
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_arena = nullptr;
     std::vector<uint8_t> rope_cos_host, rope_sin_host;   // the rope table, kept to fill the arena as it grows
-    if (kv_elastic_state(s, p)) {
+    if (borrow_residency) {
+        const auto& owner = binding->backing;
+        st.k_pool = owner.k_pool;
+        st.v_pool = owner.v_pool;
+        st.k_q = owner.k_q;
+        st.v_q = owner.v_q;
+        st.k_scale = owner.k_scale;
+        st.v_scale = owner.v_scale;
+        st.n_slots = owner.n_slots;
+    } else if (kv_elastic_state(s, p)) {
         // the same arrays, each in its own reserved range: per page, the row bytes of each array
         const uint64_t pr = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t code = pr * s.head_dim, scale = pr * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2;
@@ -579,25 +612,44 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.k_pool = c.take<uint16_t>(rows * s.head_dim);
         st.v_pool = c.take<uint16_t>(rows * s.head_dim);
     }
-    st.page_table = c.take<int32_t>((uint64_t) pages);
     st.n_pages = pages;
     st.max_cells = max_cells;
-    st.map = basalt::kernels::KvStreamMap{};
-    st.map.page_table = st.page_table;
-    st.map.n_blocks = pages;
-    st.map.n_slots = p.slots;
-    if (p.mode == 1) {
-        st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
-        st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
-        st.map.slot_ref = c.take<int32_t>((uint64_t) p.slots);
-        st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
-        st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
-        st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
+    if (borrow_residency) {
+        st.page_table = binding->backing.page_table;
+        st.map = binding->backing.map;
+    } else {
+        st.page_table = c.take<int32_t>((uint64_t) pages);
+        st.map = basalt::kernels::KvStreamMap{};
+        st.map.page_table = st.page_table;
+        st.map.n_blocks = pages;
+        st.map.n_slots = p.slots;
+        if (p.mode == 1) {
+            st.map.slot_block = c.take<int32_t>((uint64_t) p.slots);
+            st.map.slot_stamp = c.take<int32_t>((uint64_t) p.slots);
+            st.map.slot_ref = c.take<int32_t>((uint64_t) p.slots);
+            st.map.miss_block = c.take<int32_t>((uint64_t) p.slots);
+            st.map.miss_slot = c.take<int32_t>((uint64_t) p.slots);
+            st.map.ctl = c.take<int32_t>((uint64_t) basalt::kernels::kKvCtlInts);
+        }
     }
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    if (st.kv_arena == nullptr) st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (borrow_residency) {
+        auto* index = new KvArena();
+        std::string err;
+        const uint64_t row = (uint64_t) s.idx_dim * sizeof(float);
+        if (s.page_size % s.idx_block != 0 ||
+            !index->open({(uint64_t) (s.page_size / s.idx_block) * row}, p.pages, s.page_size, err, {2 * row})) {
+            basalt::log::error("basalt", "shared KV indexer: %s", err.c_str());
+            delete index;
+            return 0;
+        }
+        st.shared_index_arena = index;
+        st.idx_pooled = (float*) index->array(0);
+    } else if (st.kv_arena == nullptr) {
+        st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    }
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
@@ -617,7 +669,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = basalt::kernels::KvHostPools{};
-    if (p.mode != 0) {
+    if (binding) {
+        st.host = binding->backing.host;
+        st.host.fp16_host_pages = binding->device_pages;
+        st.host.fp16_shared_residency = borrow_residency;
+        st.host_page_ids = binding->host_pages;
+        st.host_page_count = binding->page_count;
+        st.host_pool_pages = (size_t) binding->backing.n_pages;
+    } else if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * basalt::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
@@ -669,7 +728,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
         cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
     } else if (p.mode == 1) {
-        basalt::kernels::kv_stream_reset(st.map, nullptr);
+        if (!borrow_residency) basalt::kernels::kv_stream_reset(st.map, nullptr);
     } else {
         basalt::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
@@ -683,6 +742,8 @@ int64_t qsa_kv_elastic() { return g_kv_elastic; }
 void qsa_state_release(QsaState& st) {
     delete st.kv_arena;
     st.kv_arena = nullptr;
+    delete st.shared_index_arena;
+    st.shared_index_arena = nullptr;
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
@@ -691,7 +752,9 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // elastic: only the backed pages (the rest has no memory; mapping more zeroes it)
     const int64_t pages = st.kv_arena != nullptr ? st.kv_arena->cells() / s.page_size : st.n_slots;
     const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
-    if (st.kv_hybrid) {
+    if (st.shared_residency) {
+        // The lease recycling path invalidates physical pages before reuse.
+    } else if (st.kv_hybrid) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.k_scale, 0, rows * (s.head_dim / basalt::kernels::KV_Q8_GROUP) * 2, cs);
         cudaMemsetAsync(st.v_q4, 0, rows * basalt::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
@@ -710,13 +773,14 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     // A streamed state starts over with nothing resident. Its host copy is not cleared (GBs over PCIe per new
     // conversation): no reader names a cell before this sequence has written it, and a block copied in whole
     // carries the unwritten cells past the end, which nothing reads.
-    if (st.kv_mode == 1) basalt::kernels::kv_stream_reset(st.map, stream);
+    if (st.kv_mode == 1 && !st.shared_residency) basalt::kernels::kv_stream_reset(st.map, stream);
     cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
     cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
     // elastic: the pooled rows of the backed pages and the spare rows past them (mapping more zeroes the rest)
-    const int64_t pooled_rows =
-        st.kv_arena != nullptr ? std::min(st.idx_pooled_rows, st.kv_arena->cells() / s.idx_block + 2) : st.idx_pooled_rows;
-    cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
+    const KvArena* index = st.shared_index_arena ? st.shared_index_arena : st.kv_arena;
+    const int64_t pooled_rows = index ? (index->cells() == 0 ? 0 :
+        std::min(st.idx_pooled_rows, index->cells() / s.idx_block + 2)) : st.idx_pooled_rows;
+    if (pooled_rows > 0) cudaMemsetAsync(st.idx_pooled, 0, (size_t) pooled_rows * s.idx_dim * 4, cs);
 }
 
 namespace {
@@ -733,7 +797,7 @@ uint64_t qsa_prompt_layout(const ModelGeometry& g, int64_t max_cells, uint8_t* b
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
-    st.kv_rot = st.kv_q4;
+    st.kv_rot = st.kv_q4 || (st.kv_int8 && exp_flag("int8_kv_rot") != 0);
     st.kv_mode = 0;
     st.n_slots = pages;
     const uint64_t rows = (uint64_t) pages * s.n_head_kv * s.page_size;
@@ -819,10 +883,33 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
         arrs = {{dh ? dst.host.k_pool : dst.k_pool, sh ? src.host.k_pool : src.k_pool, code * 2},
                 {dh ? dst.host.v_pool : dst.v_pool, sh ? src.host.v_pool : src.v_pool, code * 2}};
     const int64_t p0 = cell0 / s.page_size, p1 = (cell1 + s.page_size - 1) / s.page_size;
+    const auto* sm = src.host.fp16_host_pages ? src.host_page_ids : nullptr;
+    const auto* dm = dst.host.fp16_host_pages ? dst.host_page_ids : nullptr;
+    if ((src.host.fp16_host_pages && (!sm || (size_t) p1 > src.host_page_count)) ||
+        (dst.host.fp16_host_pages && (!dm || (size_t) p1 > dst.host_page_count))) {
+        err = "a QSA state copy exceeds a shared KV mapping";
+        return false;
+    }
+    for (int64_t p = p0; p < p1; ++p) {
+        if ((sm && sm[p] >= src.host_pool_pages) || (dm && dm[p] >= dst.host_pool_pages)) {
+            err = "a QSA state copy names a page outside the shared pool";
+            return false;
+        }
+    }
     bool ok = true;
-    for (const Arr& a : arrs)
-        ok = ok && copy((uint8_t*) a.d + (size_t) p0 * a.page, (const uint8_t*) a.s + (size_t) p0 * a.page,
-                        (uint64_t) (p1 - p0) * a.page);
+    for (int64_t p = p0; ok && p < p1;) {
+        const size_t from = sm ? sm[p] : (size_t) p;
+        const size_t to = dm ? dm[p] : (size_t) p;
+        int64_t end = p + 1;
+        while (end < p1 && (!sm || sm[end] == from + (size_t) (end - p)) &&
+                           (!dm || dm[end] == to + (size_t) (end - p))) ++end;
+        for (const Arr& a : arrs) {
+            auto* dest = static_cast<uint8_t*>(a.d) + to * a.page;
+            const auto* source = static_cast<const uint8_t*>(a.s) + from * a.page;
+            ok = ok && (dest == source || copy(dest, source, (uint64_t) (end - p) * a.page));
+        }
+        p = end;
+    }
     // the pooled keys of the blocks the cells reach and the spare row after them, the tail, the spare, the block position
     const uint64_t row = (uint64_t) s.idx_dim * 4;
     const int64_t r0 = cell0 / s.idx_block;
@@ -838,6 +925,7 @@ bool qsa_state_copy_cells(QsaState& dst, const QsaState& src, const ModelGeometr
 basalt::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     basalt::kernels::QsaAttnPools pools;
     pools.page_table = st.page_table;
+    pools.physical_pages = st.shared_residency ? st.host.fp16_host_pages : nullptr;
     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
     else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
     else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
@@ -1019,7 +1107,8 @@ if (st.kv_hybrid) {
 } else {
 if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0
     basalt::kernels::fwht256_inplace_cuda(b.kcur, g.n_head_kv, stream);
-    basalt::kernels::fwht256_inplace_cuda(b.vcur, g.n_head_kv, stream);
+    basalt::kernels::fwht_value_inplace_cuda(b.vcur, g.n_head_kv, stream,
+                                             basalt::kernels::kv_value_rotation_width(st.kv_int8 && !st.kv_q4));
 }
 if (st.kv_q4) {
     basalt::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
@@ -1062,11 +1151,15 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
                                            b.v_scratch, b.v_scratch, stream);
     }
     else if (st.kv_q4) basalt::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
-    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
-    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
+    else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,
+                                           b.k_scratch, b.v_scratch, stream,
+                                           st.shared_residency ? st.host.fp16_host_pages : nullptr);
+    else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream, st.shared_residency ? st.host.fp16_host_pages : nullptr);
     qsa_attend_step(b.qcur, b.k_scratch, b.v_scratch, st.step, cap, s, b.attn, nullptr, stream);
     }
-    if (st.kv_rot || st.kv_hybrid) basalt::kernels::fwht256_inplace_cuda(b.attn, g.n_head, stream);   // the output back: H is self-inverse
+    if (st.kv_rot || st.kv_hybrid)
+        basalt::kernels::fwht_value_inplace_cuda(b.attn, g.n_head, stream,
+                                                 basalt::kernels::kv_value_rotation_width(st.kv_rot && st.kv_int8 && !st.kv_q4));
     dump_slot(dump, g, layer, b.attn, (uint64_t) 2 * g.n_embd + 2 * g.hc,                            (uint64_t) g.n_head * g.head_dim, stream);    {        const uint64_t vs = (uint64_t) 2 * g.n_embd + 2 * g.hc + (uint64_t) g.n_head * g.head_dim +                            (uint64_t) 2 * g.n_head_kv * g.head_dim;        dump_slot(dump, g, layer, (const float*) b.v_scratch, vs,                            (uint64_t) g.n_head_kv * g.head_dim / 2, stream);        dump_slot(dump, g, layer, (const float*) b.ids, vs + (uint64_t) g.n_head_kv * g.head_dim / 2, 4, stream);        dump_slot(dump, g, layer, (const float*) st.step,                            vs + (uint64_t) g.n_head_kv * g.head_dim / 2 + 4, 4, stream);    }
 // ---- 9. Gate the attention output before its projection. Native CUDA keeps F32
 // sigmoid/multiply arithmetic and uses Q8_1 for the native quantized projection.

@@ -1,4 +1,6 @@
 #include "experts.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/kernels/iq_kernels.hpp"
@@ -30,6 +32,12 @@ bool Prefill::Run::Chunk::Experts::Group::compute_fp16(size_t j, const uint8_t* 
     m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
     swiglu_interleaved(m.GU + o0 * 1280, m.Hh + o0 * 640, ne, m.cs);
     m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
+    if (const auto* adapter = m.gemm.lora()) {
+        const auto name = core::LayerView(*m.wt, l).name("ffn_down_exps.weight");
+        const float* a = adapter->input_factor(name) + (size_t) e * 640;
+        basalt::kernels::atomic_lora_project_f16(m.Hh + o0 * 640, a, adapter->output_factor(),
+            (int) ne, 640, (int) N, N, adapter->scale(), m.Dm + o0 * N, m.cs);
+    }
     return true;
 }
 

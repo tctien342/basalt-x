@@ -113,7 +113,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         long long r = -1;
         if (t < n_here) {
             const int cell = ids[c0 + t];
-            const long long page = (long long) p.page_table[cell / page_size];
+            const int logical = cell / page_size;
+            const long long page = p.page_table[p.physical_pages ? p.physical_pages[logical] : logical];
             // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
             // (score -FLT_MAX, weight 0) instead of being read from before the pool.
             if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);

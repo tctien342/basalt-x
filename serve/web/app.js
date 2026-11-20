@@ -337,9 +337,156 @@ function contextPane(s, reqs, eng) {
     + `<div class="cx-scale"><span>0</span><span>${kc(n / 2)}</span><span>${kc(n)}</span></div>`
     + ctxHistory(reqs) + `</div>`;
 }
+const SCHED_PHASE = { idle: "Idle", prefill: "Solo prefill", overlap: "Prefill + decode",
+  solo_decode: "Solo decode", batch_decode: "Batch decode" };
+const SCHED_DECISION = { none: "-", applied: "Trial applied", gap_guard: "Latency rollback", kept_incumbent: "Kept current budget",
+  overlap_calibrating: "Measuring baseline", overlap_probe: "Testing chunk", overlap_confirming: "Confirming baseline",
+  overlap_promoted: "Chunk applied", overlap_rolled_back: "Chunk rolled back", overlap_interrupted: "Trial interrupted" };
+const LEARNING_OUTCOME = { provisional: "Provisional win", qualified: "Qualified", revalidated: "Revalidated",
+  revoked: "Revoked", rejected: "Rejected" };
+const LEARNING_STORE = { synced: "Synced", pending: "Write pending", error: "Write failed" };
+const reading = (value, unit = "") => num(value) && value >= 0 ? `${fmt(value)}${unit}` : "-";
+const memorySize = value => !num(value) || value < 0 ? "-" : value >= 1024 ** 3
+  ? `${fmt(value / 1024 ** 3, 2)} GiB` : `${fmt(value / 1024 ** 2, 1)} MiB`;
+function schedulerPane(m) {
+  const s = m.scheduler;
+  if (!s) return '<p class="empty">Scheduler telemetry is unavailable for this worker.</p>';
+  const hw = m.hardware || {}, conv = m.conversation || {}, engine = m.engine || {};
+  const stale = !num(s.sampled_at) || Date.now() / 1000 - s.sampled_at > 8;
+  const queue = s.queue_fresh === 1 && !stale;
+  const rows = items => items.map(([label, value]) => `<div><dt>${esc(label)}</dt><dd>${esc(value)}</dd></div>`).join("");
+  const box = (title, items) => `<section class="sched-box"><h3>${esc(title)}</h3><dl>${rows(items)}</dl></section>`;
+  const learner = m.scheduler_learning;
+  const last = learner?.last_outcome;
+  const experts = [
+    ["CUDA 0 warm lookups", reading(s.gpu0_cache_hits)],
+    ["Peer resident experts", reading(s.peer_resident_experts)],
+    ["Peer GPU routed entries", reading(s.peer_expert_entries)],
+    ["CPU routed entries", reading(s.cpu_expert_entries)],
+    ["Distinct PCIe experts", reading(s.pcie_distinct_experts)],
+    ["Peer cache swaps", reading(s.peer_swaps)],
+  ];
+  const gbps = mbps => num(mbps) && mbps >= 0 ? `${fmt(mbps / 1000, 2)} GB/s` : "-";
+  const probeRows = Object.keys(engine).filter(k => /^pcie_h2d_cuda\d+_mbps$/.test(k)).sort().map(key => {
+    const ordinal = key.match(/cuda(\d+)/)[1];
+    return [`Host → CUDA ${ordinal}, startup copy`, gbps(engine[key])];
+  });
+  const f = typeof engine.pcie_frac === "string" && engine.pcie_frac !== "" ? Number(engine.pcie_frac) : engine.pcie_frac;
+  const pcie = [
+    ["Batch expert staging fraction", num(s.pcie_frac_q8) && s.pcie_frac_q8 >= 0
+      ? `${fmt(100 * s.pcie_frac_q8 / 256, 1)}%` : "-"],
+    ["Startup expert fraction", num(f) && f >= 0 ? `${fmt(100 * f, 1)}%` : "-"],
+    ["Trial fraction", num(s.pcie_trial_q8) && s.pcie_trial_q8 >= 0
+      ? `${fmt(100 * s.pcie_trial_q8 / 256, 1)}%` : "-"],
+    ["Tuner state", s.pcie_tuner_state ? s.pcie_tuner_state.replaceAll("_", " ") : "-"],
+    ["Measured tuner windows", reading(s.pcie_tuner_windows)],
+    ["Last window eligible / staged experts", `${reading(s.pcie_window_eligible)} / ${reading(s.pcie_window_staged)}`],
+    ["Last window staged payload rate", gbps(s.pcie_window_payload_mbps)],
+    ["Cumulative staged payload", memorySize(s.pcie_stage_payload_bytes)],
+    ...probeRows,
+    ["Simultaneous startup H2D", gbps(engine.pcie_h2d_combined_mbps)],
+    ...((hw.gpus || []).flatMap((g, i) => {
+      const label = `GPU ${g.index ?? i}`;
+      const link = num(g.pcie_gen) && num(g.pcie_width) ? `Gen${g.pcie_gen} ×${g.pcie_width}` : "-";
+      return [[`${label} path ceiling`, gbps(g.pcie_path_ceiling_mbps)],
+        [`${label} current link`, link],
+        [`${label} live RX / TX`, `${reading(g.pcie_rx_mb, " MiB/s")} / ${reading(g.pcie_tx_mb, " MiB/s")}`]];
+    })),
+  ];
+  const devices = (hw.gpus || []).map((g, i) => [
+    `GPU ${g.index ?? i} device use`, `${memorySize(g.mem_used)} / ${memorySize(g.mem_total)}`,
+  ]);
+  const dense = Object.keys(engine).filter(k => /^dense_arena_cuda\d+_bytes$/.test(k)).sort().flatMap(key => {
+    const dev = key.match(/cuda(\d+)/)[1];
+    return [[`CUDA ${dev} dense arena`, memorySize(engine[key])],
+      [`CUDA ${dev} native output head`, memorySize(engine[`native_head_cuda${dev}_bytes`])],
+      [`CUDA ${dev} verifier workspace`, memorySize(engine[`verify_arena_cuda${dev}_bytes`])]];
+  });
+  const startup = new Map();
+  for (const row of m.startup_memory?.kv_allocations || []) {
+    const key = `${row.device} ${row.kind === "draft" ? "draft KV" : "target session and KV"}`;
+    const sum = startup.get(key) || [0, 0];
+    sum[0] += row.bytes;
+    sum[1] += row.configured_bytes;
+    startup.set(key, sum);
+  }
+  return `<div class="sched">
+    <div class="sched-head"><strong>${esc(stale && m.live?.state === "idle" ? "Idle" : SCHED_PHASE[s.phase] || s.phase)}</strong>
+    <span>${stale ? "Last sample" : "Sample"} ${num(s.sampled_at) ? clock(s.sampled_at * 1000) : "-"}</span></div>
+    <div class="sched-grid">
+      ${box("Active policy", [
+        ["Prompt remaining", reading(s.prompt_remaining, " tok")], ["Prefill chunk", reading(s.chunk_tokens, " tok")],
+        ["Decode time budget", reading(s.decode_quantum_ms, " ms")],
+        ["Latest batch output gap", reading(s.batch_output_gap_ms, " ms")],
+        ["Limited / joint batch windows", `${reading(s.limited_batch_windows)} / ${reading(s.batch_windows)}`],
+        ["Time under a row limit", reading(s.limited_batch_window_ms, " ms")],
+        ["Verify rows / limit", `${reading(s.verify_rows)} / ${reading(s.verify_limit)}`],
+        ["Trial row budget", s.verify_trial_rows > 0
+          ? `${reading(s.verify_trial_rows)}${s.verify_trial_remembered ? " (remembered)" : ""}` : "-"],
+        ["Last decision", SCHED_DECISION[s.decision] || s.decision || "-"],
+      ])}
+      ${learner ? box("Overlap learning", [
+        ["Qualified scopes / limit", `${reading(learner.qualified_scopes)} / ${reading(learner.scope_limit)}`],
+        ["Provisional scopes", reading(learner.provisional_scopes)],
+        ["Profile storage", LEARNING_STORE[learner.store_state] || "-"],
+        ["Last outcome", LEARNING_OUTCOME[last?.outcome] || "-"],
+        ["Last chunk", reading(last?.chunk_tokens, " tok")],
+        ["Last scope", last?.scope || "-"],
+        ["Last outcome time", num(last?.at) ? clock(last.at * 1000) : "-"],
+      ]) : ""}
+      ${box("Queue and KV", [
+        ["Control waiters", queue ? reading(s.control_waiters) : "-"],
+        ["Admission waiters", queue ? reading(s.admission_waiters) : "-"],
+        ["Paused in admission", queue ? reading(s.parked_waiters) : "-"],
+        ["Oldest waiter", queue ? reading(s.oldest_wait_ms, " ms") : "-"],
+        ["Free shared KV pages", queue ? reading(s.free_kv_pages) : "-"],
+        ["KV context capacity", reading(engine.max_context, " tok")],
+      ])}
+      ${box("Expert routing", experts)}
+      ${box("PCIe", pcie)}
+      ${box("VRAM allocations", [
+        ...devices,
+        ...dense,
+        ["CUDA 0 adapter factors", memorySize(engine.adapter_cuda0_payload_bytes)],
+        ["Peer adapter factors", memorySize(engine.adapter_peer_payload_bytes)],
+        ["CUDA 0 expert pool, mapped", memorySize(s.gpu0_expert_mapped_bytes)],
+        ["CUDA 0 expert pool, capacity", memorySize(s.gpu0_expert_capacity_bytes)],
+        ["CUDA 0 prefill loan (within pool)", memorySize(s.gpu0_prefill_loan_bytes)],
+        [s.cuda0_prefill_workspace_borrowed ? "CUDA 0 prefill workspace (inside loan)" : "CUDA 0 prefill workspace",
+          memorySize(s.cuda0_prefill_workspace_bytes)],
+        ["Peer expert pool", memorySize(s.peer_expert_cache_bytes)],
+        ["Peer prefill scratch (within pool)", memorySize(s.peer_prefill_scratch_within_loan_bytes)],
+        ["Peer vision loan (within pool)", memorySize(s.peer_vision_loan_bytes)],
+        ["Vision device workspace and weights", memorySize(s.vision_device_bytes)],
+        ["Shared indexer, mapped", memorySize(s.shared_index_mapped_bytes)],
+        ["MTP tracked allocation", memorySize(s.mtp_tracked_bytes)],
+      ])}
+      ${startup.size ? box("KV at engine load (backed / configured)", Array.from(startup, ([k, values]) =>
+        [k, `${memorySize(values[0])} / ${memorySize(values[1])}`])) : ""}
+      ${box("Host memory", [
+        ["System RAM use", `${memorySize(hw.ram_used)} / ${memorySize(hw.ram_total)}`],
+        ["RAM available for capture", memorySize(s.capture_ram_available_bytes >= 0 ? s.capture_ram_available_bytes : null)],
+        ["Expert arena and resident complement", memorySize(s.expert_arena_bytes)],
+        ["Pinned KV, target + draft", memorySize(s.pinned_kv_bytes)],
+        ["Pinned peer prefill weights", memorySize(s.pinned_peer_weights_bytes)],
+        ["RAM prefix cache, all namespaces", memorySize(s.ram_prefix_cache_total_bytes)],
+        ["RAM prefix cache, current namespace", memorySize(conv.bytes)],
+        ["RAM prefix budget per namespace", memorySize(num(engine.conversation_cache_mib) ? engine.conversation_cache_mib * 1024 ** 2 : null)],
+      ])}
+      ${box("Snapshot storage", [
+        ["RAM recovery files", memorySize(s.recovery_cache_bytes)],
+        ["RAM recovery writer queue", memorySize(s.recovery_queued_bytes)],
+        ["RAM recovery shared limit", memorySize(engine.recovery_budget_bytes)],
+        ["NVMe cache files", memorySize(s.disk_cache_bytes)],
+        ["NVMe shared budget", memorySize(engine.disk_cache_budget_bytes)],
+      ])}
+    </div>
+  </div>`;
+}
 function drawMain(live, hist, reqs, slots, total) {
   const multi = total > 1, n = live.queued || 0;
   const T = (multi ? [["slots", "Slots"]] : reqs.length || (slots[0] && slots[0].ctx_used > 0) ? [["ctx", "Context"]] : []).concat([["req", "Requests"], ["queue", `Queue (${n})`]]);
+  if (M.engine?.scheduler_queue === 1 || M.scheduler) T.push(["scheduler", "Scheduler"]);
   const cur = T.some(t => t[0] === tab) ? tab : T[0][0];
   html($("#tabs"), T.map(t => `<button type="button" role="tab" data-t="${t[0]}" aria-selected="${t[0] === cur}">${t[1]}</button>`).join(""));
   let h;
@@ -347,6 +494,7 @@ function drawMain(live, hist, reqs, slots, total) {
     const series = slots.map((_, k) => tail((hist.slot_tok_s || [])[k]));
     h = slotRows(slots, series);
   } else if (cur === "ctx") h = contextPane(slots[0] || {}, reqs, M.engine || {});
+  else if (cur === "scheduler") h = schedulerPane(M);
   else h = cur === "req" ? requestsPane(live, reqs, multi) : queuePane(live);
   html($("#pane"), h);
 }

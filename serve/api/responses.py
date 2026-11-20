@@ -21,7 +21,7 @@ import time
 import uuid
 
 from serve.api.logprobs import MAX_TOP as MAX_TOP_LOGPROBS, REQUEST_KEY as LOGPROBS_KEY
-from serve.frontend import IMAGE_PARTS, VIDEO_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
+from serve.frontend import AUDIO_PARTS, IMAGE_PARTS, VIDEO_PARTS, Event, _late_system_to_user, _parts_of, effort_kwargs, stable_tool_order
 
 ENCRYPTED_PREFIX = "basalt.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -81,6 +81,8 @@ def _content(content, param):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind in AUDIO_PARTS:
+            parts.append(part)
         elif kind in VIDEO_PARTS:
             if not isinstance(part.get("video_url"), str) or not part["video_url"]:
                 raise ResponsesError("only videos given as video_url (a data: or http(s) URL) are supported; "

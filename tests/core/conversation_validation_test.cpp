@@ -117,6 +117,22 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         for (const auto* p : {&first,&last,&draft}) for (const auto& bytes : p->data) if (!pristine(bytes)) return false;
         return true;
     };
+    {
+        auto prefix = image;
+        check(!conversation_snapshot_trim_to_checkpoint(prefix,ss,g,&draft.st,6,error) &&
+              prefix.live.ids.size()==9, "reject a cut without exact checkpoint state before mutation");
+        check(conversation_snapshot_trim_to_checkpoint(prefix,ss,g,&draft.st,5,error),
+              "select the shorter cached checkpoint");
+        check(prefix.live.ids == image.checkpoints[0].ids && prefix.live.state_a == image.checkpoints[0].state_a,
+              "trimmed running state belongs to the selected prefix");
+        check(prefix.kv.size()==image.kv.size() &&
+              std::all_of(prefix.kv.begin(),prefix.kv.end(),[](const auto& layer) { return layer.cells==8; }),
+              "trim all target and draft payloads at the rounded page boundary");
+        check(conversation_snapshot_validate(prefix,ss,g,draft.st,error) &&
+              image.live.ids.size()==9 && image.kv.front().cells==12,
+              "trimmed image validates and the source copy is unchanged");
+        check(unchanged(), "trimming a host image did not modify destination state");
+    }
     auto reject = [&](const std::function<void(SavedConversation&)>& mutate, const char* label) {
         auto bad = image; mutate(bad);
         check(conversation_snapshot_restore(bad,ss,g,draft.st,error) == ConversationRestore::invalid,label);
@@ -230,12 +246,88 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     SavedConversation unpublished;
     check(!conversation_snapshot_save(unpublished,view,ss,g,draft.st,error,std::move(reuse)), "incremental capture copy failure is reported");
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
+    for (bool retained : {false, true}) {
+        ConversationKvReuse candidate;
+        if (retained) {
+            candidate.unchanged_tokens = 9;
+            candidate.captured_tokens = 9;
+            for (const auto& layer : full.kv) candidate.kv.push_back(layer.shared_copy());
+        }
+        reset();
+        const ConversationCaptureStop input = [&] { return copy_calls > 0; };
+        check(!conversation_snapshot_save(unpublished, view, ss, g, &draft.st, error,
+                                          std::move(candidate), nullptr, &input) && error == kCaptureInterrupted,
+              "incoming work interrupts either kind of idle capture after a transfer");
+        check(copy_calls > 0 && unpublished.kv.empty() && unpublished.live.ids.empty(),
+              "interrupted capture cannot publish a partial image");
+        check(full.kv.back().k == incremental.kv.back().k, "old committed payload remains valid");
+    }
 #endif
 }
+#if defined(CONVERSATION_TEST_TRANSFERS)
+void mapped_int8_capture() {
+    ModelGeometry g;
+    g.n_head_kv = 1;
+    g.head_dim = 64;
+    Pools source(g, 1);
+    auto& st = source.st;
+    st.kv_int8 = st.kv_rot = true;
+    st.kv_mode = 1;
+    st.host.k_q = st.k_q;
+    st.host.v_q = st.v_q;
+    st.host.k_scale = st.k_scale;
+    st.host.v_scale = st.v_scale;
+    int32_t device_mapping[3] = {8, 2, 3};
+    const uint32_t pages[3] = {8, 2, 3};
+    st.host.fp16_host_pages = device_mapping;
+    st.host_page_ids = pages;
+    st.host_page_count = 3;
+    st.host_pool_pages = st.n_pages;
+    int32_t guard = 0;   // only capture and read-back run here, with host CUDA wrappers
+    st.map.n_blocks = st.n_pages;
+    st.map.n_slots = st.n_slots;
+    st.map.page_table = st.map.slot_block = st.map.slot_stamp = st.map.slot_ref = &guard;
+    st.map.ctl = st.map.miss_block = st.map.miss_slot = &guard;
+    for (size_t part = 0; part < 4; ++part) {
+        const size_t page_bytes = source.data[part].size() / st.n_pages;
+        for (int64_t page = 0; page < st.n_pages; ++page)
+            std::fill_n(source.data[part].data() + page * page_bytes, page_bytes, uint8_t(32 * part + page));
+    }
+    std::string error;
+    ConversationKv image;
+    check(conversation_kv_save(image, st, g, 9, false, error), "capture rotated INT8 host pages");
+    check(image.format == qsa_kv_format(st) + 16, "keep rotated snapshot format");
+    const auto first_copy = copy_calls;
+    const ConversationCaptureStop input = [&] { return copy_calls > first_copy; };
+    ConversationKv partial;
+    check(!conversation_kv_save(partial, st, g, 9, false, error, 0, nullptr, &input) &&
+          error == kCaptureInterrupted && copy_calls == first_copy + 1,
+          "incoming work stops a fragmented mapped copy between physical runs");
+    const std::array<const ConversationBuffer*, 4> buffers = {&image.k, &image.v, &image.k_scale, &image.v_scale};
+    for (size_t part = 0; part < buffers.size(); ++part) {
+        const auto& buffer = *buffers[part];
+        const size_t page_bytes = buffer.size() / 3;
+        std::vector<uint8_t> bytes(page_bytes);
+        for (size_t i = 0; i < 3; ++i) {
+            check(buffer.read(bytes.data(), i * page_bytes, page_bytes), "read saved K/V page");
+            check(std::all_of(bytes.begin(), bytes.end(), [&](uint8_t b) { return b == 32 * part + pages[i]; }),
+                  "page translation preserves each INT8 payload");
+        }
+    }
+    uint64_t fingerprint = 0;
+    check(conversation_kv_verify(image, st, g, 9, false, fingerprint, error), "verify mapped INT8 data and scales");
+    st.host.v_scale = nullptr;
+    check(!conversation_kv_save(image, st, g, 9, false, error), "refuse a missing shared INT8 scale buffer");
+}
+#endif
+
 }
 
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+#if defined(CONVERSATION_TEST_TRANSFERS)
+    mapped_int8_capture();
+#endif
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

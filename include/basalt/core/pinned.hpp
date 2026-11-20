@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -41,7 +42,8 @@ struct PinnedArena {
     /// header and is refused when its stored hash does not match.  Empty `shared_file` preserves the existing
     /// allocation path.  Population/coordination and backing-file lifetime remain the caller's job.
     PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
-                const std::string& shared_file = {}, uint64_t shared_hash = 0);
+                const std::string& shared_file = {}, uint64_t shared_hash = 0,
+                const std::function<bool()>& before_register = {});
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base

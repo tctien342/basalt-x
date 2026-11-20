@@ -1,4 +1,6 @@
 #include "experts.hpp"
+#include "basalt/models/qwen4exp/atomic_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/atomic_lora.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
 #include "basalt/core/on_device.hpp"
@@ -10,6 +12,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
+#include <atomic>
 
 namespace basalt::prefill {
 using namespace detail;
@@ -26,6 +29,8 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
     L.up_type = mmq_ut;
     L.up_at = mmq_gb;
     const size_t n = order_peer.size();
+    // In the mixed path, routing puts newly moved FP32 rows first and the old peer rows last.
+    int64_t packed_tail_rows = on_peer[(size_t) order_peer.front()] == 2 ? 0 : -1;
     if (peer_fp4) {
         // a streamed chunk: the FP4 kernels in pieces of at most G rows (PeerPrefill::T_fp4), the blobs read in place
         if (!fp4_l) {
@@ -78,15 +83,21 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
         // groups of up to MMQ_GROUP experts and at most G rows, each one launch
         size_t g0 = 0;
         int64_t gr = 0;
+        size_t cold = 0;
         for (size_t j = 0; j < n; ++j) {
             const int32_t e = order_peer[j];
             const int64_t c = m.cnt[(size_t) e];
             PeerShare::Expert x;
-            x.blob = P.peer->slot_ptr(l, e);
-            x.on_peer = true;
+            x.on_peer = P.peer->has(l, e);
+            x.blob = x.on_peer ? P.peer->slot_ptr(l, e) : m.src->blob(l, e);
+            if (x.blob == nullptr) { err = "prefill: missing peer expert blob"; return false; }
+            if (!x.on_peer) ++cold;
+            const bool originally_peer = on_peer[(size_t) e] == 1;
+            if (packed_tail_rows >= 0 && originally_peer) packed_tail_rows += c;
             x.tok = src_h + m.off[(size_t) e];
             x.n = (int) c;
-            x.group = j == 0 || j - g0 == (size_t) MMQ_GROUP || gr + c > P.G;
+            const bool precision_boundary = j > 0 && on_peer[(size_t) e] != on_peer[(size_t) order_peer[j - 1]];
+            x.group = j == 0 || precision_boundary || j - g0 == (size_t) MMQ_GROUP || gr + c > P.G;
             if (x.group) {
                 g0 = j;
                 gr = 0;
@@ -94,7 +105,10 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             gr += c;
             ex.push_back(x);
         }
-        // a group's blobs out of the peer's slots into the MMQ layout of a group buffer (peer_down_at)
+        static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+        if (cold && !logged.test_and_set())
+            basalt::log::info("basalt prefill", "peer cold MMQ staging on GPU %d (%zu host experts in first layer)", P.dev, cold);
+        // a group's blobs into the MMQ layout of a group buffer (peer_down_at)
         const size_t gub = mmq_gub, gb = mmq_gb, ub = mmq_ub, db = mmq_db, down_at = peer_down_at(mmq_plan());
         const bool native = lay.native;
         const size_t up_off = f.up_off, down_off = f.down_off, tail = f.tail, bytes = f.bytes;
@@ -105,7 +119,16 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             uint8_t* grp_d = grp + down_at;
             for (size_t q = 0; q < blobs.size(); ++q) {
                 const uint8_t* bd = blobs[q].first;
-                if (native)
+                if (!blobs[q].second) {
+                    const auto s = (cudaStream_t) stream;
+                    uint8_t* gu = grp + q * gub;
+                    cudaMemcpyAsync(gu, bd, gb, cudaMemcpyHostToDevice, s);
+                    cudaMemcpyAsync(gu + gb, bd + up_off, ub, cudaMemcpyHostToDevice, s);
+                    cudaMemcpyAsync(grp_d + q * db, bd + down_off, db, cudaMemcpyHostToDevice, s);
+                    if (tail)
+                        cudaMemcpyAsync(grp_scales(grp_d) + 4 * q, bd + bytes - tail,
+                                        4 * sizeof(float), cudaMemcpyHostToDevice, s);
+                } else if (native)
                     mmq::gather_native(bd, bd + up_off, gb, bd + down_off, db, grp + q * gub, grp_d + q * db, stream,
                                        tail ? bd + bytes - tail : nullptr, grp_scales(grp_d) + 4 * q, ub);
                 else
@@ -114,12 +137,29 @@ bool Prefill::Run::Chunk::Experts::Group::peer_experts() {
             cudaMemsetAsync(grp + blobs.size() * gub, 0, MMQ_TAIL, (cudaStream_t) stream);
             cudaMemsetAsync(grp_d + blobs.size() * db, 0, MMQ_TAIL, (cudaStream_t) stream);
         };
-        L.act = [native, tail, down_at](const float* gu, float* h, const PeerShare::Launch& lv, void* stream) {
+        L.pack_activation = [native, tail, down_at, dt = mmq_dt](const float* gu, void* hq, const PeerShare::Launch& lv, void* stream) {
             const float* sc = native && tail ? grp_scales((uint8_t*) lv.stage + down_at) + 4 * lv.q0 : nullptr;
-            mmq::swiglu(gu, h, lv.rows, 640, !native, stream, sc, lv.bounds, lv.n);
+            mmq::swiglu_quantize(gu, hq, dt, lv.rows, 640, !native, stream, sc, lv.bounds, lv.n);
         };
+        if (const auto* adapter = m.peer_lora) {
+            const auto name = core::LayerView(*m.wt, l).name("ffn_down_exps.weight");
+            const float* a = adapter->input_factor(name);
+            L.post_down = [a, b = adapter->output_factor(), scale = adapter->scale(), ids = order_peer,
+                           native, tail, down_at](const float* gu, float* h, const PeerShare::Launch& lv, void* stream) {
+                const float* sc = native && tail ? grp_scales((uint8_t*) lv.stage + down_at) + 4 * lv.q0 : nullptr;
+                mmq::swiglu(gu, h, lv.rows, 640, !native, stream, sc, lv.bounds, lv.n);
+                for (int q = 0; q < lv.n; ++q) {
+                    const int32_t expert = ids[lv.expert_begin + (size_t) q];
+                    const int first = lv.bounds_host[q];
+                    const int rows = lv.bounds_host[q + 1] - first;
+                    basalt::kernels::atomic_lora_project(h + (size_t) first * 640, a + (size_t) expert * 640,
+                        b, nullptr, rows, 640, (int) N, scale, lv.out + (size_t) first * N, stream);
+                }
+            };
+        }
     }
-    return P.share->run(L, m.mixed, (int) T, ex, m.Dm + (size_t) rows_local * N, m.cs, err);
+    return P.share->run(L, m.mixed, (int) T, ex, m.Dm + (size_t) rows_local * N, m.cs, err,
+                        !peer_fp4, packed_tail_rows);
 }
 
 }  // namespace basalt::prefill

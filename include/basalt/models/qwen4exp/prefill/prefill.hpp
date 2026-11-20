@@ -26,6 +26,8 @@
 namespace basalt::core { class PeerExperts; }
 namespace basalt::kernels::cpu { class ExpertPool; }
 
+namespace basalt::qwen4exp { class AtomicLora; class AtomicLoraDevice; class SwiftLoraDevice; }
+
 namespace basalt::prefill {
 
 struct PrefillStats {
@@ -54,6 +56,9 @@ public:
     /// drafts may differ, never the target's tokens' logits.
     bool draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
                   std::string& err);
+    bool draft_kv(core::MtpDrafter& mtp, const float* rows, const int32_t* next_tokens, int64_t n, int64_t cell0,
+                  std::string& err, bool fp16_rows);
+    bool copy_draft_rows_fp16(const float* rows, void* host, int64_t count, std::string& err);
     Prefill();
     ~Prefill();
     Prefill(const Prefill&) = delete;
@@ -74,6 +79,8 @@ public:
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    uint64_t workspace_bytes() const;
+    bool workspace_borrowed() const;
     int64_t chunk() const;
     /// The next runs read their first chunk with at most `tokens` tokens (0: every chunk is `chunk()` long), so the
     /// rows it waits for before layer 1 are few; the chunks after it are `chunk()` long.
@@ -81,6 +88,10 @@ public:
     /// Points the prompt path at another session's state (a view of `ss` with a batch slot's state fields) for the
     /// next runs; the buffers and the layer range stay.
     void set_session(core::SessionState& ss);
+    void bind_lora(const basalt::qwen4exp::AtomicLoraDevice* adapter,
+                   const basalt::qwen4exp::AtomicLoraDevice* peer_adapter = nullptr);
+    void bind_swift_lora(const basalt::qwen4exp::SwiftLoraDevice* adapter);
+    void set_cpu_lora(const basalt::qwen4exp::AtomicLora* adapter, float scale);
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all); sizes the prompt path's
     /// lend cap.
@@ -89,6 +100,9 @@ public:
     /// The chunk size from which every expert streams (below it only the routed experts are staged and the peer card
     /// computes the rows of its own); before init, which sizes the buffers by it.  Default 1024.
     static void set_stream_all_min(int64_t tokens);
+
+    /// Reserve streamed MMQ scratch alongside the fused expert layout before sizing prefill.
+    static void set_lora_fallback(bool enabled);
 
     /// The streamed ring's depth for the layouts made from now on (`relayout`, `bytes_needed`, `ring_slots_for`); at
     /// most the one `init` laid out.  A shallower ring takes fewer of the lent cache slots.
@@ -218,6 +232,7 @@ private:
     Prefill* next_ = nullptr;
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    bool hand_on_device_ = false;      ///< the hand-off already landed in this stage's rows
     bool rows_in_place_ = false;        ///< the next run's rows are in this stage's own buffers (continue_in_place)
     bool keep_last_ = false;            ///< set_keep_last
 

@@ -25,6 +25,7 @@ bool Verifier::WindowRecorder::ple_fork() {
         copy_from_mapped(v_.ple_, v_.m_ple_, (int64_t) T * N, v_.ple_s_);
         bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.key_bf16, v_.ple_key_, HC * N, N, HC * N, T, v_.ple_s_);
         bf16_gemv_fp32_mmvf_multi(v_.ple_, N, ss.ple.w.value_bf16, v_.ple_val_, N, N, N, T, v_.ple_s_);
+        ple_value_lora(ss.ple.w, v_.ple_, v_.ple_val_, T, (int) N, v_.ple_s_);
         cudaEventRecord(v_.ev_ple_join_, v_.ple_s_);
     } catch (const std::exception& e) {
         err = std::string("verify PLE side: ") + e.what();
@@ -62,7 +63,15 @@ bool Verifier::WindowRecorder::inputs() {
     if (v_.batch_rec_) {   // the segment tables: which slot each row is
         copy_i32_from_mapped((int32_t*) v_.segb_, (const int32_t*) v_.m_segb_, (int64_t) T * 8, cs);
         copy_i32_from_mapped((int32_t*) v_.d_qrows_, (const int32_t*) v_.m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs);
-        if (ple_on) ple_hist_gather(v_.ple_work_, v_.d_ple_slots_, v_.segb_, HS, T, cs);
+        static_assert(sizeof(QsaSegSlot) % sizeof(int32_t) == 0);
+        const auto q_words = (int64_t) g.n_qsa_layers() * MT * (sizeof(QsaSegSlot) / sizeof(int32_t));
+        if (q_words)
+            copy_i32_from_mapped((int32_t*) v_.d_qslot_base_, (const int32_t*) v_.m_qslots_, q_words, cs);
+        if (ple_on) {
+            copy_i32_from_mapped((int32_t*) v_.d_ple_slots_, (const int32_t*) v_.m_ple_slots_,
+                                 (int64_t) T * (sizeof(float*) / sizeof(int32_t)), cs);
+            ple_hist_gather(v_.ple_work_, v_.d_ple_slots_, v_.segb_, HS, T, cs);
+        }
     }
     // per-row positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     pos_k = v_.pos_ + MT * NH;
@@ -77,7 +86,7 @@ bool Verifier::WindowRecorder::inputs() {
         copy_from_mapped(v_.bo_, hin + (size_t) T * HC * N, (int64_t) T * N, cs);
         copy_from_mapped(v_.inj2_, hin + (size_t) T * (HC + 1) * N, (int64_t) T * HC, cs);
     } else if (const NativeEmbed* ne = native_embed()) {   // the GGUF-form table
-        ne->gather_dev(v_.tok_, T, v_.emb_, cs);
+        ne->gather_dev(v_.tok_, T, v_.emb_, cs, v_.batch_rec_ ? v_.m_adapter_scale_ : nullptr);
         broadcast_streams(v_.emb_, v_.R_, N, (int) HC, T, cs);
     } else {
         const WeightRef* w = wt.find("token_embd.weight");

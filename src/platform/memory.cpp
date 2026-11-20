@@ -596,9 +596,10 @@ std::string commit_headroom_note() {
 
 
 static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes, bool ready_only) {
     mapping_base = nullptr;
     mapping_bytes = 0;
+    (void) ready_only;
     if (!shared_file.empty()) {
         note = "shared arena files are not available on Windows";
         return nullptr;
@@ -729,10 +730,11 @@ struct SharedArenaHeader {
     uint64_t reserved[4];
 };
 static_assert(sizeof(SharedArenaHeader) <= kSharedArenaHeaderBytes);
+constexpr uint64_t kExpertPayloadReady = 0x4558504552545631ull;
 }  // namespace
 
 static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
+                              uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes, bool ready_only) {
     mapping_base = nullptr;
     mapping_bytes = 0;
     if (!shared_file.empty()) {
@@ -745,7 +747,7 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
             return nullptr;
         }
         const uint64_t file_bytes = kSharedArenaHeaderBytes + bytes;
-        const int fd = open(shared_file.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        const int fd = open(shared_file.c_str(), O_RDWR | O_CLOEXEC | (ready_only ? 0 : O_CREAT), 0600);
         if (fd < 0) {
             note = "cannot open shared arena " + shared_file + ": " + std::strerror(errno);
             return nullptr;
@@ -759,6 +761,11 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
         }
 
         const bool fresh = st.st_size == 0;
+        if (ready_only && fresh) {
+            close(fd);
+            note = "shared arena has no published payload";
+            return nullptr;
+        }
         if (fresh) {
             if (ftruncate(fd, (off_t) file_bytes) != 0) {
                 const int e = errno;
@@ -805,6 +812,11 @@ static void* alloc_region_raw(uint64_t bytes, RegionBacking& got, std::string& n
                               shared_file.c_str(), (unsigned long long) hdr.arena_hash,
                               (unsigned long long) shared_hash);
                 note = b;
+                return nullptr;
+            }
+            if (ready_only && hdr.reserved[0] != kExpertPayloadReady) {
+                close(fd);
+                note = "shared arena has no published payload";
                 return nullptr;
             }
         }
@@ -876,8 +888,8 @@ bool pin_budget(uint64_t&, std::string&, const char*, uint32_t, bool) { return f
 #endif
 
 void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const std::string& shared_file,
-                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes) {
-    void* p = alloc_region_raw(bytes, got, note, shared_file, shared_hash, mapping_base, mapping_bytes);
+                   uint64_t shared_hash, void*& mapping_base, uint64_t& mapping_bytes, bool ready_only) {
+    void* p = alloc_region_raw(bytes, got, note, shared_file, shared_hash, mapping_base, mapping_bytes, ready_only);
     if (p != nullptr && mapping_base == nullptr) {   // not a file mapping: the region is what gets released
         mapping_base = p;
         mapping_bytes = bytes;
@@ -885,6 +897,23 @@ void* alloc_region(uint64_t bytes, RegionBacking& got, std::string& note, const 
     return p;
 }
 
+
+bool shared_arena_ready(const void* mapping) {
+#if defined(_WIN32)
+    (void) mapping;
+    return false;
+#else
+    return mapping && static_cast<const SharedArenaHeader*>(mapping)->reserved[0] == kExpertPayloadReady;
+#endif
+}
+
+void publish_shared_arena(void* mapping) {
+#if defined(_WIN32)
+    (void) mapping;
+#else
+    static_cast<SharedArenaHeader*>(mapping)->reserved[0] = kExpertPayloadReady;
+#endif
+}
 
 uint64_t system_page_size() {
 #if defined(_WIN32)

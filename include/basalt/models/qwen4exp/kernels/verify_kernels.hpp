@@ -85,7 +85,7 @@ struct SegRow {
     int32_t j;         // this row's index in its segment
     int32_t n;         // the segment's rows
     int32_t n_keep;    // rows of the segment to commit
-    int32_t slot;      // the sequence's slot
+    int32_t segment;   // the segment ordinal in the current window
     int32_t pos;       // this row's position
 };
 static_assert(sizeof(SegRow) == 32, "SegRow is copied as eight words");

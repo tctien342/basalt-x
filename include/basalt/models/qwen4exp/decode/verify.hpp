@@ -27,6 +27,7 @@
 #include "basalt/core/expert_source.hpp"
 #include "basalt/models/qwen4exp/decode/layer.hpp"
 #include "basalt/models/qwen4exp/decode/session.hpp"
+#include "basalt/models/qwen4exp/kernels/rope_scaling.hpp"
 #include "basalt/kernels/sampler.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa_seg.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
@@ -43,6 +44,8 @@
 
 namespace basalt::kernels::cpu { class ExpertPool; }
 namespace basalt::kernels { struct DmMixLayer; }
+
+namespace basalt::qwen4exp { class AtomicLoraDevice; class SwiftLoraDevice; }
 
 namespace basalt::core {
 
@@ -117,6 +120,11 @@ public:
     void set_main_priority(bool high) { main_high_ = high; }
     /// The peer expert tier the window drives itself (persistent kernel, mapped rings) instead of the pool launching it
     /// per layer.  Before init.
+    void bind_lora(const basalt::qwen4exp::AtomicLoraDevice* adapter,
+                   const basalt::qwen4exp::AtomicLoraDevice* peer_adapter = nullptr) {
+        lora_ = adapter;
+        peer_lora_ = peer_adapter;
+    }
     void set_peer(PeerExperts* peer) { peer_ = peer; }
     /// A further peer card's expert tier, served like the first by a persistent kernel of its own (its own ring,
     /// doorbell and done word); only with the device-planned MoE tail.  Before init, after set_peer.
@@ -127,11 +135,23 @@ public:
     void set_cpu_warm(basalt::kernels::cpu::ExpertPool* pool, ExpertSource* src) { warm_pool_ = pool; warm_src_ = src; }
     /// Opt-in routing changes, each of which changes the output; before init, and only with the device-planned MoE
     /// tail (otherwise init switches them off).  Route tail skip: see `kernels::route_tail_skip` (0 = off).
+    void bind_swift_lora(const basalt::qwen4exp::SwiftLoraDevice* adapter) { swift_lora_ = adapter; }
+    void set_solo_swift(bool active) { swift_solo_window_ = swift_lora_ && active; }
     void set_route_tail_skip(int rank) { route_tail_skip_ = rank; }
-    /// Residency-biased routing: see `kernels::route_prior_top10` (0 = off).
+    /// Residency-biased routing: see `kernels::route_prior_topk` (0 = off).
     void set_route_prior(float lambda) { route_prior_ = lambda; }
     /// What the routing changes did since the start, one line each; empty when none applied.
     std::vector<std::string> route_report() const;
+    struct PcieWindow {
+        int eligible = 0, staged = 0, misses = 0;
+        uint64_t staged_bytes = 0;
+        int staged_rows = 0;
+    };
+    bool batch_pcie_tunable() const;
+    bool prepare_batch_pcie(int rows, int pinned_q8, double bandwidth_gbps, double hard_cap, std::string& err);
+    PcieWindow batch_pcie_window();
+    bool batch_pcie_active() const { return batch_pcie_active_; }
+    std::string take_batch_pcie_budget_report();
 
     /// The watchdog's view of the window in flight: the layer, the GPU's sequence, the flags.
     void diag(std::FILE* f) const;
@@ -148,10 +168,11 @@ public:
 
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-              const NativeHead* head, int max_t, std::string& err);
+              const NativeHead* head, int max_t, std::string& err, int routed_k = 0, int first_wide_layer = 0);
     /// The window capacity in rows given to init.  A batch planner must never build a window with more rows than this;
     /// kVerifyMaxT only bounds the graphs, not this verifier.
     int max_t() const { return max_t_; }
+    uint64_t arena_bytes() const { return arena_bytes_; }
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
@@ -290,6 +311,8 @@ public:
     // No drafting here: the caller supplies the tokens of every segment.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
+    bool append_shared_slot(SessionState& slot, std::string& err);
+    void undo_shared_slot_append();
     int n_slots() const { return (int) slots_.size(); }
     /// Captures every window width's graph now (the solo windows, and the batch windows when slots exist), so no
     /// request pays a capture while others decode.  After the verifier is configured.
@@ -339,6 +362,14 @@ public:
         bh_len_ = len;
         if (next_) next_->set_batch_history(rows, len);
     }
+    void set_slot_adapter_scale(int slot, float scale, float swift_scale = 0.0f) {
+        if (slot >= 0 && slot < (int) slot_adapter_scale_.size()) {
+            slot_adapter_scale_[(size_t) slot] = scale;
+            slot_swift_scale_[(size_t) slot] = swift_scale;
+        }
+        if (next_) next_->set_slot_adapter_scale(slot, scale, swift_scale);
+    }
+    const float* batch_adapter_scales() const { return h_adapter_scale_; }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
     /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
@@ -417,6 +448,7 @@ private:
     bool gs_move(bool to_peer, std::string& err);
     bool dm_sync(std::string& err);        ///< the residency tables to the devices, before a window
     bool dm_begin(std::string& err, DecodeGaps* gm);   ///< the tail's window start (tables, flags, the peer window)
+    void report_dm_wait(int rows);
     bool dm_stage_places(std::string& err);            ///< the staged share's RAM addresses, read again when they moved
     bool dm_end(std::string& err);         ///< the peer window's end
     void dm_free();
@@ -465,10 +497,12 @@ private:
     bool pdl_off_ = false;                 ///< ... a window failed to capture with it: the later ones go without
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
+    bool batch_pcie_timing_ = false;       ///< the graph records completion times for the layer cost model
+    bool batch_pcie_active_ = false;       ///< use the staged variant of the batch graph
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
-    /// One window graph per (hand-off base, row count, doorbell variant) and one commit graph per row count.  Which
+    /// Window and commit graphs also depend on the RoPE profile captured by the indexer. Which
     /// slots the rows are is data (the staged segment tables), so a membership change re-records nothing.
     std::map<uint64_t, cudaGraphExec_t> exec_bm_;
     std::map<int, cudaGraphExec_t> commit_bm_;
@@ -479,8 +513,11 @@ private:
     std::chrono::steady_clock::time_point commit_t0_;   ///< commit_slots_begin
     std::vector<int> commit_next_keep_;                 ///< its counts, for the next stage
     uint64_t bkey(int S, int hbase) const {
-        return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull);
+        return batch_key(S, hbase) | (ar_off_ ? (1ull << 63) : 0ull) | (swift_batch_window_ ? (1ull << 62) : 0ull) |
+               (static_cast<uint64_t>(basalt::kernels::rope_context_index()) << 60) |
+               (batch_pcie_active_ ? (1ull << 59) : 0ull) | (batch_pcie_timing_ ? (1ull << 58) : 0ull);
     }
+    static int commit_batch_key(int rows, int context) { return rows * basalt::kernels::kRopeContexts + context; }
     static uint64_t batch_key(int S, int hbase) { return (uint64_t) hbase << 40 | (uint64_t) S << 32; }
     /// Instantiates a finished batch capture as the executable of a new key.
     bool instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::string& err, bool priority = false);
@@ -490,6 +527,12 @@ private:
     std::chrono::steady_clock::time_point b_last_;
     int32_t b_out_[8] = {};
     std::vector<basalt::kernels::SamplerParams> slot_sp_;
+    std::vector<float> slot_adapter_scale_;
+    float* h_adapter_scale_ = nullptr;
+    float* m_adapter_scale_ = nullptr;
+    std::vector<float> slot_swift_scale_;
+    float* h_swift_scale_ = nullptr;
+    float* m_swift_scale_ = nullptr;
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -503,10 +546,12 @@ private:
     basalt::kernels::QsaSeg* h_qseg_ = nullptr; basalt::kernels::QsaSeg* m_qseg_ = nullptr;
     basalt::kernels::QsaSeg* d_qrows_ = nullptr;   ///< kQsaSegMaxRows row entries, then the segment entries
     basalt::kernels::QsaSeg* d_qsegs_ = nullptr;
-    std::vector<basalt::kernels::QsaSegSlot*> d_qslots_;   ///< per QSA layer ordinal: [slot] (null outside the stage)
-    float** d_ple_slots_ = nullptr;        ///< each slot's PLE history
+    basalt::kernels::QsaSegSlot *h_qslots_ = nullptr, *m_qslots_ = nullptr, *d_qslot_base_ = nullptr;
+    std::vector<basalt::kernels::QsaSegSlot*> d_qslots_;   ///< per QSA layer ordinal: [segment]
+    float **h_ple_slots_ = nullptr, **m_ple_slots_ = nullptr, **d_ple_slots_ = nullptr; ///< window segments
     float* ple_work_ = nullptr;            ///< each row's PLE history while the window runs
     bool batch_dm_ = false;                ///< a batch window runs the device-planned tail
+    bool batch_shared_residency_ = false;
     bool batch_stream_ = false;            ///< a slot's QSA K/V is streamed: batch windows resolve before attending
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
@@ -565,13 +610,24 @@ private:
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
 
+    const basalt::qwen4exp::AtomicLoraDevice* lora_ = nullptr;
+    const basalt::qwen4exp::AtomicLoraDevice* peer_lora_ = nullptr;
+    const basalt::qwen4exp::SwiftLoraDevice* swift_lora_ = nullptr;
+    float* swift_scratch_ = nullptr;
+    float* swift_shared_scratch_ = nullptr;
+    bool swift_solo_window_ = false;
+    bool swift_batch_window_ = false;
     const WeightTable* wt_ = nullptr;
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
     VerifyHits hits_;
     const NativeHead* head_ = nullptr;
     int max_t_ = 0;
+    int routed_k_ = 0;
+    int first_wide_layer_ = 0;
+    int layer_k(int64_t layer) const { return layer < first_wide_layer_ ? 10 : routed_k_; }
     int last_t_ = 0;
+    int last_rope_context_ = 0;
     int64_t last_pos0_ = 0;
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
@@ -588,11 +644,17 @@ private:
     cudaStream_t ple_s_ = nullptr;   // layer 1's PLE projections, from the window's start
     cudaEvent_t ev_ple_fork_ = nullptr, ev_ple_join_ = nullptr;
     bool ple_side_ = false;          // the window's graph computes them there (the host raises h_flag_[8] with the rows)
-    cudaGraphExec_t exec_[9] = {};
-    cudaGraphExec_t exec_nr_[9] = {};   // the doorbell variant of a stage that is all-resident otherwise
-    cudaGraphExec_t commit_exec_ = nullptr;
+    static constexpr int solo_widths = 9;
+    static constexpr int solo_graphs = 2 * solo_widths * basalt::kernels::kRopeContexts;
+    int solo_graph_index(int rows) const {
+        return rows + solo_widths * (2 * basalt::kernels::rope_context_index() + int(swift_solo_window_));
+    }
+    cudaGraphExec_t exec_[solo_graphs] = {};
+    cudaGraphExec_t exec_nr_[solo_graphs] = {};   // the doorbell variant of a stage that is all-resident otherwise
+    cudaGraphExec_t commit_exec_[basalt::kernels::kRopeContexts] = {};
     struct SoloGraphs {
-        cudaGraphExec_t exec[9] = {}, exec_nr[9] = {}, commit = nullptr;
+        cudaGraphExec_t exec[solo_graphs] = {}, exec_nr[solo_graphs] = {};
+        cudaGraphExec_t commit[basalt::kernels::kRopeContexts] = {};
     };
     std::map<SessionState*, SoloGraphs> solo_sets_;   // the solo graphs of the sessions not bound now
 
@@ -659,6 +721,7 @@ private:
 
     // device
     void* arena_ = nullptr;
+    uint64_t arena_bytes_ = 0;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;

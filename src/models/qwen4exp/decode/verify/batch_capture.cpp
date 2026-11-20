@@ -18,7 +18,7 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
     const uint64_t key = bkey(R, hbase);
     cudaGraphExec_t& ex = exec_bm_[key];
     if (ex != nullptr) return true;
-    const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
+    const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_ && !swift_batch_window_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
         basalt::log::warn("basalt verify", "the %d-row batch window failed with programmatic dependent launch (%s): "
@@ -52,7 +52,7 @@ bool Verifier::capture_batch(int R, int hbase, std::string& err) {
         if (pdl_try) return retry_plain(err);
         return false;
     }
-    basalt::log::info("basalt verify", "captured the batch window for %d rows", R);
+    basalt::log::info("basalt verify", "captured the%s batch window for %d rows", swift_batch_window_ ? " Swift" : "", R);
     return true;
 }
 
@@ -67,7 +67,7 @@ bool Verifier::instantiate_batch(cudaGraphExec_t& ex, cudaGraph_t graph, std::st
 }
 
 bool Verifier::capture_commit_batch(int R, std::string& err) {
-    cudaGraphExec_t& cex = commit_bm_[R];
+    cudaGraphExec_t& cex = commit_bm_[commit_batch_key(R, basalt::kernels::rope_context_index())];
     if (cex != nullptr) return true;
     using namespace basalt::kernels;
     const ModelGeometry& g = *g_;
@@ -83,7 +83,7 @@ bool Verifier::capture_commit_batch(int R, std::string& err) {
     }
     bool ok = true;
     try {
-        copy_i32_from_mapped(commitb_, m_commitb_, (int64_t) slots_.size() * CB, cs_);
+        copy_i32_from_mapped(commitb_, m_commitb_, (int64_t) R * CB, cs_);
         copy_i32_from_mapped((int32_t*) segb_, (const int32_t*) m_segb_, (int64_t) R * 8, cs_);
         copy_i32_from_mapped((int32_t*) d_qrows_, (const int32_t*) m_qseg_, (int64_t) (kQsaSegMaxRows + 8) * 4, cs_);
         int64_t qsa_index = 0, gdn_index = 0;

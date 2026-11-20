@@ -4,6 +4,7 @@
 namespace basalt::models::qwen4exp::generate {
 
 int resident_plan(Context& context) {
+    const auto started = Clock::now();
     auto& o = *context.o;
     auto& set_stream_all_min = context.set_stream_all_min;
     auto& err = *context.err;
@@ -67,10 +68,10 @@ int resident_plan(Context& context) {
     // The largest chunk --prefill auto may pick: the operator's ceiling (--prefill auto:N) and never past the context,
     // but never below 8192.  A bare `auto` is cut back once the RAM complement is built (below) to what the lend can
     // fund, and again to the fewest-equal-chunks cap when a prompt is read; without the resident RAM mode there is no
-    // complement to size it from, so it stays at 8192.
+    // reliable RAM backing to size it from, so it stays at 8192. A shared arena holds the complete expert pack.
     const int64_t kMaxAutoChunk = basalt::kernels::cpu::expert_layout().max_blob > (3u << 19) ? 32768 : 16384;
     int64_t auto_ceiling = std::max<int64_t>(8192, std::min<int64_t>(o.prefill_auto_max, o.max_context));
-    if (o.prefill_auto_fit && !o.resident_cpu_experts) auto_ceiling = 8192;
+    if (o.prefill_auto_fit && !o.resident_cpu_experts && o.shared_expert_arena.empty()) auto_ceiling = 8192;
     // The peer tier's fill.  `exclusive` (--peer-exclusive): done before the RAM complement, which then leaves the
     // peer's experts out, so they are read from the file here and held only on the peer.
     auto open_peer = [&](bool exclusive) -> bool {
@@ -81,7 +82,7 @@ int resident_plan(Context& context) {
         const int peer_reserve = o.peer_reserve_mib + (int) ((peer_split_bytes(d0) + peer_prompt_bytes() + (1 << 20) - 1) >> 20);
         if (o.peer_devices.size() <= 1) {
             if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, g.n_embd, g.n_ff, peer_reserve, o.peer_slots,
-                           err, exclusive)) {
+                           err, exclusive, context.before_peer_upload)) {
                 basalt::log::error("basalt generate", "%s", err.c_str());
                 return false;
             }
@@ -317,6 +318,7 @@ int resident_plan(Context& context) {
     context.pool = &pool;
     context.peer_only = &peer_only;
     context.peer_only_bytes = &peer_only_bytes;
+    log_expert_load_phase(context, "resident planning", started);
     return split_plan(context);
 }
 

@@ -2,8 +2,23 @@
 
 #include "basalt/models/qwen4exp/shared_names.hpp"
 #include "helpers.hpp"
+#include "basalt/models/qwen4exp/decode/shared_kv_table.hpp"
+
+namespace basalt::qwen4exp { class SwiftLora; class SwiftLoraDevice; }
 
 namespace basalt::models::qwen4exp::generate {
+
+struct VisionStaging {
+    std::unique_ptr<basalt::vision::CudaEncoder> encoder;
+    std::string error;
+    double seconds = 0;
+};
+
+struct SharedArenaStartup {
+    std::future<std::unique_ptr<basalt::core::ArenaExpertSource>> worker;
+    // Destruction releases a waiting worker before the future joins it.
+    std::promise<void> permit;
+};
 
 // Startup phases keep their resources on the stack until the following phases return.
 // This view borrows those resources without changing their construction or destruction order.
@@ -50,6 +65,9 @@ struct Context {
     uint64_t* cuda0_fixed_bytes = nullptr;
     void ** arena = nullptr;
     basalt::core::WeightTable* wt = nullptr;
+    const basalt::qwen4exp::SwiftLora* swift_host = nullptr;
+    basalt::qwen4exp::SwiftLoraDevice* swift_main = nullptr;
+    basalt::qwen4exp::SwiftLoraDevice* swift_peer = nullptr;
     int32_t ** d_mrope = nullptr;
     std::vector<int32_t>* mrope_host = nullptr;
     std::string* cvec_summary = nullptr;
@@ -59,6 +77,9 @@ struct Context {
     void *const* main_cs = nullptr;
     basalt::core::Doorbell* db = nullptr;
     basalt::kernels::PleTable* ple_table = nullptr;
+    std::future<VisionStaging>* vision_staging = nullptr;
+    SharedArenaStartup* shared_arena_startup = nullptr;
+    std::future<int>* vision_warmup = nullptr;
     basalt::vision::CudaEncoder* vis_enc = nullptr;
     float ** d_parts = nullptr;
     std::vector<std::unique_ptr<GpuStage>>* stages = nullptr;
@@ -70,6 +91,7 @@ struct Context {
     std::vector<int64_t>* slot_cap = nullptr;
     uint64_t* slot_kv_cuda0 = nullptr;
     bool* slot0_is_solo = nullptr;
+    std::vector<std::unique_ptr<basalt::core::SharedKvTable>>* shared_tables = nullptr;
     basalt::core::MtpDrafter* mtp = nullptr;
     const bool* mtp_on = nullptr;
     const basalt::core::QsaState *const* mtp_kv = nullptr;
@@ -124,6 +146,8 @@ struct Context {
     const int64_t* kMaxAutoChunk = nullptr;
     int64_t* auto_ceiling = nullptr;
     std::function<bool(bool)> open_peer;
+    std::function<int()> primary_expert_fill;
+    Clock::time_point expert_fill_started{};
     const bool* adapt_fast_on = nullptr;
     int64_t* lend_from = nullptr;
     std::vector<std::pair<int32_t, int32_t>>* stage_held = nullptr;
@@ -131,6 +155,8 @@ struct Context {
     std::vector<std::pair<int32_t, int32_t>>* peer_only = nullptr;
     uint64_t* peer_only_bytes = nullptr;
     std::vector<std::unique_ptr<PromptStage>>* pstages = nullptr;
+    std::future<bool>* split_ram_reservation = nullptr;
+    std::function<void()> before_peer_upload;
     double* split_host_gbps = nullptr;
     std::function<int64_t()> read_cap;
     const int64_t* kSplitRefCells = nullptr;
@@ -144,9 +170,16 @@ struct Context {
     int64_t* spec_pos = nullptr;
 };
 
+inline void log_expert_load_phase(const Context& context, const char* phase, Clock::time_point started) {
+    if (context.expert_fill_started == Clock::time_point{}) return;
+    basalt::log::info("basalt startup", "expert load phase %s: %.3f s", phase,
+                      std::chrono::duration<double>(Clock::now() - started).count());
+}
+
 int model(Context& context);
 int layer_plan(Context& context);
 int weights(Context& context);
+std::future<VisionStaging> stage_vision(Context& context);
 int vision(Context& context);
 int sessions(Context& context);
 int sources(Context& context);

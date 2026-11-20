@@ -100,7 +100,8 @@ struct Prefill::Run::Chunk::Experts {
     const bool fp4_l = use_mmq && lay.native && mmq_gt == GGML_TYPE_NVFP4 && mmq_dt == GGML_TYPE_NVFP4 &&
                        lay.fmt[(size_t) l].tail != 0 && T >= FP4_MIN_TOKENS;
     const bool fused_nat = use_mmq && stream_all && lay.native && fused::native_supported(mmq_gt, mmq_dt, mmq_ut);
-    const bool fused_l = (use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat;
+    const bool fused_l = m.cpu_lora_scale == 0 &&
+        ((use_mmq && stream_all && !lay.native && fused::enabled()) || fused_nat);
     bool peer_now = false;                // multi-GPU: the peer computed rows of this layer (MMQ path only)
     // CPU share: this layer's CPU experts (rows [T * K - rows_cpu, T * K) of Dm) run on a thread that
     // reads on_cpu, so the future (which waits for the thread) is declared after it
@@ -112,8 +113,9 @@ struct Prefill::Run::Chunk::Experts {
 
 struct Prefill::Run::Chunk::Experts::Group {
     Group(Experts& experts) : experts(experts) {}
-    bool execute();
-    bool group();
+    bool execute(cudaEvent_t ready = nullptr);
+    bool read_routes();
+    bool group(cudaEvent_t ready);
     bool cpu_download();
     void cpu_select();
     bool cpu_start();

@@ -952,6 +952,67 @@ __device__ __noinline__ void hc_top10_item(const float* logits, int32_t* ids, fl
     hc_top10<DBG>(logits, ids, weights, lane, cand, dbg, b, tg, tag);
 }
 
+// Preserve the wide generic selector's FP64 softmax and rank-ordered normalization.
+__device__ __noinline__ void hc_top23(int32_t* ids, float* weights, int lane, double* exponentials,
+                                    const unsigned long long* tagged_logits, unsigned tag) {
+    constexpr int K = 23;
+    constexpr int experts_per_lane = NE / 32;
+    unsigned long long words[experts_per_lane];
+    float logits[experts_per_lane];
+    float maximum = -INFINITY;
+    for (int i = 0; i < experts_per_lane; ++i)
+        words[i] = ld_tagged_raw(tagged_logits + lane + i * 32);
+    tagged_settle(words, tag, [&](int i) { return tagged_logits + lane + i * 32; });
+    for (int i = 0; i < experts_per_lane; ++i) {
+        logits[i] = __uint_as_float((unsigned) words[i]);
+        maximum = fmaxf(maximum, logits[i]);
+    }
+    for (int mask = 16; mask > 0; mask >>= 1)
+        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffffu, maximum, mask));
+    for (int i = 0; i < experts_per_lane; ++i)
+        exponentials[lane + i * 32] = exp((double) logits[i] - (double) maximum);
+    __syncwarp();
+    float inverse = 0.0f;
+    if (lane == 0) {
+        double sum = 0.0;
+        for (int e = 0; e < NE; ++e) sum += exponentials[e];
+        inverse = __double2float_rn(__ddiv_rn(1.0, sum));
+    }
+    inverse = __shfl_sync(0xffffffffu, inverse, 0);
+    for (int i = 0; i < experts_per_lane; ++i)
+        logits[i] = __double2float_rn(exponentials[lane + i * 32] * (double) inverse);
+
+    for (int rank = 0; rank < K; ++rank) {
+        float best = logits[0];
+        int expert = lane;
+        for (int i = 1; i < experts_per_lane; ++i) {
+            if (logits[i] <= best) continue;
+            best = logits[i];
+            expert = lane + i * 32;
+        }
+        for (int mask = 16; mask > 0; mask >>= 1) {
+            const float other = __shfl_xor_sync(0xffffffffu, best, mask);
+            const int other_id = __shfl_xor_sync(0xffffffffu, expert, mask);
+            if (other > best || (other == best && other_id < expert)) {
+                best = other;
+                expert = other_id;
+            }
+        }
+        if ((expert & 31) == lane) logits[expert / 32] = -INFINITY;
+        if (lane == 0) {
+            ids[rank] = expert;
+            weights[rank] = best;
+        }
+    }
+    if (lane == 0) {
+        double sum = 0.0;
+        for (int rank = 0; rank < K; ++rank) sum += (double) weights[rank];
+        sum = fmax(sum, 6.103515625e-05);
+        for (int rank = 0; rank < K; ++rank)
+            weights[rank] = __double2float_rn(__ddiv_rn((double) weights[rank], sum));
+    }
+}
+
 // ---------------------------------------------------------------- the kernel
 // The read is a queue of work items in dependency order: the down items, the up slices, the router rows, the top-10.
 // A CTA claims one item at a time (in claim order) and waits only on items before its own, all of them claimed by
@@ -969,7 +1030,8 @@ struct Items {
     }
 };
 
-constexpr int CAND_WORDS = 2 * NE + 2 * KT;   // hc_top10's shared memory per warp
+constexpr int CAND_WORDS = 2 * NE + 2 * KT;   // selector scratch per warp
+static_assert(CAND_WORDS % 2 == 0 && CAND_WORDS * sizeof(uint32_t) >= NE * sizeof(double));
 
 template <int T, bool DBG>
 __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_constant__ HcLaunch L) {
@@ -1067,7 +1129,7 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             }
             stamp<DBG>(dbg, b, 3, tid);
         } else if (item >= it.t10) {
-            // the top-10 once every router row has stored its logits: warp k takes token k
+            // the selector waits for the router rows; warp k takes token k
             if constexpr (DBG) if (tid == 0) dbg[b * 16 + 15] = 3;
             {   // a down CTA may claim the item: its code once on fixed logits while the router runs
                 const int warp = tid >> 5;
@@ -1080,9 +1142,15 @@ __global__ void __launch_bounds__(THREADS, 1) hc_fused_kernel(const __grid_const
             stamp<DBG>(dbg, b, 8, tid);
             const int k = tid >> 5;
             uint32_t* cand = reinterpret_cast<uint32_t*>(smem) + k * CAND_WORDS;
-            if (k < T)
-                hc_top10_item<DBG>(a.logits + (size_t) k * NE, a.ids + (size_t) k * KT, a.weights + (size_t) k * KT, tid & 31,
-                                   cand, tid < 32 ? dbg : nullptr, b, L.lg64 + (size_t) k * NE, tag);
+            if (k < T) {
+                const size_t offset = (size_t) k * a.router_k;
+                if (a.router_k == 23)
+                    hc_top23(a.ids + offset, a.weights + offset, tid & 31,
+                             reinterpret_cast<double*>(cand), L.lg64 + (size_t) k * NE, tag);
+                else
+                    hc_top10_item<DBG>(a.logits + (size_t) k * NE, a.ids + offset, a.weights + offset, tid & 31,
+                                       cand, tid < 32 ? dbg : nullptr, b, L.lg64 + (size_t) k * NE, tag);
+            }
             if (a.pub_ctr != nullptr) cta_signal(a.pub_ctr + 1, tid);   // the ids are out
             __syncthreads();
             stamp<DBG>(dbg, b, 6, tid);
@@ -1479,7 +1547,7 @@ void hc_fused_read(const HcFusedArgs& a, void* stream) {
     const DevInfo& d = dev_info();
     if (!d.ok || a.T < 1 || a.T > MAXT || !a.R || !a.R_out || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs ||
         !a.mixed || !a.xn || (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev)) ||
-        (a.w_router && (!a.logits || !a.ids || !a.weights)) || (a.apply && a.inj_prev == a.inject_out) ||
+        (a.w_router && (!a.logits || !a.ids || !a.weights || (a.router_k != 10 && a.router_k != 23))) || (a.apply && a.inj_prev == a.inject_out) ||
         (a.pub_ctr && (!a.w_router || !a.xq)) ||
         (a.w_gate_sh && (!a.w_router || !a.gate_sh || (reinterpret_cast<uintptr_t>(a.w_gate_sh) & 15u) != 0)) ||
         (a.xq_sh && !a.w_router)) {

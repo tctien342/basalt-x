@@ -49,7 +49,16 @@ int sources(Context& context) {
             return 1;
         }
     }
-    basalt::core::ArenaExpertSource arena_src;
+    basalt::core::ArenaExpertSource serial_arena;
+    std::unique_ptr<basalt::core::ArenaExpertSource> prepared_arena;
+    if (auto* staged = context.shared_arena_startup) {
+        const auto start = Clock::now();
+        staged->permit.set_value();
+        prepared_arena = staged->worker.get();
+        basalt::log::info("basalt startup", "shared arena early join: %.3f s, prepared=%d",
+                         std::chrono::duration<double>(Clock::now() - start).count(), int(bool(prepared_arena)));
+    }
+    auto& arena_src = prepared_arena ? *prepared_arena : serial_arena;
     basalt::core::ExpertSource* srcp = nullptr;
     if (o.mmap_experts) {
         // The low-RAM mode: the experts come from the model file through the OS cache instead of a pinned copy in
@@ -60,7 +69,8 @@ int sources(Context& context) {
         basalt::log::info("basalt generate", "experts via mmap (--mmap-experts)");
         srcp = &src;
     } else {
-        if (!arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, o.shared_expert_arena)) {
+        if (!prepared_arena &&
+            !arena_src.open(expert_files, g.n_layers, g.n_expert, /*threads=*/6, err, o.shared_expert_arena)) {
             return fatal_start_error(err);
         }
         if (!arena_src.ram_warning().empty())   // said before the load's numbers, which it explains
@@ -80,6 +90,13 @@ int sources(Context& context) {
     context.srcp = &srcp;
     context.pool_store = &pool_store;
     context.auto_resident_bytes = &auto_resident_bytes;
+    if (context.vision_warmup != nullptr) {
+        const auto start = Clock::now();
+        const int status = context.vision_warmup->get();
+        basalt::log::info("basalt startup", "peer vision warm-up join wait %.3f s",
+                         std::chrono::duration<double>(Clock::now() - start).count());
+        if (status != 0) return status;
+    }
     return cache_size(context);
 }
 

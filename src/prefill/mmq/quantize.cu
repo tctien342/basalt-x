@@ -8,11 +8,11 @@
 // One thread quantizes 4 consecutive floats; the 8 threads of a 32-value block share one scale (and, for DS4, the
 // sum of its rounded values times the scale); for D2S6 the 16 threads of 64 values share one scale, and each 16 values
 // keep the sum of their rounded values times it.  Row i of the output is row ids[i] of the input (row i without `ids`).
-template <mmq_q8_1_ds_layout ds_layout>
+template <mmq_q8_1_ds_layout ds_layout, bool swiglu>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2) {
+        const int64_t ne0, const int ne1, const int ne2, MmqSwiglu act) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -38,7 +38,19 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (i0 < ne00) {
+        if constexpr (swiglu) {
+            const float* row = x + base_idx;
+            const float4* scale = mmq_swiglu_scales(act, i01);
+            xi = make_float4(mmq_swiglu_value(row, i00, ne00, act.interleaved, scale),
+                             mmq_swiglu_value(row, i00 + 1, ne00, act.interleaved, scale),
+                             mmq_swiglu_value(row, i00 + 2, ne00, act.interleaved, scale),
+                             mmq_swiglu_value(row, i00 + 3, ne00, act.interleaved, scale));
+        } else {
+            xi = x4[(base_idx + i00)/4];
+        }
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -92,10 +104,12 @@ static __global__ void quantize_mmq_q8_1(
     }
 }
 
-void quantize_mmq_q8_1_cuda(
+template <bool swiglu>
+static void launch_mmq_q8_1(
         const float * x, const int32_t * ids, void * vy, const ggml_type type_x,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, MmqSwiglu act,
+        cudaStream_t stream) {
     GGML_ASSERT(ne00 % 4 == 0);
     GGML_ASSERT(ne0 % QK8_1_MMQ == 0);
 
@@ -105,16 +119,28 @@ void quantize_mmq_q8_1_cuda(
     const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE_MMQ, 1, 1);
     switch (mmq_get_q8_1_ds_layout(type_x)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4><<<num_blocks, block_size, 0, stream>>>(
-                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4, swiglu><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, act);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4><<<num_blocks, block_size, 0, stream>>>(
-                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4, swiglu><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, act);
             break;
         case MMQ_Q8_1_DS_LAYOUT_D2S6:
-            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6><<<num_blocks, block_size, 0, stream>>>(
-                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2);
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6, swiglu><<<num_blocks, block_size, 0, stream>>>(
+                x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, act);
             break;
     }
+}
+
+void quantize_mmq_q8_1_cuda(
+        const float * x, const int32_t * ids, void * vy, const ggml_type type_x,
+        const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+        const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, cudaStream_t stream) {
+    launch_mmq_q8_1<false>(x, ids, vy, type_x, ne00, s01, s02, s03, ne0, ne1, ne2, ne3, {}, stream);
+}
+
+void quantize_mmq_swiglu_q8_1_cuda(const float* gu, void* vy, ggml_type type_x, int64_t n_ff, int64_t padded_cols,
+                                  int64_t rows, MmqSwiglu act, cudaStream_t stream) {
+    launch_mmq_q8_1<true>(gu, nullptr, vy, type_x, n_ff, 2 * n_ff, 0, 0, padded_cols, rows, 1, 1, act, stream);
 }

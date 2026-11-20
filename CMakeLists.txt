@@ -137,6 +137,8 @@ target_link_libraries(model PUBLIC artifact warnings)
 
 if(BASALT_MODEL_QWEN4EXP)
 add_library(model_qwen4exp STATIC src/models/qwen4exp/adapter.cpp src/models/qwen4exp/flags.cpp
+  src/models/qwen4exp/atomic_lora.cpp
+  src/models/qwen4exp/swift_lora.cpp
   src/models/qwen4exp/tokenizer/pretok_qwen35.cpp
   src/models/qwen4exp/load/engine_local.cpp
   src/models/qwen4exp/serve/probe_peer.cpp
@@ -1390,7 +1392,9 @@ foreach(_isa avx2 avx512)
   add_library(ggml_dots_${_isa} OBJECT src/kernels/cpu/ggml/ggml_cpu_dots.c)
   target_include_directories(ggml_dots_${_isa} PRIVATE include src/kernels/cpu/ggml)
   target_compile_options(ggml_dots_${_isa} PRIVATE ${_ggml_dots_${_isa}_flags})
-  target_compile_definitions(ggml_dots_${_isa} PRIVATE ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa})
+  target_compile_definitions(ggml_dots_${_isa} PRIVATE
+    ggml_get_type_traits_cpu=ggml_get_type_traits_cpu_${_isa}
+    basalt_q5_0_q8_0_rows=basalt_q5_0_q8_0_rows_${_isa})
   set_target_properties(ggml_dots_${_isa} PROPERTIES C_STANDARD 11 C_EXTENSIONS ON POSITION_INDEPENDENT_CODE ON)
 endforeach()
 # part of kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's

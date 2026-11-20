@@ -190,7 +190,9 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
             if (warm_next) dm_warm(a, sm, xq, w_tok, w_layer, ring + 1u, wlog, wlist, 0u);
             continue;
         }
-        const int n_tok = min(hdr->n_tok, kVerifyMaxT), layer = hdr->layer, n = n_tok * a.k;
+        const int n_tok = min(hdr->n_tok, kVerifyMaxT), layer = hdr->layer;
+        const int k = layer < a.first_wide_layer ? 10 : a.k;
+        const int n = n_tok * k;
         w.layer = layer; w.n_tok = n_tok; w.n = n;
         unsigned long long blob = 0ull;   // a peer entry's blob, loaded while the block groups
         if (tid < n) {
@@ -202,7 +204,7 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         __syncthreads();
         dm_group(sm.ids, sm.kind, n, 2, tid, sm.first, sm.cnt, sm.gstart, sm.gidx, sm.pos, sm.start, &sm.ng, &sm.ne);
         if (tid < n && sm.kind[tid] == 2) {
-            sm.tok[sm.pos[tid]] = tid / a.k;
+            sm.tok[sm.pos[tid]] = tid / k;
             sm.dst[sm.pos[tid]] = tid;
             if (sm.first[tid]) sm.gptr[sm.gidx[tid]] = blob;
         }
@@ -216,7 +218,10 @@ __global__ void __launch_bounds__(kDmThreads, 4) dm_peer_kernel(DmPeerArgs a) {
         if (big && tid == 0) dm_abort(w, &sm, 2u, 0u, -1, 0u, 0u);
         stamp(s, 2);
         if (!bad && !big) {
-            dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0, &w);
+            const float scale = !a.lora_rows && a.lora_scale ? *a.lora_scale : 0;
+            const float* factor = (a.lora_rows || scale != 0) ? a.lora_routed[layer] : nullptr;
+            dm_experts_any<Q2>(sm, xq, a.lay[layer], gate, up, a.rows_m, done, blockIdx.x, nb, a.gu2 != 0,
+                                &w, a.rows_fp16, factor, a.lora_b, scale, a.lora_rows);
         }
         stamp(s, 3);
         __threadfence_system();

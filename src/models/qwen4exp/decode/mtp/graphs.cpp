@@ -26,21 +26,21 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
 }  // namespace
 
 bool MtpDrafter::capture_prefill(int T, std::string& err) {
-    if (prefill_exec_[T]) return true;
+    if (prefill_exec_[basalt::kernels::rope_context_index()][T]) return true;
     using namespace basalt::kernels;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     copy_i32_from_mapped(tok_, m_tok_, T, cs_);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) T * g_->n_head, cs_);
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T)
-    return finish_capture(cs_, ok, prefill_exec_[T], "prefill", err);
+    return finish_capture(cs_, ok, prefill_exec_[basalt::kernels::rope_context_index()][T], "prefill", err);
 }
 
 bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
-    if (prefill_dev_exec_[T]) return true;
+    if (prefill_dev_exec_[basalt::kernels::rope_context_index()][T]) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_forward(T, -1, cs_, err);   // K/V only, rows [0, T); tok_/step_/pos_ filled before launch
-    return finish_capture(cs_, ok, prefill_dev_exec_[T], "prefill (device inputs)", err);
+    return finish_capture(cs_, ok, prefill_dev_exec_[basalt::kernels::rope_context_index()][T], "prefill (device inputs)", err);
 }
 
 // The round: the catch-up's K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
@@ -99,7 +99,7 @@ bool MtpDrafter::record_step(int j, bool copy_records, std::string& err) {
 }
 
 bool MtpDrafter::capture_round(int T, std::string& err) {
-    cudaGraphExec_t& exec = round_exec_[tier_][T];
+    cudaGraphExec_t& exec = round_exec_[basalt::kernels::rope_context_index()][tier_][T];
     if (exec) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_round(T, false, err);
@@ -107,7 +107,7 @@ bool MtpDrafter::capture_round(int T, std::string& err) {
 }
 
 bool MtpDrafter::capture_step(int j, std::string& err) {
-    cudaGraphExec_t& exec = step_exec_[tier_][j];
+    cudaGraphExec_t& exec = step_exec_[basalt::kernels::rope_context_index()][tier_][j];
     if (exec) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
     const bool ok = record_step(j, true, err);

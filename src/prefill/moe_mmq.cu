@@ -98,18 +98,8 @@ __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ 
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff;
     const float* row = gu + r * 2 * n_ff;
-    float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
-    if (tail == nullptr) {
-        h[i] = g / (1.0f + __expf(-g)) * u;
-        return;
-    }
-    // the row's expert: the last q with bounds[q] <= r
-    int q = 0;
-    while (q + 1 < n && bounds[q + 1] <= r) ++q;
-    const float4 s = tail[q];   // {s_gate, s_up, s_down, -}
-    g *= s.x;
-    u *= s.y;
-    h[i] = g / (1.0f + __expf(-g)) * u * s.z;
+    const auto* scale = mmq_swiglu_scales({interleaved, tail, bounds, n}, r);
+    h[i] = mmq_swiglu_value(row, k, n_ff, interleaved, scale);
 }
 
 __global__ void iota_kernel(int32_t* dst, int64_t n) {
@@ -325,6 +315,15 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved,
                                                                            (const float4*) tail, bounds, n);
     ck(cudaGetLastError(), "swiglu");
+}
+
+void swiglu_quantize(const float* gu, void* hq, int type, int64_t rows, int64_t n_ff, bool interleaved,
+                     void* stream, const float* tail, const int32_t* bounds, int n) {
+    if (rows <= 0) return;
+    if (bounds == nullptr || n <= 0) tail = nullptr;
+    quantize_mmq_swiglu_q8_1_cuda(gu, hq, (ggml_type) type, n_ff, pad512(n_ff), rows,
+                                 {interleaved, (const float4*) tail, bounds, n}, (cudaStream_t) stream);
+    ck(cudaGetLastError(), "swiglu_quantize");
 }
 
 void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream) {

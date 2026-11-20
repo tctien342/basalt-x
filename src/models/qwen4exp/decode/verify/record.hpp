@@ -10,6 +10,9 @@
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/swift_lora.hpp"
+#include "basalt/models/qwen4exp/kernels/swift_lora.hpp"
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -26,6 +29,16 @@ struct Verifier::WindowRecorder {
     bool qsa(int64_t l, const LayerView& v, bool read_q8);
     bool post(int64_t l);
     bool head();
+    const float* swift_scale() const { return v_.batch_rec_ ? v_.m_swift_scale_ : v_.swift_lora_->scale(); }
+    void swift_project(const LayerView& layer, const char* suffix, const float* x, float* y,
+                       int inputs, int outputs) const {
+        if (!use_swift) return;
+        const auto name = layer.name(suffix);
+        const auto* factors = v_.swift_lora_->find(name);
+        if (!factors) throw std::runtime_error("missing Swift LoRA projection " + name);
+        kernels::swift_lora_project(x, factors->a, factors->b, T, inputs, outputs, outputs,
+                                    swift_scale(), v_.batch_rec_, v_.swift_scratch_, y, cs);
+    }
     float* Rt(int t) const { return v_.R_ + (size_t) t * HC * N; }
     void stamp(int64_t l, int i) const {
         if (v_.prof_on_) kernels::gpu_stamp(v_.prof_, (int) (l * kProfPer + i), cs);
@@ -39,7 +52,7 @@ struct Verifier::WindowRecorder {
     const ModelGeometry& g = *v_.g_;
     const WeightTable& wt = *v_.wt_;
     SessionState& ss = *v_.ss_;
-    const int64_t N = g.n_embd, HC = g.hc, K = ss.k, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
+    const int64_t N = g.n_embd, HC = g.hc, C = g.ssm_conv_channels, ZV = g.ssm_value_dim;
     const int64_t HV = g.ssm_v_heads, HK = g.ssm_k_heads, NH = g.n_head, HD = g.head_dim, NKV = g.n_head_kv;
     const int64_t IQ = g.idx_q_heads, ID = g.idx_key_dim, NE = g.n_expert, MT = v_.max_t_;
     const kernels::QsaShapes s = verify_detail::shapes_of(g);
@@ -55,6 +68,7 @@ struct Verifier::WindowRecorder {
     const bool dec_hc = kernels::hc_fused_supported();
     // the dense chain's kernels (pdl.hpp) may start during the previous kernel's tail.  Only where that previous kernel
     // is one of them or another plain kernel; never with the profile's stamps.
+    const bool use_swift = v_.batch_rec_ ? v_.swift_batch_window_ : v_.swift_solo_window_;
     const bool pdl = v_.pdl_rec_ && !v_.prof_on_;
     // the chain's kernels let their dependents in early (pdl.hpp), which stage their weights
     const bool pdl2 = pdl && kernels::pdl2_requested();

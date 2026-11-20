@@ -44,24 +44,33 @@ Flow Runtime::dispatch() {
         }
         if (line.rfind("BSTOP ", 0) != 0 && !drain_windows()) return Flow::error;
     } else {
+        if (!tick_async_image()) return Flow::error;
         kv_ceiling_note();   // between requests too: the free VRAM also moves without the KV
-        // idle: once no line has come for a second (a client's next turn usually comes sooner), what a crash would
-        // lose goes to disk, then the idle conversations whose time is up leave VRAM, one at a time while no line
-        // waits
+        // Poll input first. Take at most one idle snapshot per timeout and
+        // check again before optional VRAM parking.
         bool got = false, parking = true;
+        const bool recover = ram_checkpoint_store() != nullptr;
         std::string pe;
-        while (!got && (disk.enabled() || parking)) {
+        while (!got && (recover || disk_store().enabled() || parking || async_image_active())) {
             const int r = next_line_within(line, 1000);
             if (r < 0) return Flow::quit;
-            got = r == 1;
-            while (!got && !(got = try_next_line(line)) && disk.enabled() && spill_to_disk(false, 1) > 0) {}
+            got = r == 1 || try_next_line(line);
             if (got) break;
+            bool queued = checkpoint_for_recovery() > 0;
+            if ((got = try_next_line(line))) break;
+            if (!queued && disk_store().enabled()) {
+                queued = spill_to_disk(false, 1) > 0;
+                if ((got = try_next_line(line))) break;
+            }
+            if (queued) continue;
             parking = parking && park_idle_engine(pe);
             if (!pe.empty()) { std::printf("ERR %s\n", pe.c_str()); return Flow::error; }
-            if (!parking) break;
+            if (!tick_async_image()) return Flow::error;
+            if (!recover && !parking && !async_image_active()) break;
         }
         if (!got && !next_line(line)) return Flow::quit;
     }
+    ++dispatch_epoch;
     // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
     // request's prompt and first token as a GEN 1, then continues it in that slot
     if (line.rfind("BSTOP ", 0) == 0) {
@@ -69,12 +78,22 @@ Flow Runtime::dispatch() {
         if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
         return Flow::next;
     }
+    if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
+    if (!before_command()) {
+        std::printf("ERR %s\n", err.c_str());
+        return Flow::error;
+    }
+    if (line == "BGROW" || line == "BGROW 0" || line == "BGROW 1") {
+        const int slot = grow_batch_slot();
+        std::printf("BGROWN %d\n", slot);
+        std::fflush(stdout);
+        return Flow::next;
+    }
     if (line.rfind("BSCRIPT ", 0) == 0) {   // BSCRIPT <slot> <seed> <id,id,...>: before the slot's BGEN
         script_command(line);
         return Flow::next;
     }
-    if (line.rfind("BYIELD", 0) == 0) return Flow::next;   // for a prompt read that has ended meanwhile
-    if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0) {   // the in-engine encoder, between requests and windows
+    if (line.rfind("ENC ", 0) == 0 || line.rfind("ENCV ", 0) == 0 || line.rfind("ENCA ", 0) == 0) {
         enc_command(line);
         return Flow::next;
     }

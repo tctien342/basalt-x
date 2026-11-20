@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -96,10 +97,11 @@ struct SessionState {
 /// default full range is the whole-model carve.  Pure arithmetic - safe to call for a candidate range before anything
 /// is allocated, which is how the layer-split search prices a placement.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
-                       int64_t layer_hi = -1);
+                       int64_t layer_hi = -1, bool borrow_residency = false);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
-                      int64_t layer_lo = 0, int64_t layer_hi = -1);
+                      int64_t layer_lo = 0, int64_t layer_hi = -1,
+                      std::span<const QsaHostBinding> host_bindings = {});
 /// Before the memory `session_init` carved is freed: forgets what points into it from outside the session (the rope
 /// kernels' registered angle table), so a later session never rotates by freed memory.
 void session_release(SessionState& s);

@@ -30,14 +30,25 @@ uint64_t QfnRuntime::row_hash(int t) {
 
 // one batch window over the active slots only (row t is the t-th active slot): an idle slot is not touched,
 // so it keeps the conversation it holds
-bool QfnRuntime::batch_step() {
+bool QfnRuntime::batch_step(bool beside_prefill) {
+    observe_scheduler(beside_prefill ? SchedulerPhase::overlap : SchedulerPhase::batch_decode);
     constexpr int MR = basalt::kernels::kVerifyMaxT;
-    const int MB = std::min(MR, ver.max_t());   // the row budget is this verifier capacity; MR only sizes the arrays
-    int S = 0, R = 0;
-    int rows[MR] = {}, lens[MR] = {}, n_keep[MR] = {}, r0s[MR] = {};
-    int32_t tok[MR] = {}, outb[MR] = {};
-    int64_t pos[MR] = {}, p0s[MR] = {};
-    std::vector<int32_t> drafts[MR];
+    int MB = std::min(MR, ver.max_t());
+    if (shared_pages) {
+        const auto shape = basalt::kernels::qsa_real_shapes();
+        const auto width = basalt::kernels::qsa_selection_width(ss.max_cells, shape);
+        // Selection emits whole index blocks followed by the current tail.
+        const auto pages_per_row = (width + shape.page_size - 1) / shape.page_size;
+        const auto resident = ss.qsa_states[ss.qsa_primary()].n_slots;
+        MB = (int) std::min<int64_t>(MB, resident / pages_per_row);
+        if (MB < 1) {
+            std::printf("ERR shared KV: residency cannot fit one verifier row\n");
+            return false;
+        }
+    }
+    int S = 0;
+    int rows[MR] = {};
+    int64_t pos[MR] = {};
     // the elastic KV: each slot's next cells backed ahead of its windows; beside a prompt read only from free
     // VRAM, and a slot that needs more than that waits for the read to end
     std::vector<uint8_t> kv_wait(bs.size(), 0);
@@ -66,17 +77,204 @@ bool QfnRuntime::batch_step() {
             if (!ke.empty()) { std::printf("ERR %s\n", ke.c_str()); return false; }
             if (at + 2 * MR > backed) kv_wait[(size_t) b] = 1;
         }
-    for (int b = 0; b < (int) bs.size() && S < MR; ++b)
-        if (bs[(size_t) b].active && !kv_wait[(size_t) b]) {
-            rows[S] = b;
-            pos[S] = bs[(size_t) b].p;
-            lens[S] = 1;
-            ++S;
+    bool have_prompt = false, have_decode = false;
+    for (size_t b = 0; b < bs.size(); ++b) {
+        auto& slot = bs[b];
+        if (!slot.active || kv_wait[b]) continue;
+        if (slot.short_prompt.empty()) {
+            have_decode = true;
+        } else if (!beside_prefill && slot.stop) {
+            if (!settle_shared_slot((int) b, false)) {
+                std::printf("ERR shared KV: cancelled prompt cleanup failed: %s\n", err.c_str());
+                return false;
+            }
+            slot = BSlot{};
+            std::printf("BDONE %zu 0 cancel 0 0 0\n", b);
+            std::fflush(stdout);
+        } else {
+            have_prompt = true;
         }
-    if (S == 0) return true;
+    }
+    const bool prompt = !beside_prefill && have_prompt && (!have_decode || !next_batch_prefers_decode);
+    next_batch_prefers_decode = prompt;
+    if (prompt) observe_scheduler(have_decode ? SchedulerPhase::overlap : SchedulerPhase::prefill);
+
+    const std::vector<int32_t>* image_rope = nullptr;
+    auto context = basalt::kernels::rope_context();
+    size_t first_skipped = bs.size();
+    size_t next = shared_pages ? batch_cursor : 0;
+    for (size_t scanned = 0; scanned < bs.size() && S < MB; ++scanned) {
+        const size_t b = next;
+        next = (next + 1) % bs.size();
+        if (!bs[b].active || kv_wait[b] || prompt == bs[b].short_prompt.empty()) continue;
+        if (prompt && S > 0 && cached_adapter((int) b) != cached_adapter(rows[0])) {
+            if (first_skipped == bs.size()) first_skipped = b;
+            continue;
+        }
+        const auto* sequence = shared_pages ? shared_sequences[b].get() : nullptr;
+        const auto* table = sequence ? &sequence->image_rope : nullptr;
+        const auto row_context = sequence ? sequence->rope_context : context;
+        const bool image = table && !table->empty();
+        if (S > 0 && (image || image_rope || row_context != context)) {
+            if (first_skipped == bs.size()) first_skipped = b;
+            continue;
+        }
+        context = row_context;
+        if (image) image_rope = table;
+        rows[S] = (int) b;
+        pos[S] = bs[b].p;
+        ++S;
+    }
+    if (shared_pages) batch_cursor = first_skipped == bs.size() ? next : first_skipped;
+    if (S == 0) {
+        decode_rows.reset();
+        return true;
+    }
+
+    // Captured decode and commit graphs read the same device address. Shared prefill
+    // only calls this at chunk boundaries, so it can resume after we restore its table.
+    const bool switched = shared_pages && (image_rope
+        ? mrope_identity || *image_rope != mrope_host
+        : !mrope_identity);
+    std::vector<int32_t> identity;
+    if (switched && !image_rope) {
+        identity.resize(mrope_host.size());
+        for (size_t i = 0; i < identity.size(); ++i) identity[i] = (int32_t) (i / 3);
+    }
+    const auto& table = image_rope ? *image_rope : switched ? identity : mrope_host;
+    auto upload = [&](const std::vector<int32_t>& values) {
+        const basalt::core::OnDevice on(0);
+
+        return cudaDeviceSynchronize() == cudaSuccess &&
+               cudaMemcpy(d_mrope, values.data(), values.size() * sizeof(values[0]),
+                          cudaMemcpyHostToDevice) == cudaSuccess;
+    };
+    if (switched && !upload(table)) {
+        std::printf("ERR shared KV: unable to bind the decode rotary table\n");
+        return false;
+    }
+    if (shared_pages && (switched || image_rope) && basalt::core::exp_flag("shared_rope_audit")) {
+        const auto at = (size_t) pos[0] * 3;
+        if (at + 2 < table.size())
+            basalt::log::info("basalt rope audit", "%s slot=%d cell=%lld sees %d,%d,%d rows=%d",
+                              image_rope ? "image" : "text", rows[0], (long long) pos[0],
+                              table[at], table[at + 1], table[at + 2], S);
+    }
+    if (switched && !beside_prefill) {
+        mrope_host = table;
+        mrope_identity = image_rope == nullptr;
+    }
+    const bool tune = tune_decode_rows && S >= 2 && !beside_prefill && !ov_active && !image_rope &&
+        !vision_decode_lease.load() &&
+        std::count_if(bs.begin(), bs.end(), [](const BSlot& slot) { return slot.active; }) == S;
+    const basalt::kernels::RopeContextScope scope(context);
+    const bool ok = prompt ? batch_prompt_rows(S, MB, rows, pos) : batch_rows(S, MB, rows, pos, tune);
+    if (switched && beside_prefill && !upload(mrope_host)) {
+        std::printf("ERR shared KV: unable to restore the prefill rotary table\n");
+        return false;
+    }
+    return ok;
+}
+
+bool QfnRuntime::batch_prompt_rows(int slots, int budget, const int* rows, const int64_t* pos) {
+    pcie_state = "idle";
+    pcie_applied_q8 = 0;
+    if (!ver.prepare_batch_pcie(0, -1, 0.0, 0.0, err)) {
+        std::printf("ERR %s\n", err.c_str());
+        return false;
+    }
+    constexpr int max_rows = basalt::kernels::kVerifyMaxT;
+    int lens[max_rows] = {};
+    int32_t tokens[max_rows] = {};
+    int total = 0;
+    for (int i = 0; i < slots; ++i) {
+        const auto& pending = bs[(size_t) rows[i]].short_prompt;
+        const int remaining_slots = slots - i;
+        const int share = (budget - total + remaining_slots - 1) / remaining_slots;
+        const int count = std::min(share, (int) pending.size() - 1);
+        lens[i] = count;
+        std::copy_n(pending.begin(), count, tokens + total);
+        total += count;
+    }
+    if (!xq_drain()) {
+        std::printf("ERR an adaptive refill failed before a grouped prompt window\n");
+        return false;
+    }
+    drive.d.layers = 0;
+    drive.d.experts = 0;
+    drive.d.failed = false;
+    drive.d.cpu_lora_rows = ver.batch_adapter_scales();
+    const bool verified = ver.run_slot_segs(rows, lens, slots, tokens, pos, win_pool_fn, win_pool_user, nullptr, err);
+    drive.d.cpu_lora_rows = nullptr;
+    if (!verified || drive.d.failed || !ver.commit_slots(lens, err)) {
+        std::printf("ERR grouped prompt: %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
+        return false;
+    }
+    const float* residual = batch_spec ? mtp.keep_rows(ver.final_R_all(), total, err) : nullptr;
+    if (batch_spec && residual == nullptr) {
+        std::printf("ERR grouped prompt: %s\n", err.c_str());
+        return false;
+    }
+    const int64_t stride = (int64_t) g.hc * g.n_embd;
+    int offset = 0;
+    for (int i = 0; i < slots; ++i) {
+        const int b = rows[i];
+        auto& slot = bs[(size_t) b];
+        auto& pending = slot.short_prompt;
+        const int count = lens[i];
+        if (batch_spec) {
+            mtp.set_ple_session(bslot_ss[0][(size_t) b].get());
+            if (!mtp.catch_up(b, residual + offset * stride, pending.data() + 1, count, pos[i], err)) {
+                std::printf("ERR grouped prompt draft: %s\n", err.c_str());
+                return false;
+            }
+        }
+        slot.ids.insert(slot.ids.end(), pending.begin(), pending.begin() + count);
+        if (slot.sfx)
+            for (int j = 1; j <= count; ++j) slot.sfx->append(pending[(size_t) j]);
+        pending.erase(pending.begin(), pending.begin() + count);
+        slot.p += count;
+        slot.x = pending.front();
+        offset += count;
+        if (pending.size() == 1) {
+            pending.clear();
+            slot.t0 = Clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(slot.t0 - slot.prompt_started).count();
+            std::printf("BPF %d %lld %lld %.1f\n", b, (long long) (slot.p + 1 - slot.prompt_reused),
+                        (long long) slot.prompt_reused, ms);
+        }
+    }
+    if (batch_spec && !mtp.idle(err)) {
+        std::printf("ERR grouped prompt draft: %s\n", err.c_str());
+        return false;
+    }
+    if (slots > 1) basalt::log::info("basalt batch", "grouped prompt: %d slots, %d rows", slots, total);
+    std::fflush(stdout);
+    return true;
+}
+
+bool QfnRuntime::batch_rows(int S, int MB, int* rows, int64_t* pos, bool tune) {
+    constexpr int MR = basalt::kernels::kVerifyMaxT;
+    int R = 0;
+    int lens[MR] = {}, n_keep[MR] = {}, r0s[MR] = {};
+    int32_t tok[MR] = {}, outb[MR] = {};
+    int64_t p0s[MR] = {};
+    std::vector<int32_t> drafts[MR];
+    std::fill_n(lens, S, 1);
     bool scripted = false;
     for (int sg = 0; sg < S; ++sg) scripted = scripted || !bs[(size_t) rows[sg]].script.empty();
     const bool real = batch_spec && !scripted;
+    tune = tune && real && MB > S;
+    const bool measure_batch = scheduler_enabled && S >= 2 && scheduler_phase == SchedulerPhase::batch_decode;
+    const auto tune_start = tune || measure_batch ? Clock::now() : Clock::time_point{};
+    bool limited = false;
+    int order[MR] = {};
+    double emitted[MR] = {};
+    if (!tune) {
+        decode_rows.reset();
+        scheduler_trial_rows = 0;
+    }
+    scheduler_hard_rows = MB;
     if (real) {
         // each slot's window as the solo rule makes it (the drafts that clear the cumulative or min-p cut, or a
         // prompt-lookup run the policy prefers); the rows beyond the budget go to the slots whose last kept draft is the
@@ -109,6 +307,45 @@ bool QfnRuntime::batch_step() {
         }
         int sum = 0;
         for (int sg = 0; sg < S; ++sg) sum += Tw[sg];
+        if (tune) {
+            for (int sg = 0; sg < S; ++sg) order[sg] = sg;
+            sort_small(order, S, [&](int a, int b) { return rows[a] < rows[b]; });
+            uint64_t cohort = 1469598103934665603ull;
+            for (int i = 0; i < S; ++i) {
+                const int sg = order[i], b = rows[sg];
+                cohort = (cohort ^ (uint64_t) b) * 1099511628211ull;
+                cohort = (cohort ^ (uint64_t) bs[(size_t) b].t0.time_since_epoch().count()) * 1099511628211ull;
+                cohort = (cohort ^ (uint64_t) (pos[sg] / 32768)) * 1099511628211ull;
+            }
+            const int pressure = scheduler_pressure_class();
+            cohort = (cohort ^ (uint64_t) pressure) * 1099511628211ull;
+            uint64_t workload = 0;
+            const bool queue_known = scheduler_warm_start &&
+                Clock::now() - scheduler_pressure.received <= std::chrono::seconds(4);
+            if (scheduler_warm_start && !queue_known)
+                cohort = (cohort ^ 0xffu) * 1099511628211ull;
+            if (queue_known) {
+                const auto range = std::minmax_element(pos, pos + S);
+                uint64_t adapters = 0;
+                for (int sg = 0; sg < S; ++sg) {
+                    const auto mode = cached_adapter(rows[sg]);
+                    if (mode) adapters += 1ull << (8 * (mode - 1));
+                }
+                workload = 1469598103934665603ull;
+                for (const uint64_t feature : {(uint64_t) S, (uint64_t) MB, (uint64_t) (*range.first / 32768),
+                         (uint64_t) (*range.second / 32768), adapters, (uint64_t) pressure})
+                    workload = (workload ^ feature) * 1099511628211ull;
+                if (rope_context_profiles)
+                    workload = (workload ^ basalt::kernels::rope_context_index()) * 1099511628211ull;
+            }
+            MB = decode_rows.choose(cohort, S, MB, sum, workload);
+            limited = MB < std::min(scheduler_hard_rows, sum);
+            scheduler_trial_rows = decode_rows.trial();
+            if (workload && decode_rows.starting_trial())
+                basalt::log::info("basalt batch", "decode profiling %016llx: trying %d rows (%s)",
+                                  (unsigned long long) workload, decode_rows.trial(),
+                                  decode_rows.trial_from_profile() ? "remembered" : "neighbor");
+        }
         if (sum > MB) {
             // every slot keeps one row, and none takes more than an equal share of the window unless the others
             // want less: the slots wanting least are served in full, the rest split what is left
@@ -233,8 +470,27 @@ bool QfnRuntime::batch_step() {
         bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
         bt_miss0 = drive.d.multi_misses; bt_hits0 = drive.d.cache_hits; bt_pcie0 = drive.d.pcie_experts;
     }
+    const bool pcie_enabled = ver.batch_pcie_tunable() && measure_batch && !tune && !ov_active &&
+        !vision_decode_lease.load() && std::none_of(rows, rows + S, [&](int b) { return bs[(size_t) b].stop; });
+    static const int pinned_q8 = [] {
+        const double pin = basalt::core::exp_flag("pcie_tuner_pin_q8", -1.0);
+        return pin >= 0.0 && pin <= 256.0 ? (int) pin : -1;
+    }();
+    static const double pcie_cap = [] {
+        const double cap = basalt::core::exp_flag("pcie_tuner_cap", 1.0);
+        return cap >= 0.0 && cap <= 1.0 ? cap : 0.0;
+    }();
+    if (!ver.prepare_batch_pcie(pcie_enabled ? R : 0, pinned_q8, main_link_gbps, pcie_cap, err)) {
+        std::printf("ERR %s\n", err.c_str());
+        return false;
+    }
+    pcie_state = !pcie_enabled ? "idle" : pinned_q8 >= 0 ? "pinned" :
+        ver.batch_pcie_active() ? "layer_budget" : "budget_zero";
     const Clock::time_point w0 = Clock::now();
-    if (!ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+    drive.d.cpu_lora_rows = ver.batch_adapter_scales();
+    const bool verified = ver.run_slot_segs(rows, lens, S, tok, pos, win_pool_fn, win_pool_user, outb, err);
+    drive.d.cpu_lora_rows = nullptr;
+    if (!verified || drive.d.failed) {
         std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
         return false;
     }
@@ -307,7 +563,17 @@ bool QfnRuntime::batch_step() {
     bt_run += msd(w0, w1);
     bt_commit += msd(w1, w2);
     ++bt_windows;
+    if (shared_pages && configured_adapters() && S > 1) {
+        const auto mode = shared_sequences[(size_t) rows[0]]->adapter;
+        for (int sg = 1; sg < S; ++sg) {
+            if (shared_sequences[(size_t) rows[sg]]->adapter != mode) {
+                ++bt_mixed_adapters;
+                break;
+            }
+        }
+    }
     bt_rows += R;
+    double output_gap_ms = -1.0;
     for (int sg = 0; sg < S; ++sg) {
         const int b = rows[sg];
         BSlot& sl = bs[(size_t) b];
@@ -318,6 +584,14 @@ bool QfnRuntime::batch_step() {
             bt += " " + std::to_string((int) outb[r0s[sg] + e]);
         }
         basalt::protocol::emit_text(lp_lines[sg] + bt + "\n");
+        if (tune || scheduler_enabled) {
+            const auto emitted_at = Clock::now();
+            if (scheduler_enabled && sl.last_emit > sl.t0)
+                output_gap_ms = std::max(output_gap_ms, msd(sl.last_emit, emitted_at));
+            sl.last_emit = emitted_at;
+            if (overlap_settlement) observe_overlap_emission((size_t) b, emitted_at);
+        }
+        if (tune) emitted[sg] = msd(Clock::time_point{}, sl.last_emit);
         sl.produced += k;
         if (real) {   // the window's verdict on its drafts: the draft-length rule, the lookup history, the policy
             const int a = k - 1, Tw = lens[sg];
@@ -343,11 +617,15 @@ bool QfnRuntime::batch_step() {
             std::printf("\n");
         }
         if (fin_of[sg] != nullptr) {
+            sl.cached = o.prompt_cache > 0;
+            if (!settle_shared_slot(b, true)) {
+                std::printf("ERR shared KV: slot completion failed: %s\n", err.c_str());
+                return false;
+            }
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
             std::printf("BDONE %d %lld %s %.1f %lld %lld\n", b, (long long) sl.produced, fin_of[sg], ms,
                         (long long) sl.drafts_accepted, (long long) sl.drafts_offered);
             sl.active = false;
-            sl.cached = o.prompt_cache > 0;   // its sessions hold sl.ids for the next turn
             sl.idle_busy = busy_now();
             sl.guard.reset();
         } else {
@@ -369,7 +647,9 @@ bool QfnRuntime::batch_step() {
             const BSlot& s2 = bs[(size_t) rows[x2]];
             return s1.acc + 0.05 * (double) s1.since_draft > s2.acc + 0.05 * (double) s2.since_draft;
         });
-        const float* Rw = mtp.keep_rows(ver.final_R_all(), R, err);
+        // A single segment starts at row zero of the verifier buffer bound to MTP.
+        const bool direct_draft = shared_pages && S == 1;
+        const float* Rw = direct_draft ? ver.final_R_all() : mtp.keep_rows(ver.final_R_all(), R, err);
         if (Rw == nullptr) { std::printf("ERR %s\n", err.c_str()); return false; }
         const int64_t HCN = (int64_t) g.hc * g.n_embd;
         for (int ci = 0; ci < nc; ++ci) {
@@ -383,8 +663,12 @@ bool QfnRuntime::batch_step() {
             if (ci < nfull) {
                 mtp.set_cum_th(sl.cum.th());
                 int nd = 0;
-                if (!mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err, sl.dprob,
-                                   &nd)) {
+                const bool drafted = direct_draft
+                    ? mtp.flush(b, err) && mtp.use_store(b, err) &&
+                        mtp.draft_from(Rw, Tw, outb, p0s[sg], a, sl.dr, err, sl.dprob, &nd)
+                    : mtp.draft_seq(b, Rw + (size_t) r0s[sg] * HCN, Tw, outb + r0s[sg], p0s[sg], a, sl.dr, err,
+                                    sl.dprob, &nd);
+                if (!drafted) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
                 }
@@ -411,7 +695,59 @@ bool QfnRuntime::batch_step() {
         }
         bt_commit += msd(c0, Clock::now());
     }
+    if (pcie_enabled && (pinned_q8 < 0 || ver.batch_pcie_active() || ver.windows % 32 == 0)) {
+        pcie_last_window = ver.batch_pcie_window();
+        ++pcie_tuner_windows;
+        pcie_tuner_bytes += pcie_last_window.staged_bytes;
+        const int misses = pcie_last_window.misses;
+        pcie_applied_q8 = misses > 0 ? (256 * pcie_last_window.staged + misses / 2) / misses : 0;
+        const double pcie_window_ms = msd(tune_start, Clock::now());
+        pcie_window_payload_mbps = pcie_window_ms > 0.0
+            ? (long long) (pcie_last_window.staged_bytes / (pcie_window_ms * 1000.0) + 0.5) : 0;
+    } else {
+        pcie_applied_q8 = 0;
+        pcie_last_window = {};
+        pcie_last_window.eligible = -1;
+        pcie_window_payload_mbps = 0;
+    }
     basalt::core::progress().busy.store(was_busy);
+    const double window_ms = tune || measure_batch ? msd(tune_start, Clock::now()) : 0.0;
+    if (measure_batch) {
+        ++scheduler_batch_windows;
+        scheduler_batch_ms += window_ms;
+        if (limited) {
+            ++scheduler_limited_windows;
+            scheduler_limited_ms += window_ms;
+        }
+    }
+    if (tune) {
+        if (std::any_of(fin_of, fin_of + S, [](const char* reason) { return reason != nullptr; })) {
+            decode_rows.reset();
+        } else {
+            int committed[MR] = {};
+            double sent[MR] = {};
+            for (int i = 0; i < S; ++i) {
+                committed[i] = n_keep[order[i]];
+                sent[i] = emitted[order[i]];
+            }
+            const auto result = decode_rows.observe(R, window_ms, committed, sent);
+            if (result.candidate)
+                scheduler_decision = result.promoted ? "applied" : result.late ? "gap_guard" : "kept_incumbent";
+            if (result.candidate)
+                basalt::log::info("basalt batch", "decode row budget %d -> %d, trial %.1f vs %.1f tok/s (%s)",
+                                  result.prior, result.candidate, result.probe_rate, result.base_rate,
+                                  result.promoted ? "applied" : result.late ? "gap guard" : "kept incumbent");
+            if (result.profile_key)
+                basalt::log::info("basalt batch", "decode profile %016llx: %s %s",
+                                  (unsigned long long) result.profile_key,
+                                  result.remembered ? "remembered" : "neighbor",
+                                  result.promoted ? "validated" : "withdrawn");
+        }
+    }
+    scheduler_rows = R;
+    scheduler_output_gap_ms = output_gap_ms;
+    if (!batch_on() && scheduler_phase == SchedulerPhase::batch_decode)
+        observe_scheduler(SchedulerPhase::idle);
     if (!batch_on() && bt_windows > 0) {
         const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
         const double L = (double) g.n_layers;
@@ -423,6 +759,12 @@ bool QfnRuntime::batch_step() {
                      (ver.ms_wait - bt_wait0) / w, (ver.ms_pool - bt_pool0) / w, bt_commit / w, bt_emit / w,
                      (drive.d.multi_misses - bt_miss0) / (w * L), (drive.d.cache_hits - bt_hits0) / (w * L),
                      (drive.d.pcie_experts - bt_pcie0) / (w * L), 1000.0 * bt_rows / std::max(wall, 1e-9), wall);
+        const auto pcie_budget = ver.take_batch_pcie_budget_report();
+        if (!pcie_budget.empty()) basalt::log::info("basalt PCIe budget", "%s", pcie_budget.c_str());
+        if (shared_pages && lora_main)
+            basalt::log::info("basalt batch", "%lld mixed adapter windows of %lld",
+                              (long long) bt_mixed_adapters, (long long) bt_windows);
+        bt_mixed_adapters = 0;
         if (batch_adapt) {
             basalt::log::info("basalt batch adapt", "%lld rounds, %lld swaps queued (%.1f per round), %lld deferred "
                                  "(no free RAM place), %.3f ms/window of host time, peer swaps total %lld",
@@ -454,6 +796,7 @@ int QfnRuntime::init_batch() {
     // the real MTP drafts in the batch windows (a draft K/V per slot); the scripted test drive keeps its own
     batch_spec = mtp_on && mtp.main_store() > 0 && o.batch > 0;
     S_all = S;
+    tune_decode_rows = basalt::core::exp_flag("adaptive_decode_rows", scheduler_enabled ? 1 : 0) > 0;
     bpolicy.emplace(S);   // the lookup-or-MTP choice, costs per row
     bt_draft = 0;
     bt_draft_last = 0;

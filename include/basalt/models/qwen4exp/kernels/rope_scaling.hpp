@@ -191,4 +191,20 @@ inline const char* rope_scaling_invalid(const RopeScaling& s) {
 void rope_scaling_set(const RopeScaling& scaling);
 const RopeScaling& rope_scaling();
 
+enum class RopeContext { Startup, Native, YaRN2 };
+inline constexpr int kRopeContexts = 3;
+RopeContext rope_context();
+inline int rope_context_index() { return static_cast<int>(rope_context()); }
+
+/// Analytic kernel launchers and graph capture see the same profile on this host thread.
+class RopeContextScope {
+public:
+    explicit RopeContextScope(RopeContext context);
+    ~RopeContextScope();
+    RopeContextScope(const RopeContextScope&) = delete;
+    RopeContextScope& operator=(const RopeContextScope&) = delete;
+private:
+    RopeContext previous_;
+};
+
 }  // namespace basalt::kernels

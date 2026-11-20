@@ -1,3 +1,7 @@
+#include "basalt/core/diag.hpp"
+#include "basalt/core/direct_peer.hpp"
+#include "basalt/log.hpp"
+#include <atomic>
 // src/prefill/peer_share.cpp - multi-GPU: a second card's share of a prompt chunk's routed experts.
 //
 // Per layer the main card quantizes the activations into mapped host memory. A layer's experts are staged in groups of
@@ -64,6 +68,10 @@ struct PeerShare::Impl {
     cudaEvent_t ev_xin = nullptr, ev_staged[kMaxBufs] = {}, ev_free[kMaxBufs] = {}, ev_done[kMaxBufs] = {}, ev_out[kMaxBufs] = {};
     uint8_t* stage[kMaxBufs] = {};
     void* xq[kMaxBufs] = {};
+    void* act_peer = nullptr;
+    bool act_direct = false;
+    int64_t results_fp16_rows = 0;
+    uint16_t* out_fp16 = nullptr;
     void* hq = nullptr;
     float *gu = nullptr, *h = nullptr, *out[kMaxBufs] = {};
     int32_t *ident = nullptr, *tok_dev = nullptr, *bounds_dev = nullptr;
@@ -159,8 +167,12 @@ struct PeerShare::Impl {
             p.dst = gu + d.n_ff;
         }
         ctx->run(p, ps);
-        L.act(gu, h, l, ps);
-        mmq::quantize(h, nullptr, hq, L.d_type, d.n_ff, d.n_ff, l.rows, ps);
+        if (L.pack_activation) {
+            L.pack_activation(gu, hq, l, ps);
+        } else {
+            L.act(gu, h, l, ps);
+            mmq::quantize(h, nullptr, hq, L.d_type, d.n_ff, d.n_ff, l.rows, ps);
+        }
         cudaStreamWaitEvent(ps, ev_out[b], 0);   // the last rows out of this buffer have left
         mmq::Product q = p;
         q.w = l.stage + L.down_off + L.d_stride * (size_t) l.q0;
@@ -172,6 +184,7 @@ struct PeerShare::Impl {
         q.dst = l.out;
         q.ld_dst = d.n_embd;
         ctx->run(q, ps);
+        if (L.post_down) L.post_down(gu, h, l, ps);
     }
 
     ~Impl() {
@@ -222,12 +235,15 @@ template <class Peer, class Host>
 static void layout(const PeerShare::Dims& d, Peer&& peer, Host&& host) {
     const int64_t R = d.launch_rows, G = max_launches(d);
     host(d.act_bytes);                                               // hxq
+    if (core::exp_flag("peer_direct_q8") != 0) peer(d.act_bytes);       // act_peer
     for (int b = 0; b < d.stage_bufs; ++b) peer(d.group_bytes);     // stage
     for (int b = 0; b < d.bufs; ++b) {
         peer(mmq::q8_bytes(R, d.n_embd));                            // xq
         peer((size_t) R * (size_t) d.n_embd * 4);                    // out
         host((size_t) R * (size_t) d.n_embd * 4);                    // hrows
     }
+    if (core::exp_flag("peer_result_fp16") != 0)
+        peer((size_t) R * (size_t) d.n_embd * sizeof(uint16_t));
     peer((size_t) R * (size_t) d.n_ff * 2 * 4);                      // gu
     peer((size_t) R * (size_t) d.n_ff * 4);                          // h
     peer(mmq::q8_bytes(R, d.n_ff));                                  // hq
@@ -278,11 +294,13 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
                 ok = ok && cudaEventCreateWithFlags(e, cudaEventDisableTiming) == cudaSuccess;
         if (ok) {
             size_t i = 0;
+            if (core::exp_flag("peer_direct_q8") != 0) m->act_peer = pv[i++];
             for (int b = 0; b < d.stage_bufs; ++b) m->stage[b] = (uint8_t*) pv[i++];
             for (int b = 0; b < d.bufs; ++b) {
                 m->xq[b] = pv[i++];
                 m->out[b] = (float*) pv[i++];
             }
+            if (core::exp_flag("peer_result_fp16") != 0) m->out_fp16 = (uint16_t*) pv[i++];
             m->gu = (float*) pv[i++];
             m->h = (float*) pv[i++];
             m->hq = pv[i++];
@@ -305,7 +323,10 @@ bool PeerShare::open(int main_device, int peer_device, const Dims& d, std::strin
              cudaEventCreateWithFlags(&m->ev_xq, cudaEventDisableTiming) == cudaSuccess &&
              cudaEventCreateWithFlags(&m->ev_end, cudaEventDisableTiming) == cudaSuccess;
         for (int b = 0; ok && b < kMaxBufs; ++b) ok = cudaEventCreateWithFlags(&m->ev_rows[b], cudaEventDisableTiming) == cudaSuccess;
-        ok = ok && cudaMalloc(&m->dxq, mmq::q8_bytes(kQuantRows, d.n_embd)) == cudaSuccess;
+        const int64_t quant_rows = m->act_peer ? std::max<int64_t>(kQuantRows, d.max_tokens) : kQuantRows;
+        ok = ok && cudaMalloc(&m->dxq, mmq::q8_bytes(quant_rows, d.n_embd)) == cudaSuccess;
+        m->act_direct = ok && m->act_peer && core::direct_peer_enabled(m->peer, m->main) &&
+                        core::direct_peer_pointer(m->act_peer, m->peer) && core::direct_peer_pointer(m->dxq, m->main);
         layout(d, [](size_t) {}, [&](size_t b) {
             void* p = nullptr;
             if (ok && cudaHostAlloc(&p, b, cudaHostAllocPortable | cudaHostAllocMapped) == cudaSuccess)
@@ -354,6 +375,16 @@ void PeerShare::prepare(const Layer& L, const std::vector<Expert>& experts) {
 
 bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst,
                     void* main_stream, std::string& err) {
+    return run(L, x, n_tokens, experts, dst, main_stream, err, false);
+}
+
+bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst,
+                    void* main_stream, std::string& err, bool allow_fp16_results) {
+    return run(L, x, n_tokens, experts, dst, main_stream, err, allow_fp16_results, -1);
+}
+
+bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst,
+                    void* main_stream, std::string& err, bool allow_fp16_results, int64_t fp16_tail_rows) {
     Impl& m = *m_;
     const Dims& d = m.d;
     const int prepared = m.prepared;
@@ -427,13 +458,30 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
         }
         groups.push_back(std::move(g));
     }
-    if (r > 0) {   // the layer's activations into mapped host memory, once the second card has read the last layer's
+    if (fp16_tail_rows < -1 || fp16_tail_rows > r) {
+        err = "peer share: packed result tail exceeds the result rows";
+        return false;
+    }
+    const bool direct_activations = m.act_direct && !L.quantize && !L.products && r > n_tokens;
+    if (r > 0) {   // The previous layer's gathers own the slab until ev_xin.
         const core::OnDevice od(m.main);
         cudaEventRecord(m.ev_x, (cudaStream_t) main_stream);
         cudaStreamWaitEvent(m.s_main, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_rows, m.ev_x, 0);
         cudaStreamWaitEvent(m.s_main, m.ev_xin, 0);
-        if (L.quantize) {
+        if (direct_activations) {
+            const size_t bytes = mmq::q8_bytes(n_tokens, d.n_embd) - mmq::q8_bytes(0, d.n_embd);
+            mmq::quantize(x, nullptr, m.dxq, L.gu_type, d.n_embd, d.n_embd, n_tokens, m.s_main);
+            const auto copy = cudaMemcpyPeerAsync(m.act_peer, m.peer, m.dxq, m.main, bytes, m.s_main);
+            if (copy != cudaSuccess) {
+                err = std::string("peer share: Q8 activation copy: ") + cudaGetErrorString(copy);
+                return false;
+            }
+            static std::atomic<bool> noted{false};
+            if (!noted.exchange(true))
+                basalt::log::info("basalt P2P", "routed prefill Q8 activations CUDA%d -> CUDA%d (%zu bytes)", m.main,
+                                  m.peer, bytes);
+        } else if (L.quantize) {
             L.quantize(x, n_tokens, m.hxq, m.s_main);
         } else {   // block column kb of row r lies at (kb n_tokens + r) blocks: a piece's rows are a strided copy
             const size_t kb = (size_t) mmq::q8_blocks(d.n_embd);
@@ -459,11 +507,25 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
             for (size_t i = groups[gi].i0; i < groups[gi].i1; ++i) blobs[gi].emplace_back(experts[i].blob, experts[i].on_peer);
     }
     Impl* w = &m;
-    m.post([w, L, n_tokens, dst, r, nb, tok, bounds, prepared, groups = std::move(groups), nums = std::move(nums),
+    const bool fp16_results = allow_fp16_results && m.out_fp16 && n_tokens >= 256 &&
+                              core::direct_peer_enabled(m.main, m.peer) && core::direct_peer_pointer(dst, m.main);
+    m.results_fp16_rows = fp16_results ? (fp16_tail_rows < 0 ? r : fp16_tail_rows) : 0;
+    const int64_t fp32_rows = r - m.results_fp16_rows;
+    if (fp32_rows > 0 && fp32_rows < r) {
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true))
+            basalt::log::info("basalt P2P", "routed prefill mixed FP32/FP16 results CUDA%d -> CUDA%d (%lld/%lld rows)",
+                              m.peer, m.main, (long long) fp32_rows, (long long) (r - fp32_rows));
+    }
+    m.post([w, L, n_tokens, dst, r, nb, tok, bounds, prepared, direct_activations, fp32_rows,
+            groups = std::move(groups), nums = std::move(nums),
             blobs = std::move(blobs), all_blobs = std::move(all_blobs)] {
         Impl& m = *w;
         const Dims& d = m.d;
         const cudaStream_t mr = m.s_rows, ps = m.s_prod, so = m.s_out;
+        const bool direct = fp32_rows < r || (core::direct_peer_enabled(m.main, m.peer) &&
+                                              core::direct_peer_pointer(dst, m.main));
+        const void* activations = direct_activations ? m.act_peer : m.hxq;
         if (r > 0) {
             const core::OnDevice od(m.peer);
             cudaMemcpyAsync(m.tok_dev, tok, (size_t) r * 4, cudaMemcpyHostToDevice, ps);
@@ -482,6 +544,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 Launch lv;
                 lv.stage = m.stage[sb];
                 lv.q0 = l.q0;
+                lv.expert_begin = g.i0 + l.q0;
                 lv.n = l.n;
                 lv.blob = all_blobs.data() + g.i0 + l.q0;
                 lv.tok = m.tok_dev + l.r0;
@@ -489,7 +552,7 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 lv.bounds_host = bounds + l.b0;
                 lv.rows = l.rows;
                 lv.max_rows = l.max_rows;
-                lv.act = m.hxq;
+                lv.act = activations;
                 lv.n_tokens = n_tokens;
                 lv.first = first;
                 lv.out = m.out[b];
@@ -505,11 +568,39 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
                 const size_t bytes = (size_t) l.rows * (size_t) d.n_embd * 4;
                 cudaStreamWaitEvent(so, m.ev_done[b], 0);
                 cudaStreamWaitEvent(so, m.ev_rows[b], 0);
-                cudaMemcpyAsync(m.hrows[b], m.out[b], bytes, cudaMemcpyDeviceToHost, so);
+                float* out = dst + (size_t) l.r0 * (size_t) d.n_embd;
+                if (direct) {
+                    const int64_t full = std::clamp<int64_t>(fp32_rows - l.r0, 0, l.rows);
+                    const size_t full_count = (size_t) full * d.n_embd;
+                    if (full > 0) {
+                        const auto copy = cudaMemcpyPeerAsync(out, m.main, m.out[b], m.peer, full_count * sizeof(float), so);
+                        if (copy != cudaSuccess) { m.err = copy; return; }
+                        static std::atomic<bool> noted{false};
+                        if (!noted.exchange(true))
+                            basalt::log::info("basalt P2P", "routed prefill results CUDA%d -> CUDA%d (%zu bytes)",
+                                              m.peer, m.main, full_count * sizeof(float));
+                    }
+                    if (full < l.rows) {
+                        const int64_t count = (l.rows - full) * d.n_embd;
+                        // Pack after the full rows. The output event protects both transfers and the scratch.
+                        kernels::f32_to_f16_bulk(m.out[b] + full_count, m.out_fp16, count, so);
+                        auto* packed = reinterpret_cast<uint16_t*>(dst + (size_t) fp32_rows * d.n_embd) +
+                                       (size_t) (l.r0 + full - fp32_rows) * d.n_embd;
+                        const size_t packed_bytes = (size_t) count * sizeof(uint16_t);
+                        const auto copy = cudaMemcpyPeerAsync(packed, m.main, m.out_fp16, m.peer, packed_bytes, so);
+                        if (copy != cudaSuccess) { m.err = copy; return; }
+                        static std::atomic<bool> noted{false};
+                        if (!noted.exchange(true))
+                            basalt::log::info("basalt P2P", "routed prefill FP16 results CUDA%d -> CUDA%d (%zu bytes)",
+                                              m.peer, m.main, packed_bytes);
+                    }
+                } else {
+                    cudaMemcpyAsync(m.hrows[b], m.out[b], bytes, cudaMemcpyDeviceToHost, so);
+                }
                 cudaEventRecord(m.ev_out[b], so);
                 const core::OnDevice om(m.main);
                 cudaStreamWaitEvent(mr, m.ev_out[b], 0);
-                kernels::copy_from_mapped(dst + (size_t) l.r0 * (size_t) d.n_embd, m.hrows[b], (int64_t) (bytes / 4), mr);
+                if (!direct) kernels::copy_from_mapped(out, m.hrows[b], (int64_t) (bytes / 4), mr);
                 cudaEventRecord(m.ev_rows[b], mr);
             }
             // the staging buffer is free once the group's products are done (or at once, without rows)
@@ -526,6 +617,8 @@ bool PeerShare::run(const Layer& L, const float* x, int n_tokens, const std::vec
     });
     return true;
 }
+
+int64_t PeerShare::results_fp16_rows() const { return m_->results_fp16_rows; }
 
 bool PeerShare::join(void* stream, std::string& err) {
     m_->drain();

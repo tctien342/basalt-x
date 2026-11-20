@@ -16,7 +16,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
 
     def start():
         return "message_start", {"type": "message_start", "message": {
-            "id": mid, "type": "message", "role": "assistant", "model": svc.model, "content": [],
+            "id": mid, "type": "message", "role": "assistant", "model": svc.response_model(), "content": [],
             "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
 
     # the start carries the prompt's token count: when the engine tokenizes, it opens once the engine has counted

@@ -17,7 +17,7 @@ using namespace detail;
 bool Prefill::Run::Chunk::inputs() {
     // ---- embeddings, broadcast to the four streams - or, in a later stage of a layer split, the rows the
     // previous stage handed on
-    if (owner.hand_in_ != nullptr) {
+    if (owner.hand_in_ != nullptr && !owner.hand_on_device_) {
         if (cudaMemcpyAsync(m.R, owner.hand_in_ + (size_t) c0 * D, (size_t) T * D * 4, cudaMemcpyHostToDevice, m.cs) !=
             cudaSuccess) {
             err = "prefill: the layer split's hand-off upload failed";

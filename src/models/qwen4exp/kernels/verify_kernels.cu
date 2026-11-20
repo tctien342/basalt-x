@@ -742,7 +742,7 @@ __global__ void ple_hist_seg_kernel(float* __restrict__ work, float* const* __re
                                     const SegRow* __restrict__ rows, int64_t n, int dir) {
     const int t = blockIdx.y;
     const SegRow r = rows[t];
-    float* slot = slots[r.slot];
+    float* slot = slots[r.segment];
     const float* src = nullptr;
     float* dst = nullptr;
     if (dir == 0) {

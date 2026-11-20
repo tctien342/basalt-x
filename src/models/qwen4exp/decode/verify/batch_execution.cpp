@@ -8,6 +8,7 @@
 #include "basalt/core/peer_experts.hpp"
 #include "basalt/models/qwen4exp/kernels/dec_gdn.hpp"
 #include "basalt/models/qwen4exp/kernels/native_ple_postops.hpp"
+#include "basalt/kernels/cpu/expert_layout.hpp"
 #include "basalt/kernels/pdl.hpp"
 #include "basalt/models/qwen4exp/kernels/ngram.hpp"
 #include "basalt/models/qwen4exp/kernels/qsa.hpp"
@@ -20,6 +21,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <string>
 #include <immintrin.h>
 
@@ -52,6 +55,10 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
             return false;
         }
     refresh_ar();
+    swift_batch_window_ = false;
+    if (swift_lora_)
+        for (int s = 0; s < S; ++s)
+            swift_batch_window_ |= slot_swift_scale_[(size_t) slots[s]] != 0.0f;
     if (!capture_batch(R, hbase, err) || !capture_commit_batch(R, err)) return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
@@ -63,12 +70,27 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
     int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
     int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
     for (int t = 0; t < kQsaSegMaxRows + 8; ++t) h_qseg_[t] = QsaSeg{-1, 0, 0, 0};   // unused until set
+    const int64_t nQ = g.n_qsa_layers();
+    const int64_t TS = (s.idx_block - 1) * g.idx_key_dim;
+    const int64_t interval = std::max<int64_t>(g.qsa_interval, 1);
+    for (int64_t qi = lb_ / interval; qi < le_ / interval; ++qi)
+        for (int sg = 0; sg < S; ++sg) {
+            const QsaState& st = slots_[(size_t) slots[sg]]->qsa_states[qi];
+            QsaSegSlot& e = h_qslots_[(size_t) qi * max_t_ + sg];
+            e.k_pool = st.k_pool; e.v_pool = st.v_pool; e.k_q = st.k_q; e.v_q = st.v_q;
+            e.k_scale = st.k_scale; e.v_scale = st.v_scale; e.page_table = st.page_table; e.host = st.host;
+            e.map = st.kv_mode == 1 ? st.map : decltype(e.map){};
+            e.tail = st.idx_tail; e.dead = st.idx_dead; e.pooled = st.idx_pooled;
+            e.tail_snap = tail_snap_b_ + ((size_t) sg * nQ + qi) * TS;
+            e.block_pos = st.idx_block_pos; e.max_cells = (int32_t) st.max_cells;
+        }
     for (int sg = 0, r0 = 0; sg < S; ++sg) {
         const int n = lens != nullptr ? lens[sg] : 1;
         const SessionState& sx = *slots_[(size_t) slots[sg]];
+        h_ple_slots_[sg] = sx.ple_hist;
         int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
-        h_qseg_[kQsaSegMaxRows + sg] = QsaSeg{slots[sg], r0, n, 0};
-        int32_t* c = h_commitb_ + (size_t) slots[sg] * CB;   // the commit's rows, all kept until commit_slots says less
+        h_qseg_[kQsaSegMaxRows + sg] = QsaSeg{sg, r0, n, 0};
+        int32_t* c = h_commitb_ + (size_t) sg * CB;   // the commit's rows, all kept until commit_slots says less
         c[0] = n;
         c[1] = n - 1;
         for (int64_t j = 0; j < CB - 2; ++j) c[2 + j] = j < n ? (int32_t) (pos0[sg] + j) : -1;
@@ -76,6 +98,8 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
             const int t = r0 + j;
             const int64_t pos = pos0[sg] + j;
             h_tok_[t] = tokens[t];
+            h_adapter_scale_[t] = slot_adapter_scale_[(size_t) slots[sg]];
+            if (h_swift_scale_) h_swift_scale_[t] = slot_swift_scale_[(size_t) slots[sg]];
             qsa_step_fill(h_step_ + t * kStepCount, pos, s);
             for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos;
             for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos;
@@ -85,10 +109,10 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
                 prev[0] = prev[1];
                 prev[1] = tokens[t];
             }
-            h_qseg_[t] = QsaSeg{slots[sg], r0, n, 0};
+            h_qseg_[t] = QsaSeg{sg, r0, n, 0};
             SegRow& e = h_segb_[t];   // the state of layer 0 of the slot's session
             e.gdn = (float*) ((uintptr_t) sx.gdn_state - (uintptr_t) sx.gdn_ord0 * gdn_floats * sizeof(float));
-            e.row0 = r0; e.j = j; e.n = n; e.n_keep = n; e.slot = slots[sg]; e.pos = (int32_t) pos;
+            e.row0 = r0; e.j = j; e.n = n; e.n_keep = n; e.segment = sg; e.pos = (int32_t) pos;
             last_rows_[t] = slots[sg];
             last_tokens_[t] = tokens[t];
             last_pos_b_[t] = pos;
@@ -104,6 +128,7 @@ bool Verifier::stage_batch(const int* slots, const int* lens, int S, int hbase, 
     *(volatile uint32_t*) h_flagB_ = 0;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     last_t_ = R;
+    last_rope_context_ = basalt::kernels::rope_context_index();
     last_nseg_ = S;
     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
     last_batch_ = true;
@@ -148,6 +173,156 @@ bool Verifier::dm_stage_places(std::string& err) {
     return true;
 }
 
+bool Verifier::batch_pcie_tunable() const {
+    return dm_ != nullptr && dm_->stage_tune;
+}
+
+bool Verifier::prepare_batch_pcie(int rows, int pinned_q8, double bandwidth_gbps, double hard_cap, std::string& err) {
+    batch_pcie_active_ = batch_pcie_timing_ = false;
+    if (!batch_pcie_tunable() || rows <= 0 || hard_cap <= 0.0) return true;
+    using namespace basalt::kernels;
+    auto& d = *dm_;
+    const bool pinned = pinned_q8 >= 0;
+    batch_pcie_timing_ = !pinned && d.h_stage_timing != nullptr && bandwidth_gbps > 0.0;
+    if (!batch_pcie_timing_ && (!pinned || pinned_q8 == 0)) return true;
+    if (batch_pcie_timing_) {
+        const uint64_t placement = warm_src_->places_generation();
+        if (d.stage_rows != 0 && placement != d.stage_last_placement) ++d.stage_placement_changes;
+        d.stage_last_placement = placement;
+        // Shape changes change the service estimates. Placement only changes the live
+        // miss count and aliases, which the route and dm_stage_places refresh separately.
+        if (d.stage_rows != rows) {
+            std::fill(d.stage_cost.begin(), d.stage_cost.end(), PcieLayerCost{});
+            std::fill(d.stage_misses.begin(), d.stage_misses.end(), 0);
+            d.stage_rows = rows;
+            ++d.stage_shape_resets;
+        }
+        d.stage_bandwidth = bandwidth_gbps * 1000.0; // GB/s -> bytes/us
+        std::fill_n(d.h_stage_timing, d.stage_cost.size() * DmPcieTimingWords, 0ull);
+    }
+
+    const auto& layout = basalt::kernels::cpu::expert_layout();
+    const int max_misses = std::min(kDmCap, rows * (int) routed_k_);
+    std::fill(d.stage_next.begin(), d.stage_next.end(), 0);
+    for (int64_t l = lb_; l < le_; ++l) {
+        auto* row = d.stage_next.data() + l * (kDmCap + 1);
+        const uint64_t blob = layout.blob_bytes(l);
+        const int last_misses = std::min(max_misses, d.stage_misses[l]);
+        for (int m = 1; m <= max_misses; ++m) {
+            if (pinned) {
+                row[m] = (int) std::min<uint64_t>(std::min(d.stage_cap, (int) (m * hard_cap)),
+                    m * std::clamp(pinned_q8, 0, 256) * d.stage_reference_bytes / (256 * blob));
+            } else {
+                PcieBudget reason = PcieBudget::no_timing;
+                row[m] = pcie_layer_experts(d.stage_cost[l], m, d.stage_cap,
+                                            (double) dec_moe_stage_stride(blob), hard_cap, m == last_misses ? &reason : nullptr);
+                if (m == last_misses) ++d.stage_decisions[(size_t) reason];
+            }
+            row[0] |= row[m] > 0;
+        }
+        // The previous route decides whether to replay the graph with a staging branch. Its
+        // per-layer policy still uses the current window's miss count as the table index.
+        batch_pcie_active_ |= pinned ? row[0] != 0 : last_misses > 0 && row[last_misses] > 0;
+    }
+    if (!batch_pcie_active_ || d.stage_next == d.stage_table) return true;
+    const OnDevice on_device(device_);
+    const auto status = cudaMemcpyAsync(d.stage_k, d.stage_next.data(), d.stage_next.size() * sizeof(int32_t),
+                                       cudaMemcpyHostToDevice, cs_);
+    if (status != cudaSuccess) {
+        err = std::string("verify: PCIe staging table upload: ") + cudaGetErrorString(status);
+        return false;
+    }
+    d.stage_table.swap(d.stage_next);
+    return true;
+}
+
+std::string Verifier::take_batch_pcie_budget_report() {
+    if (!batch_pcie_tunable()) return {};
+    auto& d = *dm_;
+    const auto& w = d.stage_decisions;
+    if (std::all_of(w.begin(), w.end(), [](uint64_t count) { return count == 0; })) return {};
+    char result[256];
+    std::snprintf(result, sizeof result, "last-route layer decisions: no_timing=%llu peer_unobserved=%llu "
+        "cpu_not_last=%llu hard_cap=%llu no_savings=%llu stage=%llu shape_resets=%llu placement_changes=%llu",
+        (unsigned long long) w[(size_t) PcieBudget::no_timing], (unsigned long long) w[(size_t) PcieBudget::peer_unobserved],
+        (unsigned long long) w[(size_t) PcieBudget::cpu_not_last], (unsigned long long) w[(size_t) PcieBudget::hard_cap],
+        (unsigned long long) w[(size_t) PcieBudget::no_savings], (unsigned long long) w[(size_t) PcieBudget::stage],
+        (unsigned long long) d.stage_shape_resets, (unsigned long long) d.stage_placement_changes);
+    d.stage_decisions.fill(0);
+    d.stage_shape_resets = d.stage_placement_changes = 0;
+    return result;
+}
+
+Verifier::PcieWindow Verifier::batch_pcie_window() {
+    using namespace basalt::kernels;
+    PcieWindow result;
+    if (!batch_pcie_tunable() || !batch_dm_ || ar_on()) return result;
+    auto& d = *dm_;
+    const auto& layout = basalt::kernels::cpu::expert_layout();
+    std::fill(d.stage_seen.begin(), d.stage_seen.end(), 0);
+    for (int64_t l = lb_; l < le_; ++l) {
+        const auto& ring = d.h_ring[l - lb_];
+        const int entries = ring.n_tok * (int) layer_k(l);
+        const int marker = (int) (l - lb_ + 1);
+        const uint64_t blob = layout.blob_bytes(l);
+        int cpu = 0, local = 0, staged = 0;
+        for (int t = 0; t < entries; ++t) {
+            const int id = ring.ids[t], kind = ring.kind[t];
+            if (id < 0 || id >= g_->n_expert) continue;
+            if (kind == 1) ++result.staged_rows;
+            if (d.stage_seen[id] == marker) continue;
+            d.stage_seen[id] = marker;
+            local += kind == 0;
+            cpu += kind < 0;
+            staged += kind == 1;
+            if (kind >= 0 && kind != 1) continue;
+            const auto alias = batch_pcie_active_ ? d.stage_host[(size_t) l * g_->n_expert + id]
+                : (uintptr_t) warm_src_->device_alias(l, id);
+            result.eligible += alias != 0 && (alias & 15u) == 0;
+        }
+        result.staged += staged;
+        result.staged_bytes += staged * blob;
+        result.misses += cpu + staged;
+        if (!batch_pcie_timing_) continue;
+        d.stage_misses[l] = cpu + staged;
+
+        const auto* t = d.h_stage_timing + l * DmPcieTimingWords;
+        if (cpu == 0 || t[DmPcieRoute] == 0 || t[DmPcieLocal] == 0) continue;
+        auto elapsed_us = [](unsigned long long a, unsigned long long b) {
+            return a > b ? (a - b) / 1000.0 : 0.0;
+        };
+        auto update = [](double& value, double current) {
+            value = value > 0.0 ? value * 0.75 + current * 0.25 : current;
+        };
+        auto& cost = d.stage_cost[l];
+        const double per_cpu = d.stage_cpu_us[l] / cpu;
+        if (cost.cpu_per_miss > 0.0) update(cost.error_us, std::abs(per_cpu - cost.cpu_per_miss));
+        update(cost.cpu_per_miss, per_cpu);
+        update(cost.local, elapsed_us(t[DmPcieLocal], t[DmPcieRoute]));
+        // The peer acknowledgement is observed by the main combine during its normal CPU wait.
+        // A peer that has not acknowledged by then is a conservative floor, not spare slack.
+        cost.peer_censored = ring.n_peer > 0 && t[DmPciePeer] == 0;
+        if (!cost.peer_censored) update(cost.peer, elapsed_us(t[DmPciePeer], t[DmPcieRoute]));
+        if (!cost.measured_stage) {
+            cost.bytes_per_us = d.stage_bandwidth * 0.8;
+            cost.gpu_per_expert = std::max(60.0, cost.local / std::max(1, local));
+        }
+        if (staged > 0) {
+            const auto copy_first = *std::min_element(t + DmPcieCopyBegin, t + DmPcieCopyEnd);
+            const auto copy_last = *std::max_element(t + DmPcieCopyEnd, t + DmPcieTimingWords);
+            const auto copy_us = elapsed_us(copy_last, copy_first);
+            const auto compute_us = elapsed_us(t[DmPcieGrouped], std::max(t[DmPcieLocal], copy_last));
+            if (copy_first != 0 && copy_us > 0.0 && compute_us > 0.0) {
+                update(cost.copy_start, elapsed_us(copy_first, t[DmPcieRoute]));
+                update(cost.bytes_per_us, std::min(d.stage_bandwidth, staged * (double) blob / copy_us));
+                update(cost.gpu_per_expert, compute_us / staged);
+                cost.measured_stage = true;
+            }
+        }
+    }
+    return result;
+}
+
 bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int32_t* tokens, const int64_t* pos,
                              PoolMultiFn pool, void* user, int32_t* out, std::string& err) {
     using namespace basalt::kernels;
@@ -159,7 +334,7 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     const int R = last_t_;   // the window's rows
     const bool dm = dm_ != nullptr && batch_dm_;
     if (dm && !dm_begin(err, nullptr)) return false;
-    if (dm && !dm_stage_places(err)) return false;
+    if (dm && (!dm_->stage_tune || batch_pcie_active_) && !dm_stage_places(err)) return false;
     order_after_commit();
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
@@ -202,9 +377,9 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
         if (dm) {   // the ring's own rows and tiers: the pool computes the CPU's entries only
             const basalt::kernels::DmRing& Rg = dm_->h_ring[k];
             sink_.ext_kind = Rg.kind;
-            if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, Rg.ids, R, ss_->k, h_ymiss_, l);
+            if (pool != nullptr) pool(user, dm_->h_x + (size_t) k * dm_->x_stride, Rg.ids, R, routed_k_, h_ymiss_, l);
             sink_.ext_kind = nullptr;
-        } else if (pool != nullptr) pool(user, h_x_, h_ids_, R, ss_->k, h_ymiss_, l);
+        } else if (pool != nullptr) pool(user, h_x_, h_ids_, R, routed_k_, h_ymiss_, l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -220,7 +395,9 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
         }
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
-        ms_pool += ms_since(b);
+        const double pool_ms = ms_since(b);
+        ms_pool += pool_ms;
+        if (dm && batch_pcie_timing_) dm_->stage_cpu_us[l] = pool_ms * 1000.0;
     }
     progress_at("verify batch: waiting for the GPU to finish the window", R);
     const cudaError_t se = cudaStreamSynchronize(cs_);
@@ -228,11 +405,14 @@ bool Verifier::run_slot_segs(const int* rows, const int* lens, int S, const int3
     if (!window_intact(err) || !dm_ok) return false;
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     if (!ar_plan_intact(err)) return false;
+    report_dm_wait(R);
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_segs(rows, lens, S, tokens, pos, pool, next_user_, out, err);
-    if (!sample_rows(R, err)) return false;
-    for (int t = 0; t < R; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (out != nullptr) {
+        if (!sample_rows(R, err)) return false;
+        for (int t = 0; t < R; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    }
     progress_at("decode");
     progress_beat();
     return true;
@@ -255,7 +435,7 @@ bool Verifier::commit_slots_begin(const int* n_keep, std::string& err) {
         for (int sg = 0, r0 = 0; sg < last_nseg_; r0 += last_seg_len_[sg], ++sg) {
             const int k = n_keep[sg], n = last_seg_len_[sg];
             for (int j = 0; j < n; ++j) h_segb_[r0 + j].n_keep = k;
-            int32_t* c = h_commitb_ + (size_t) last_seg_slot_[sg] * CB;
+            int32_t* c = h_commitb_ + (size_t) sg * CB;
             c[0] = k;
             c[1] = k - 1;
             for (int j = k; j < n; ++j) c[2 + j] = -1;
@@ -263,7 +443,7 @@ bool Verifier::commit_slots_begin(const int* n_keep, std::string& err) {
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     order_after_commit();
-    const cudaError_t le = cudaGraphLaunch(commit_bm_[last_t_], cs_);
+    const cudaError_t le = cudaGraphLaunch(commit_bm_[commit_batch_key(last_t_, last_rope_context_)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
     // (the PLE history the commit leaves is known from the tokens: it advances now, the graph runs beside the caller)
     if (ple_stage())
@@ -322,7 +502,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     set_head_keep(0);   // the slots sample with their own parameters: every row exact
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(S, base)], cs_);
-    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[S], cs_);   // right behind it: every row is kept
+    if (le == cudaSuccess) le = cudaGraphLaunch(commit_bm_[commit_batch_key(S, basalt::kernels::rope_context_index())], cs_);   // right behind it: every row is kept
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
     if (ar_on()) ar_handoff();
@@ -367,7 +547,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot();
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        if (pool != nullptr) pool(user, h_x_, h_ids_, S, routed_k_, h_ymiss_, lb_ + b_k_);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();

@@ -28,9 +28,10 @@ void Verifier::refresh_ar() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    const auto index = solo_graph_index(T);
+    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[index] : exec_[index];
     if (exec_t != nullptr) return true;
-    const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_;
+    const bool pdl_try = basalt::kernels::pdl_requested() && !pdl_off_ && !swift_solo_window_;
     // a window that does not capture or instantiate with programmatic dependent launch is captured again without it
     auto retry_plain = [&](const std::string& why) {
         basalt::log::warn("basalt verify", "the %d-token window failed with programmatic dependent launch (%s): capturing it without", T,
@@ -76,7 +77,8 @@ bool Verifier::capture(int T, std::string& err) {
         basalt::log::info("basalt verify", "captured the %d-token window (upload %s, sync %s), %ld programmatic "
                              "dependent launches", T, cudaGetErrorString(ue), cudaGetErrorString(us), pdl_n);
     else
-        basalt::log::info("basalt verify", "captured the %d-token window (upload %s, sync %s)", T,
+        basalt::log::info("basalt verify", "captured the %d-token%s window (upload %s, sync %s)", T,
+                     swift_solo_window_ ? " Swift" : "",
                      cudaGetErrorString(ue), cudaGetErrorString(us));
     return true;
 }

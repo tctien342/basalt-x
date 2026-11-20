@@ -6,9 +6,18 @@ namespace basalt::models::qwen4exp::serve {
 
 Flow QfnRequest::complete_begin() {
     // the last commit (set_commit_async): the session is complete before anything reads or copies it
-    if (!runtime_.ver.wait_commit(runtime_.err) || (runtime_.pipe_on && !runtime_.ver_b.wait_commit(runtime_.err))) {
+    if ((req_think_close >= 0 && !runtime_.thinking_ver->wait_commit(runtime_.err)) ||
+        !runtime_.ver.wait_commit(runtime_.err) || (runtime_.pipe_on && !runtime_.ver_b.wait_commit(runtime_.err))) {
         std::printf("ERR %s\n", runtime_.err.c_str());
         return Flow::error;
+    }
+    if (runtime_.shared_pages && runtime_.solo_slot == 0) {
+        const bool keep = !cancelled && runtime_.o.prompt_cache > 0 && req_think_close < 0;
+        const int64_t cells = keep ? (int64_t) consumed.size() : 0;
+        if (!runtime_.settle_shared_slot(0, keep, cells)) {
+            std::printf("ERR shared KV: solo completion failed: %s\n", runtime_.err.c_str());
+            return Flow::error;
+        }
     }
     if (runtime_.pipe_on)
         basalt::log::info("basalt serve", "pipelined windows: %lld launched, %lld held", (long long) pair_runs,
@@ -34,6 +43,7 @@ Flow QfnRequest::complete_begin() {
         const std::string pr = runtime_.ver.profile_report();
         if (!pr.empty()) basalt::log::raw("basalt decode GPU stages (ms/window):%s\n", pr.c_str());
     }
+    runtime_.observe_scheduler(QfnRuntime::SchedulerPhase::idle);
     return Flow::proceed;
 }
 
@@ -70,18 +80,31 @@ void QfnRequest::slot_state_back(int slot) {
 }
 
 bool QfnRequest::slot_draft_keep(int slot) {
-    return !runtime_.batch_spec || runtime_.mtp.copy_store(runtime_.mtp.main_store(), slot, (int64_t) runtime_.live.size(), runtime_.err);
+    return !runtime_.batch_spec || (runtime_.mtp.set_store_adapter_scale(slot,
+        req_atomic_lora ? QfnRuntime::atomic_lora_scale : 0.0f, runtime_.err) && runtime_.mtp.copy_store(runtime_.mtp.main_store(), slot, (int64_t) runtime_.live.size(), runtime_.err));
 }
 
-void QfnRequest::slot_set_sampling(int slot) { runtime_.ver.set_slot_sampling(slot, req_sp); }
+void QfnRequest::slot_set_sampling(int slot) {
+    if (runtime_.shared_pages) {
+        auto& rope = runtime_.shared_sequences[(size_t) slot]->image_rope;
+        if (geni) rope = runtime_.mrope_host;
+        else std::vector<int32_t>().swap(rope);
+    }
+    runtime_.ver.set_slot_sampling(slot, req_sp);
+    runtime_.ver.set_slot_adapter_scale(slot, req_atomic_lora ? QfnRuntime::atomic_lora_scale : 0.0f,
+                                       req_swift_lora ? QfnRuntime::swift_lora_scale : 0.0f);
+}
 
 void QfnRequest::slot_init(BSlot& sl) {
     sl.script = std::move(runtime_.bscript[(size_t) runtime_.admit_slot].first);
     sl.rng.seed(runtime_.bscript[(size_t) runtime_.admit_slot].second);
     runtime_.bscript[(size_t) runtime_.admit_slot].first.clear();
     if (runtime_.batch_spec && runtime_.o.suffix_draft > 0) {
-        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64,
-                                                               (size_t) runtime_.o.max_context + 4096);
+        const int64_t context = runtime_.o.max_context;
+        const int64_t output = std::min<int64_t>(runtime_.admit_max_new, context);
+        // n includes any prompt rows deferred to the grouped verifier.
+        const size_t capacity = (size_t) std::min(context + 4096, n + output + 1);
+        sl.sfx = std::make_unique<basalt::spec::SuffixDrafter>(std::max(1, runtime_.o.suffix_draft), 64, capacity);
         for (int32_t t : runtime_.live) sl.sfx->append(t);
         sl.sfx->append(x);
     }
@@ -134,6 +157,8 @@ void QfnRequest::report_request(const DoneCounts& dc) {
                      (unsigned long long) look, (double) miss * 4224.0 / 1048576.0,
                      over ? " - OVERFLOW (too few resident cells)" : "");
     }
+    if (dflash_suffix_skipped > 0)
+        basalt::log::info("basalt serve", "DFlash2 suffix-first skipped %d neural draft rounds", dflash_suffix_skipped);
     if (sfx_windows > 0)
         basalt::log::info("basalt serve", "suffix drafts: %lld windows, %lld of %lld drafts accepted",
                      (long long) sfx_windows, (long long) sfx_ok, (long long) sfx_drafts);

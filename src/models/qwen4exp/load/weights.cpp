@@ -71,6 +71,8 @@ int weights(Context& context) {
                      (unsigned long long) (total_b >> 20));
         return 1;
     }
+    auto vision_staging = stage_vision(context);
+    context.vision_staging = &vision_staging;
     auto load_t0 = std::chrono::steady_clock::now();
     auto load_s = [&] {
         const auto t = std::chrono::steady_clock::now();

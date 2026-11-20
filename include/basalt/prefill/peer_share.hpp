@@ -49,6 +49,7 @@ public:
     /// One launch as the caller's steps see it (second card).
     struct Launch {
         const uint8_t* stage = nullptr;           ///< the group's staged buffer
+        size_t expert_begin = 0;                  ///< offset in the supplied expert list
         int q0 = 0, n = 0;                        ///< the launch's first expert in the group, and how many
         const uint8_t* const* blob = nullptr;     ///< their blobs, as `run` got them
         const int32_t* tok = nullptr;             ///< device: the token of each of the launch's rows
@@ -73,10 +74,14 @@ public:
         std::function<void(const float* x, int n_tokens, void* dst, void* stream)> quantize;
         /// Second card: a group's blobs into its staged buffer; empty: copies of blob_bytes each.
         std::function<void(const std::vector<std::pair<const uint8_t*, bool>>& blobs, uint8_t* stage, void* stream)> stage;
-        /// The step between the MMQ products: gu [rows][2 n_ff] -> h [rows][n_ff].
+        /// Float activation for models with custom intermediate transforms.
         std::function<void(const float* gu, float* h, const Launch& l, void* stream)> act;
+        /// Packs the activation of gu [rows][2 n_ff] into the down projection's Q8_1 input.
+        std::function<void(const float* gu, void* hq, const Launch& l, void* stream)> pack_activation;
         /// Second card: a launch's products into l.out in place of the MMQ products.
         std::function<void(const Launch& l, void* stream)> products;
+        /// Optional correction to MMQ output before the completion event and transport.
+        std::function<void(const float* gu, float* h, const Launch& l, void* stream)> post_down;
     };
     /// An expert (or a piece of one) the second card computes: its blob on the second card, or in pinned portable host
     /// memory; its row i reads row tok[i] of x (it may have none). `group`: it starts a new group, and so a new launch.
@@ -94,6 +99,13 @@ public:
     /// the consecutive rows of `dst` (main card, n_embd floats a row). False only on a bad argument.
     bool run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst, void* main_stream,
              std::string& err);
+    /// For a caller that can consume compact FP16 rows, permit direct FP16 result transport.
+    bool run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst, void* main_stream,
+             std::string& err, bool allow_fp16_results);
+    /// Only the final fp16_tail_rows are packed. A value of -1 permits packing all rows.
+    bool run(const Layer& L, const float* x, int n_tokens, const std::vector<Expert>& experts, float* dst, void* main_stream,
+             std::string& err, bool allow_fp16_results, int64_t fp16_tail_rows);
+    int64_t results_fp16_rows() const;
     /// `stream` (main card) waits for the rows of the last `run`. The host waits only until the second card's calls are
     /// issued (a thread of its own issues them). False when one of them failed.
     bool join(void* stream, std::string& err);

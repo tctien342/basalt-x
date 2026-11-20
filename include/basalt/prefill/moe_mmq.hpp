@@ -34,6 +34,10 @@ int64_t q8_blocks(int64_t cols);
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
               void* stream);
 
+/// Packs SwiGLU output directly into the MMQ down projection input.
+void swiglu_quantize(const float* gu, void* hq, int type, int64_t rows, int64_t n_ff, bool interleaved,
+                     void* stream, const float* tail, const int32_t* bounds, int n);
+
 /// Rows ids[0..rows) of `xq` (`src_rows` rows quantized for MMQ, `cols` values each) into `dst` as `rows` rows: the same
 /// bytes `quantize` writes when given those ids.
 void gather_q8(const void* xq, int64_t src_rows, const int32_t* ids, void* dst, int64_t rows, int64_t cols, void* stream);

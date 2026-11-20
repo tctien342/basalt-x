@@ -129,14 +129,16 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
     const int h = i / head_dim, d = i - h * head_dim;
     // `[page][kv_head][page_size][head_dim]`: one head's consecutive cells are contiguous inside a page.
     // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident.
-    const long long page = (long long) table[pos / page_size];
+    const long long logical = pos / page_size;
+    const long long physical = host.fp16_host_pages ? host.fp16_host_pages[logical] : logical;
+    const long long page = table[host.fp16_shared_residency ? physical : logical];
     if (page >= 0) {
         const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
         k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
         v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
     }
     if (host.k_pool != nullptr) {
-        const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+        const long long row = (physical * kv_heads + h) * page_size + (pos % page_size);
         host.k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
         host.v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
     }
@@ -406,7 +408,7 @@ __global__ void topk_kernel(const float* __restrict__ scores, const int32_t* __r
 __global__ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint16_t* __restrict__ v_pool,
                                  const int32_t* __restrict__ table, const int32_t* __restrict__ ids,
                                 const int32_t* __restrict__ step, int kv_heads, int head_dim, int page_size,
-                                uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch) {
+                                uint16_t* __restrict__ k_scratch, uint16_t* __restrict__ v_scratch, const int32_t* physical_pages) {
     const long long n_ids = (long long) __ldg(step + kStepWidth);
     const int per = head_dim / 4;                       // 4 halfs per uint2
     const long long total = n_ids * kv_heads * per;
@@ -416,7 +418,8 @@ __global__ void kv_gather_kernel(const uint16_t* __restrict__ k_pool, const uint
     const int rem = (int) (i % (kv_heads * (long long) per));
     const int h = rem / per, q = rem - h * per;
     const int cell = ids[id];
-    const long long page = (long long) table[cell / page_size];
+    const int logical = cell / page_size;
+    const long long page = table[physical_pages ? physical_pages[logical] : logical];
     const long long src = ((page * kv_heads + h) * page_size + (cell % page_size)) * (long long) per + q;
     const long long dst = (id * kv_heads + h) * (long long) per + q;
     reinterpret_cast<uint2*>(k_scratch)[dst] = reinterpret_cast<const uint2*>(k_pool)[src];
@@ -640,7 +643,7 @@ void topk_512_step(const float* cell_scores, const QsaShapes& s, int64_t cap, co
 
 void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
                     const int32_t* ids, const int32_t* step, int64_t max_ids, const QsaShapes& s,
-                    uint16_t* k_scratch, uint16_t* v_scratch, void* stream) {
+                    uint16_t* k_scratch, uint16_t* v_scratch, void* stream, const int32_t* physical_pages) {
     validate(s, "kv_gather");
     if (step == nullptr) fail("kv_gather: step is null");
     if (max_ids <= 0) return;
@@ -649,7 +652,7 @@ void kv_gather_step(const uint16_t* k_pool, const uint16_t* v_pool, const int32_
     const long long total = max_ids * s.n_head_kv * (s.head_dim / 4);
     kv_gather_kernel<<<grid_for(total, 256), 256, 0, (cudaStream_t) stream>>>(
         k_pool, v_pool, page_table, ids, step, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size,
-        k_scratch, v_scratch);
+        k_scratch, v_scratch, physical_pages);
     check_launch("kv_gather");
     if (stream == nullptr) check_sync("kv_gather");
 }

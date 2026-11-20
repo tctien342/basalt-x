@@ -27,7 +27,12 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             srcs.hc8.empty()) {
             return fatal_start_error(o.model + " lacks the dense, dense.index, experts, experts.layout or hc8 section");
         }
-        if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) o.mtp = o.model;
+        if (o.no_mtp) {
+            o.mtp.clear();
+            basalt::log::info("basalt generate", "embedded MTP disabled before GPU allocation");
+        } else if (!srcs.mtp_dense.empty() && !srcs.mtp_dense_index.empty() && !srcs.mtp_experts.empty()) {
+            o.mtp = o.model;
+        }
         // the expert profile: the one --expert-profile names, else the engine's for this model when it has one
         uint64_t prof_bytes = 0;
         if (!o.expert_profile.empty()) {
@@ -100,6 +105,7 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
             basalt::prefill::Prefill::set_stream_all_min(o.peer_exclusive ? 4096 : 2560);
     };
     set_stream_all_min();
+    basalt::prefill::Prefill::set_lora_fallback(!o.atomic_lora.empty());
     if (o.serve && o.conversation_cache_disk_mib > 0 && o.conversation_cache_dir.empty()) {
         basalt::log::error("basalt", "--conversation-cache-disk-mib needs --conversation-cache-dir");
         return 2;
@@ -191,7 +197,11 @@ int run_engine(Options& o, std::vector<program::GpuCard>& chosen_cards) {
     basalt::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
     if (const auto code = cli::validate_kv_streaming(o)) return *code;
     basalt::core::qsa_set_kv_resident(o.kv_resident);
+    if (!o.dflash2.empty() && !o.spec_given) o.spec = 8;
     const bool no_spec = cli::normalize_speculation_options(o);
+    if (!o.dflash2.empty() && (!o.serve || o.batch > 0 || multi_gpu || split_same || no_spec || o.spec > 8)) {
+        return fatal_start_error("--dflash2 needs single-slot serving with --spec 2..8 and a shared decode head");
+    }
     basalt::core::layer_set_shared_early(true);
     {
         // the source tensors hold the PLE table

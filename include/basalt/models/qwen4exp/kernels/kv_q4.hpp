@@ -40,6 +40,14 @@ inline uint64_t kv_q4_bytes_per_cell(const QsaShapes& s) {
 void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream);
 inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fwht256_cuda(data, data, n_rows, stream); }
 
+/// Restore the attention basis, apply each head's gate and pack the gated rows as native q8_1 blocks.
+void fwht256_gate_q8_cuda(const float* src, const float* q_full, void* packed, int64_t n_rows, void* stream,
+                          int value_width = 256);
+
+// Smaller widths divide the 256-channel head into independent contiguous transforms.
+int kv_value_rotation_width(bool rotated_int8);
+void fwht_value_inplace_cuda(float* data, int64_t n_rows, void* stream, int value_width);
+
 /// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
 /// and to VRAM only if its block is resident.
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,

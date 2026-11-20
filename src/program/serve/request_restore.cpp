@@ -45,7 +45,7 @@ Flow Request::restore() {
         runtime_.checks.clear();
         runtime_.live_ok = false;
         runtime_.cvec_cached = sb.cvec;
-        if (sb.cached) {
+        if (sb.cached && slot_prefix_compatible(slot_b)) {
             runtime_.live = sb.ids;
             runtime_.live_imgs = sb.imgs;
             runtime_.live_ok = runtime_.o.prompt_cache > 0;
@@ -63,7 +63,8 @@ Flow Request::restore() {
     if (!in_slot) runtime_.solo_draft_back(true);   // when a request in another slot ended before it gave them back
     runtime_.solo_busy = !in_slot;
     // slot 0 is the solo session: what an idle slot 0 holds is the live conversation, in place
-    if (runtime_.slot0_solo() && !in_slot && !runtime_.bs.empty() && runtime_.bs[0].cached && !runtime_.bs[0].active) {
+    if (runtime_.slot0_solo() && !in_slot && !runtime_.bs.empty() && runtime_.bs[0].cached && !runtime_.bs[0].active &&
+        slot_prefix_compatible(0)) {
         BSlot& s0 = runtime_.bs[0];
         runtime_.live = std::move(s0.ids);
         runtime_.live_imgs = std::move(s0.imgs);
@@ -98,24 +99,28 @@ Flow Request::restore() {
     if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells())
         for (int b = 0; b < (int) runtime_.bs.size(); ++b) {
             const BSlot& sl = runtime_.bs[(size_t) b];
-            if (b == own_slot || (!sl.active && !sl.cached) || sl.cvec != want_cvec) continue;
+            if (b == own_slot || (!sl.active && !sl.cached) || sl.cvec != want_cvec ||
+                !slot_prefix_compatible(b)) continue;
             if (!in_slot && !sl.active && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) &&
-                starts_with(sl.ids, sl.imgs)) {
+                slot_prefix_compatible(b, (int64_t) sl.ids.size()) && starts_with(sl.ids, sl.imgs)) {
                 slot_source = b;
                 slot_tokens = (int64_t) sl.ids.size();
                 slot_ck = nullptr;
             }
             for (const ConvCheckpoint& c : sl.checks)
-                if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+                if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) &&
+                    slot_prefix_compatible(b, (int64_t) c.ids.size()) && starts_with(c.ids, c.imgs)) {
                     slot_source = b;
                     slot_tokens = (int64_t) c.ids.size();
                     slot_ck = &c;
                 }
         }
     // a request in another slot: the solo session's chain is slot 0's conversation, a source like the rest
-    if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells() && in_slot && runtime_.slot0_solo() && solo_book.cvec == want_cvec)
+    if (runtime_.o.prompt_cache > 0 && runtime_.slots_share_cells() && in_slot && runtime_.slot0_solo() &&
+        solo_book.cvec == want_cvec && slot_prefix_compatible(0))
         for (const ConvCheckpoint& c : solo_book.checks)
-            if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) && starts_with(c.ids, c.imgs)) {
+            if ((int64_t) c.ids.size() > std::max(resume, slot_tokens) &&
+                slot_prefix_compatible(0, (int64_t) c.ids.size()) && starts_with(c.ids, c.imgs)) {
                 slot_source = 0;
                 slot_tokens = (int64_t) c.ids.size();
                 slot_ck = &c;
@@ -126,8 +131,16 @@ Flow Request::restore() {
     in_live = parked.live;
     // the disk tier, when it holds a longer start than every other source: read back cut at its match, after the
     // RAM guard's wait below (the read takes RAM)
-    on_disk = runtime_.disk.enabled() ? runtime_.disk.best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)
-                       : basalt::core::ConversationStore::Match{};
+    auto* read_store = &runtime_.disk_store();
+    on_disk = read_store->enabled() ? read_store->best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec)
+                                   : basalt::core::ConversationStore::Match{};
+    if (auto* recovery = runtime_.ram_checkpoint_store()) {
+        const auto saved = recovery->best(ids32.data(), ids32.size(), runtime_.req_imgs, want_cvec);
+        if (saved.tokens > 0 && saved.tokens >= on_disk.tokens) {
+            on_disk = saved;
+            read_store = recovery;
+        }
+    }
     from_disk = on_disk.tokens > std::max({resume, slot_tokens, parked.tokens});
     if (!from_disk && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(runtime_.conversations->take(parked.index));
     // RAM below the guard's floor (another program's peak): shed (after the conversation this request
@@ -180,7 +193,8 @@ Flow Request::restore() {
         }
     }
     if (from_disk) {
-        const uint64_t need = runtime_.disk.load_bytes(on_disk);
+        const uint64_t need = read_store->load_bytes(on_disk);
+        const char* source = read_store == &runtime_.disk_store() ? "disk" : "RAM recovery";
         const uint64_t floor = std::max<uint64_t>((uint64_t) runtime_.o.conversation_cache_min_free_mib << 20, runtime_.disk_floor);
         const auto t0 = Clock::now();
         basalt::core::SavedConversation image;
@@ -189,13 +203,13 @@ Flow Request::restore() {
             basalt::log::info("basalt serve", "conversation cache: %lld tokens on disk not read (physical RAM "
                               "admission; need %llu MiB)", (long long) on_disk.tokens,
                               (unsigned long long) (need >> 20));
-        } else if (!runtime_.disk.load(on_disk, image, de)) {
-            basalt::log::warn("basalt serve", "conversation cache: reading from disk failed (%s); the file is "
-                              "dropped", de.c_str());
+        } else if (!read_store->load(on_disk, image, de)) {
+            basalt::log::warn("basalt serve", "conversation cache: reading from %s failed (%s); the file is "
+                              "dropped", source, de.c_str());
         } else {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-            basalt::log::info("basalt serve", "conversation cache: read %lld tokens from disk in %.1f ms "
-                              "(%.2f GB of state)", (long long) on_disk.tokens, ms, (double) image.bytes() / 1e9);
+            basalt::log::info("basalt serve", "conversation cache: read %lld tokens from %s in %.1f ms "
+                              "(%.2f GB of state)", (long long) on_disk.tokens, source, ms, (double) image.bytes() / 1e9);
             incoming.emplace(std::move(image));
             in_tokens = on_disk.tokens;
             in_live = true;

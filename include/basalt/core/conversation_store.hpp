@@ -22,7 +22,9 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <chrono>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,7 +43,7 @@ public:
     /// Cells behind one pooled row of a K/V layer's index (before open).
     void set_row_cells(int64_t cells) { row_cells_ = cells; }
     struct Match {
-        size_t index = 0;
+        uint64_t entry_id = 0;
         int64_t tokens = 0;
     };
     struct Stats {
@@ -60,6 +62,12 @@ public:
     bool open(const std::string& dir, uint64_t identity, uint64_t budget, std::string& error);
     bool enabled() const { return open_; }
 
+    /// Pools the disk budget of two opened, unused stores with the same limit and separate directories.
+    /// After linking, either namespace can consume the unused budget until its entries are evicted.
+    void share_budget_with(ConversationStore& peer);
+    /// Links opened, unused namespaces with the same configured limit.
+    static void share_budget(std::span<ConversationStore* const> stores);
+
     /// The longest stored prefix of `prompt` (live tokens or a checkpoint, with the same pictures and control-vector
     /// state), at most prompt.size() - 1 tokens; tokens == 0 when there is none.
     Match best(const int32_t* prompt, size_t n, const std::vector<ConversationImageKey>& images, bool cvec) const;
@@ -75,6 +83,7 @@ public:
     /// Queues `image` for writing; the writer thread owns it from here.  Files it supersedes (the same conversation
     /// a turn back) are dropped.  False when the queue is over its byte cap (nothing queued).
     bool put(SavedConversation&& image, uint64_t queue_cap);
+    bool can_queue(uint64_t bytes, uint64_t queue_cap) const;
 
     /// Whether an image with these live tokens is stored or queued.
     bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const;
@@ -88,14 +97,19 @@ public:
 private:
     struct Entry;
     struct Job;
+    struct SharedBudget;
     struct PartFile {                        ///< a block or state file: its size and the conversations that use it
         uint64_t bytes = 0;
         int refs = 0;
         int64_t mtime = 0;
     };
     void writer();
-    bool write_job(Job& job, uint64_t& wrote, uint64_t& whole, std::string& error);
-    void evict_locked();
+    bool write_job(Job& job, std::span<ConversationStore* const> stores,
+                   uint64_t& wrote, uint64_t& whole, std::string& error);
+    bool make_write_room(std::span<ConversationStore* const> stores, uint64_t bytes, std::string& error);
+    bool evict_one_locked(std::span<ConversationStore* const> stores, bool owned_only);
+    Entry* entry_locked(uint64_t id) const;
+    void evict_locked(std::span<ConversationStore* const> stores = {});
     void drop_locked(size_t index);
     void release_locked(const std::vector<std::string>& refs);
     void gc_locked(int64_t min_age);         ///< removes unused block and state files at least `min_age` s old
@@ -108,8 +122,10 @@ private:
     std::vector<std::unique_ptr<Entry>> entries_;
     std::map<std::string, PartFile> parts_;   ///< block and state files of this identity, by name
     std::deque<std::shared_ptr<Job>> queue_;
-    uint64_t queue_bytes_ = 0, clock_ = 0;
+    uint64_t queue_bytes_ = 0, entry_id_ = 0;
+    std::shared_ptr<SharedBudget> shared_budget_;
     bool stop_ = false, busy_ = false;
+    std::chrono::steady_clock::time_point retry_write_after_{};
     Stats stats_;
     std::vector<std::unique_ptr<ConversationStoreBuffer>> read_bufs_;   ///< the loads' aligned read buffers, kept
     std::thread thread_;

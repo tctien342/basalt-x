@@ -25,14 +25,16 @@ Flow Request::complete() {
         // (the checkpoints taken while reading it are still good)
         runtime_.live.swap(consumed);
         runtime_.live_imgs = runtime_.imgs_below(runtime_.req_imgs, (int64_t) runtime_.live.size());
-        runtime_.live_ok = runtime_.o.prompt_cache > 0;
+        // A later prompt must recompute generated rows with the prompt's K=10.
+        runtime_.live_ok = runtime_.o.prompt_cache > 0 && req_think_close < 0;
     }
     runtime_.ckd_finish();
     const DoneCounts dc = done_counts();
     // the prompt tokens this request read - all the fresh ones, or as far as the prompt pass got when a cancel
     // stopped it part-way
     fresh = n - resume;
-    read_n = cancelled ? std::clamp<int64_t>(runtime_.pp_reached - resume, 0, fresh) : fresh;
+    read_n = !deferred_prompt.empty() ? std::clamp<int64_t>(at - resume, 0, fresh)
+           : cancelled ? std::clamp<int64_t>(runtime_.pp_reached - resume, 0, fresh) : fresh;
     // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
     //      [RAM blobs] [file blobs] [file MB]   (file tiers; appended, so an older server reads the rest)
     //      [prompt tokens read]   (fewer than <prompt> - <reused> when a cancel stopped the read)
@@ -104,6 +106,11 @@ Flow Request::complete() {
             sl.produced = in_slot ? 0 : 1;
             sl.max_new = runtime_.admit_max_new;
             sl.t0 = Clock::now();
+            sl.short_prompt = std::move(deferred_prompt);
+            if (!sl.short_prompt.empty()) {
+                sl.prompt_started = r0;
+                sl.prompt_reused = resume;
+            }
             sl.ids = runtime_.live;
             sl.cvec = runtime_.cvec_cached;
             sl.imgs = runtime_.live_imgs;
@@ -122,6 +129,10 @@ Flow Request::complete() {
             if (best != nullptr) sl.checks.push_back(*best);
             basalt::log::info("basalt batch", "slot %d takes %lld tokens (copied in %.1f ms)", runtime_.admit_slot,
                          (long long) runtime_.live.size(), std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
+        }
+        if (!cont && yielded_at < 0 && !settle_unadmitted_slot(runtime_.admit_slot)) {
+            std::printf("ERR request slot cleanup failed: %s\n", runtime_.err.c_str());
+            return Flow::error;
         }
         if (!ram_out)   // (after ERR the server reads no BADM)
             std::printf("BADM %d %d\n", runtime_.admit_slot, cont ? (in_slot ? 2 : 1) : 0);   // 2: no token yet

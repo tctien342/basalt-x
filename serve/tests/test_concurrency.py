@@ -323,6 +323,33 @@ class Admission(unittest.TestCase):
         self.assertTrue(q.may_go(head))
 
 
+    def test_shared_capacity_one_bypass_and_head_recovers(self):
+        q = AdmissionQueue()
+        head, early, late = q.join(100), q.join(15), q.join(10)
+        self.assertFalse(q.may_go_shared(head, 20))
+        self.assertFalse(q.may_go_shared(late, 20))
+        self.assertTrue(q.may_go_shared(early, 20))
+        q.leave(early)
+        self.assertFalse(q.may_go_shared(late, 20))
+        self.assertFalse(q.may_go_shared(late, 100))
+        self.assertTrue(q.may_go_shared(head, 100))
+        q.leave(head)
+        self.assertTrue(q.may_go_shared(late, 10))
+
+    def test_shared_adapter_drains_after_one_bypass(self):
+        q = AdmissionQueue()
+        head = q.join(10, adapter=True)
+        a, b = q.join(1), q.join(1)
+        self.assertFalse(q.may_go_shared(head, 99, False))
+        self.assertFalse(q.may_go_shared(b, 99, False))
+        self.assertTrue(q.may_go_shared(a, 99, False))
+        q.leave(a)
+        self.assertFalse(q.may_go_shared(b, 99, False))
+        self.assertTrue(q.may_go_shared(head, 99, None))
+        q.leave(head)
+        self.assertFalse(q.may_go_shared(b, 99, True))
+        self.assertTrue(q.may_go_shared(b, 99, None))
+
 class ParallelOption(unittest.TestCase):
     def parse(self, *argv):
         return model_settings(build_parser(), list(argv))[0]
@@ -337,6 +364,19 @@ class ParallelOption(unittest.TestCase):
     def test_maps_to_the_engine_batch(self):
         _, _, _, cli_engine = self.parse("--mock-engine", "--parallel", "4")
         self.assertEqual(cli_engine[:2], ["--batch", "4"])
+
+    def test_shared_pool_starts_with_one_slot_by_default(self):
+        a, _, file_words, cli_words = self.parse("--mock-engine", "--shared-kv-pool")
+        words = file_words + cli_words
+        self.assertEqual(a.parallel, 1)
+        self.assertEqual(words[words.index("--batch") + 1], "1")
+
+    def test_shared_pool_keeps_total_context_with_more_logical_slots(self):
+        _, _, _, words = self.parse("--mock-engine", "--shared-kv-pool", "--parallel", "12",
+                                    "--max-context", "524288")
+        self.assertEqual(words[words.index("--max-context") + 1], "524288")
+        self.assertEqual(words[words.index("--batch") + 1], "12")
+        self.assertIn("shared_kv_pool=1", words)
 
     def test_range(self):
         for bad in ("0", "9", "x"):

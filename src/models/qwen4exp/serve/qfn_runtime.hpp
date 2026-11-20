@@ -10,6 +10,9 @@
 
 #include <functional>
 #include <optional>
+#include "basalt/models/qwen4exp/decode/shared_kv_table.hpp"
+
+namespace basalt::qwen4exp { class SwiftLora; class SwiftLoraDevice; }
 
 namespace basalt::core {
 class ModelFile;
@@ -45,6 +48,9 @@ struct Context {
     std::vector<std::pair<int32_t, int32_t>>& profile_loaded;
     const bool& pf_borrow;
     basalt::core::WeightTable& wt;
+    const basalt::qwen4exp::SwiftLora* swift_host;
+    basalt::qwen4exp::SwiftLoraDevice* swift_main;
+    basalt::qwen4exp::SwiftLoraDevice* swift_peer;
     int32_t*& d_mrope;
     std::vector<int32_t>& mrope_host;
     std::string& cvec_summary;
@@ -61,6 +67,7 @@ struct Context {
     std::vector<std::vector<engine_local::SlotSession>>& bslot_ss;
     std::vector<int64_t>& slot_cap;
     bool& slot0_is_solo;
+    std::vector<std::unique_ptr<basalt::core::SharedKvTable>>& shared_tables;
     basalt::core::MtpDrafter& mtp;
     const bool& mtp_on;
     const basalt::core::QsaState* const& mtp_kv;

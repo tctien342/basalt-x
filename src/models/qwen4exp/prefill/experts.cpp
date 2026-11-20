@@ -18,8 +18,8 @@ bool Prefill::Run::Chunk::Experts::execute() {
     return finish();
 }
 
-bool Prefill::Run::Chunk::Experts::Group::execute() {
-    if (!group()) return false;
+bool Prefill::Run::Chunk::Experts::Group::execute(cudaEvent_t ready) {
+    if (!group(ready)) return false;
     if (!cpu_start()) return false;
     prepare_products();
     if (!peer_experts()) return false;

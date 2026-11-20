@@ -28,12 +28,13 @@ from serve.config import (build_parser, check_engine_flags,  # noqa: E402
                           sampling_items, shared_line, slot_share, start_items, with_spec)
 from serve.engine import process as engine_process  # noqa: E402
 from serve.engine.errors import EngineStartError  # noqa: E402
+from serve.engine.stt import SpeechWorker
 from serve.engine.image_source import image_sources_of  # noqa: E402
 from serve.engine.flags import flag_value  # noqa: E402
 from serve.engine.mock import MockEngine  # noqa: E402
 from serve.engine.process import ProcessEngine  # noqa: E402
-from serve.engine.vision import (EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
-                                 gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_item)
+from serve.engine.vision import (AdaptiveVision, EngineVision, Vision, check_gpu, child_env, engine_args, flag_refused, gpu_card_name,  # noqa: E402
+                                 cached_flag_probe, gpu_text, gpus_in_play, model_plan, vision_card, vision_env, vision_item)
 from serve.models import dialect_for  # noqa: E402
 from serve.handler import Server, serve  # noqa: E402
 from serve.security import (LOOPBACK_NAMES, allowed_hosts_of, api_key_of, exposed_without_key,  # noqa: E402
@@ -192,7 +193,7 @@ def check_model(a, file_engine: list[str], cli_engine: list[str], used_argv: lis
 def drop_sidecar_vision(cfg: dict) -> None:
     """Only a sidecar encoder holds VRAM before the first request; `dynamic` encodes inside the engine, which the
     request loads first anyway."""
-    if not cfg.get("vision") or cfg["vision"].get("mode") == "dynamic":
+    if not cfg.get("vision") or cfg["vision"].get("mode") in ("dynamic", "adaptive"):
         return
     print(tagged("warning", "lazy loading drops a sidecar image encoder, vision off; --vision dynamic stays on"), flush=True)
     del cfg["vision"]
@@ -236,7 +237,8 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             if mode == "dynamic":
                 vision = EngineVision(cfg["vision"])
             else:
-                vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                encoder = AdaptiveVision if mode == "adaptive" else Vision
+                vision = encoder(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                                 env=vision_env(env, mode), start=not multi)
         if a.lazy and not multi:
             print(tagged("model", "unloaded, the first request loads it"), flush=True)
@@ -254,7 +256,7 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
             print(tagged("disk", f"conversations={cdir} disk-mib={cmib}"), flush=True)
         # always built unloaded: the load itself is the lazy path's, started by the caller instead of by a request
         engine = ProcessEngine(cfg["engine_bin"], engine_args(cfg) + gwords, log=cfg.get("log"), env=env, lazy=True)
-        if isinstance(vision, EngineVision):
+        if isinstance(vision, (EngineVision, AdaptiveVision)):
             vision.attach(engine)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
@@ -266,7 +268,11 @@ def build_model(a, cfg: dict, logs, multi: bool, known) -> Service:
     svc = Service(engine, tok, dialect.template(template),
                   model_name=cfg.get("model_name", "basalt"), vision=vision,
                   sampling_defaults=sampling_defaults, fit_max_tokens=a.fit_max_tokens, grammar=a.grammar,
-                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect, video_max_tokens=a.video_max_tokens)
+                  grammar_engine=bool(a.mock_engine or has_grammar), dialect=dialect,
+                  video_max_tokens=a.video_max_tokens, mini_tools_helper=a.mini_tools_helper,
+                  context_profiles=a.context_profiles,
+                  atomic_lora=not a.mock_engine and bool(flag_value(engine_args(cfg), "--atomic-lora")),
+                  swift_lora=not a.mock_engine and bool(flag_value(engine_args(cfg), "--swift-lora")))
     svc.logs = logs
     svc.idle_unload_s = a.idle_unload or 0
     svc.idle_sleep_s = a.idle_sleep or 0
@@ -300,11 +306,22 @@ def check_models(services: list[Service]) -> None:
 def main() -> int:
     ap = build_parser()
     engine_bin = ap.parse_known_args(sys.argv[1:])[0].engine_bin
+    known = engine_flags_of(engine_bin) if engine_bin else None
+    parse_only = "--check-model-flags" in (known or ())
+    probe_cache = os.environ.get("BASALT_PARSER_PROBE_CACHE")
+    publish_probes = None
+    if parse_only and probe_cache:
+        flag_probe, publish_probes = cached_flag_probe(engine_bin, Path(probe_cache))
+    elif parse_only:
+        flag_probe = lambda path, group: flag_refused(engine_bin, path, group, parse_only=True)
+    else:
+        flag_probe = lambda path, group: flag_refused(engine_bin, path, group)
     try:
-        settings = model_settings(ap, sys.argv[1:], (lambda path, group: flag_refused(engine_bin, path, group))
-                                  if engine_bin else None)
+        settings = model_settings(ap, sys.argv[1:], flag_probe if engine_bin else None, parallel_probes=parse_only)
     except ValueError as e:
         fail(f"--config: {e}")
+    if publish_probes is not None:
+        publish_probes()
     a = settings[0][0]                                  # the options every model shares read the same in each
     multi = len(settings) > 1
     service.DEBUG, engine_process.REQUEST_LINES = a.debug, a.request_lines
@@ -317,7 +334,8 @@ def main() -> int:
         print(f"[server] error: {line}", file=sys.stderr)
     if problems:
         return 2
-    known = engine_flags_of(a.engine_bin) if a.engine_bin else None
+    if a.engine_bin != engine_bin or known is None:
+        known = engine_flags_of(a.engine_bin) if a.engine_bin else None
     cfgs = [check_model(m, file_engine, cli_engine, used_argv, known)
             for m, used_argv, file_engine, cli_engine in settings]
     if (a.image_url_host or a.image_dir) and not a.mock_engine and all(m[0].vision == "off" for m in settings):
@@ -339,7 +357,13 @@ def main() -> int:
         c["shared_items"], c["name_width"] = shared, width
     services = [build_model(m[0], cfg, logs, multi, known) for m, cfg in zip(settings, cfgs)]
     check_models(services)
+    if a.stt_threads < 1:
+        fail("--stt-threads must be positive")
+    speech = SpeechWorker(a.stt_model, a.stt_threads) if a.stt_model else None
     router = Router(services)
+    router.speech = speech
+    router.speech_video = a.stt_video
+    router.speech_language = a.stt_language
     svc = router.front
     svc.image_sources = image_sources
     if image_sources.url_hosts or image_sources.dirs or image_sources.remote_only:
@@ -446,7 +470,7 @@ def main() -> int:
     except KeyboardInterrupt:
         if not rc:
             print("[server] stopping (Ctrl+C again to force)", flush=True)
-        closers = [router.stop, httpd.shutdown]
+        closers = [router.stop, httpd.shutdown, speech.close if speech else None]
         for s in services:
             closers += [getattr(s.engine, "close", None), s.vision.close if s.vision else None]
         for close in filter(None, closers):

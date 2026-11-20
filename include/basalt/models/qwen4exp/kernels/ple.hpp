@@ -57,7 +57,13 @@ struct PleWeights {
     /// Plan v0.3 P6: the IQ model files keep `ple_key` in BF16 ([n_embd, hc_dim], `w[o*n_embd+i]`); when set it
     /// replaces both key paths above.
     const uint16_t* key_bf16 = nullptr;
+    const float* value_lora_a = nullptr;
+    const float* value_lora_b = nullptr;
+    const float* value_lora_scale = nullptr;
 };
+
+void ple_value_lora(const PleWeights& w, const float* input, float* value, int rows, int width, void* stream,
+                    const float* adapter_rows = nullptr);
 
 /// Everything the block produces, in the order the oracle writes it.  Any pointer may be
 /// null; the caller that only wants the result passes nothing else.  Having the intermediates is what makes

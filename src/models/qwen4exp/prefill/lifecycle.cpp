@@ -1,4 +1,5 @@
 #include "state.hpp"
+#include "basalt/core/diag.hpp"
 #include "layout.hpp"
 #include "basalt/models/qwen4exp/prefill/prefill.hpp"
 #include "basalt/models/qwen4exp/decode/mtp.hpp"
@@ -47,13 +48,26 @@ void Prefill::release() {
     for (float* p : {impl_->cpu_x, impl_->cpu_rows})
         if (p) cudaFreeHost(p);
     if (impl_->cpu_s) cudaStreamDestroy(impl_->cpu_s);
-    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1], impl_->ahead_ev})
+    for (cudaEvent_t e : {impl_->cpu_ev_in, impl_->cpu_ev_x, impl_->cpu_gev[0], impl_->cpu_gev[1], impl_->ahead_ev,
+                          impl_->kv_copy_start, impl_->kv_copy_done})
         if (e) cudaEventDestroy(e);
     if (impl_->guess_host) cudaFreeHost(impl_->guess_host);
     for (void* p : impl_->owned) cudaFree(p);
 }
 
 void Prefill::set_session(core::SessionState& ss) { impl_->ss = &ss; }
+void Prefill::bind_lora(const basalt::qwen4exp::AtomicLoraDevice* adapter,
+                        const basalt::qwen4exp::AtomicLoraDevice* peer_adapter) {
+    impl_->gemm.bind_lora(adapter);
+    impl_->peer_lora = peer_adapter;
+}
+void Prefill::bind_swift_lora(const basalt::qwen4exp::SwiftLoraDevice* adapter) {
+    impl_->gemm.bind_swift_lora(adapter);
+}
+void Prefill::set_cpu_lora(const basalt::qwen4exp::AtomicLora* adapter, float scale) {
+    impl_->cpu_lora = adapter;
+    impl_->cpu_lora_scale = scale;
+}
 
 bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, core::SessionState& ss,
                    core::ExpertSource* src, const core::ExpertCache* cache, const int32_t* host_res, int64_t chunk,
@@ -89,6 +103,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
     bool ok = true;
+    if (core::exp_flag("fp16_kv_overlap") != 0) {
+        if (cudaEventCreateWithFlags(&m.kv_copy_start, cudaEventDisableTiming) != cudaSuccess ||
+            cudaEventCreateWithFlags(&m.kv_copy_done, cudaEventDisableTiming) != cudaSuccess) {
+            err = "prefill: FP16 KV staging events";
+            return false;
+        }
+    }
     // one-time: events, the stager, the host buffers (for the largest chunk), the identity page table
     for (int i = 0; i < RING_MAX; ++i) {
         if (cudaEventCreateWithFlags(&m.copied[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
@@ -176,6 +197,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
         return false;
     }
+    m.layout_bytes = o.used;
     return true;
 }
 

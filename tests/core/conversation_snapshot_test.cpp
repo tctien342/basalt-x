@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <future>
 #include <vector>
 
 using namespace basalt::core;
@@ -164,6 +165,78 @@ void full_session(int fmt, int mode, int experts) {
     SavedConversation a,b,restored;
     check(conversation_snapshot_save(a,view,ss,g,draft.state,err),"capture complete A");
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
+    if (fmt == kKvInt8 && mode == 1) {
+        std::vector<uint32_t> directory;
+        for (uint32_t page = 0; page < 17; ++page) directory.push_back((page * 5) % 24);
+        main.state.shared_residency = true;
+        main.state.host.fp16_host_pages = main.state.map.page_table;
+        main.state.host_page_ids = directory.data();
+        main.state.host_page_count = directory.size();
+        main.state.host_pool_pages = main.state.n_pages;
+        SavedConversation expected;
+        check(conversation_snapshot_save(expected, view, ss, g, draft.state, err), "synchronous shared snapshot");
+        auto chain = [&] {
+            SavedConversation value;
+            value.live.ids = ids;
+            value.live.imgs = images;
+            value.checkpoints.push_back(checkpoints[0].shared_copy());
+            return value;
+        };
+        ConversationSharedSnapshot sealed;
+        check(conversation_snapshot_seal_shared(sealed, chain(), ss, g, &draft.state, err),
+              "seal shared INT8 state and draft");
+        check(sealed.image.kv[0].k.empty() && !sealed.image.kv[1].k.empty(),
+              "sealing leaves target K/V for the worker");
+        ConversationSharedSnapshot frozen;
+        check(conversation_snapshot_seal_shared(frozen, chain(), ss, g, &draft.state, err, true) &&
+              frozen.image.kv[0].pooled.empty() && !frozen.image.kv[1].k.empty(),
+              "leave the leased pooled rows for deferred read");
+        ConversationSharedSnapshot split_draft;
+        check(conversation_snapshot_seal_shared(split_draft, chain(), ss, g, &draft.state, err, true, 4) &&
+              split_draft.draft_tail.first_cell == 4 && split_draft.draft_tail.end_cell > 4,
+              "seal page-rounded draft prefix and retain the high tail");
+        SavedConversation frozen_image;
+        check(!conversation_snapshot_finish_shared(frozen_image, std::move(frozen), err),
+              "refuse to publish before reading the pooled rows");
+        directory[0] = 23;
+        float* other_index = nullptr;
+        main.alloc(other_index, main.sizes[4]);
+        cuda_check(cudaMemset(other_index, 0x77, main.sizes[4]));
+        auto index_worker = std::async(std::launch::async, [&] {
+            return conversation_snapshot_read_shared_index(frozen, err) &&
+                   conversation_snapshot_finish_shared(frozen_image, std::move(frozen), err);
+        });
+        cuda_check(cudaMemset(other_index, 0x33, main.sizes[4]));
+        check(index_worker.get() && equal(frozen_image.kv[0], expected.kv[0]) &&
+              equal(frozen_image.kv[1], expected.kv[1]),
+              "frozen index reads the old slot, including the spare row, through its own stream");
+        for (size_t i = 0; i < 4; ++i)
+            if (draft.sizes[i])
+                cuda_check(cudaMemset(draft.sources[i], 0x27, draft.sizes[i] / draft.state.max_cells * 4));
+        cuda_check(cudaDeviceSynchronize());
+        SavedConversation split_image;
+        auto split_worker = std::async(std::launch::async, [&] {
+            return conversation_snapshot_read_shared_draft(split_draft, err) &&
+                   conversation_snapshot_read_shared_index(split_draft, err) &&
+                   conversation_snapshot_finish_shared(split_image, std::move(split_draft), err);
+        });
+        check(split_worker.get() && equal(split_image.kv[1], expected.kv[1]),
+              "draft prefix rewrites preserve exact sealed bytes and deferred tail");
+        cuda_check(cudaMemset(main.state.idx_pooled, 0x3F, main.sizes[4]));
+        draft.fill(81);
+        SavedConversation deferred;
+        auto worker = std::async(std::launch::async, [&] {
+            return conversation_snapshot_finish_shared(deferred, std::move(sealed), err);
+        });
+        check(worker.get() && deferred.live.ids == expected.live.ids && deferred.live.state_a == expected.live.state_a &&
+              deferred.live.state_e == expected.live.state_e && deferred.checkpoints[0].used == 17 &&
+              equal(deferred.kv[0], expected.kv[0]) && equal(deferred.kv[1], expected.kv[1]),
+              "worker uses the frozen directory and sealed device state and draft");
+        main.state.shared_residency = false;
+        main.state.host.fp16_host_pages = nullptr;
+        main.state.host_page_ids = nullptr;
+        main.state.host_page_count = main.state.host_pool_pages = 0;
+    }
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
     check(a.live.state_d!=b.live.state_d,"different opening-state spare keys in regression fixture");
@@ -254,6 +327,116 @@ void full_session(int fmt, int mode, int experts) {
     cuda_check(cudaMemcpy(spare.data(),main.state.idx_pooled,sizes.dead,cudaMemcpyDeviceToHost));
     check(std::equal(spare.begin(),spare.end(),a.checkpoints[0].state_d.begin(),a.checkpoints[0].state_d.end()),"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
+}
+
+// The same logical image can move between different physical host page orders.
+void mapped_kv(int format, bool rotation) {
+    Fixture source(format, 1), target(format, 1);
+    source.state.kv_rot = target.state.kv_rot = rotation;
+    uint32_t source_pages[] = {8, 2, 3}, target_pages[] = {5, 6, 1};
+    auto bind = [](Fixture& f, const uint32_t (&pages)[3]) {
+        int32_t* device = nullptr;
+        f.alloc(device, sizeof(pages));
+        cuda_check(cudaMemcpy(device, pages, sizeof(pages), cudaMemcpyHostToDevice));
+        f.state.host.fp16_host_pages = device;
+        f.state.host_page_ids = pages;
+        f.state.host_page_count = 3;
+        f.state.host_pool_pages = f.state.n_pages;
+    };
+    bind(source, source_pages);
+    bind(target, target_pages);
+    source.fill(42);
+    target.fill(73);
+    std::string error;
+    ConversationKv image, copied;
+    constexpr int64_t tokens = 9;
+    check(conversation_kv_save(image, source.state, source.g, tokens, true, error), "capture mapped K/V pages");
+    const std::array<const ConversationBuffer*, 4> payloads = {&image.k, &image.v, &image.k_scale, &image.v_scale};
+    for (size_t part = 0; part < payloads.size(); ++part) {
+        const auto& payload = *payloads[part];
+        if (payload.empty()) continue;
+        const size_t page_bytes = payload.size() / 3;
+        for (size_t i = 0; i < 3; ++i) {
+            std::vector<uint8_t> actual(page_bytes), expected(page_bytes);
+            check(payload.read(actual.data(), i * page_bytes, page_bytes), "read logical saved page");
+            const auto* bytes = static_cast<const uint8_t*>(source.sources[part]);
+            cuda_check(cudaMemcpy(expected.data(), bytes + source_pages[i] * page_bytes, page_bytes, cudaMemcpyDefault));
+            check(actual == expected, "logical snapshot uses its physical page for each payload");
+        }
+    }
+    uint64_t fingerprint = 0;
+    check(conversation_kv_restore(image, target.state, target.g, tokens, true, error), "restore to another mapping");
+    check(conversation_kv_verify(image, target.state, target.g, tokens, true, fingerprint, error), "verify mapped restore");
+    target.fill(101);
+    check(conversation_kv_copy(source.state, target.state, target.g, tokens, true, error), "copy between distinct mappings");
+    check(conversation_kv_save(copied, target.state, target.g, tokens, true, error) && equal(image, copied),
+          "peer copy preserves the logical payload");
+    target_pages[2] = target.state.n_pages;
+    check(!conversation_kv_restore(image, target.state, target.g, tokens, true, error), "reject page outside pool");
+}
+
+void selective_staging(int format) {
+    Fixture source(format, 1), stage(format, 0);
+    source.fill(42);
+    stage.fill(73);
+    const auto& st = source.state;
+    const std::array<void*, 4> gpu = format == kKvInt8
+        ? std::array<void*, 4>{st.k_q, st.v_q, st.k_scale, st.v_scale}
+        : std::array<void*, 4>{st.k_pool, st.v_pool, nullptr, nullptr};
+    int32_t* mapping = nullptr;
+    int32_t* ids = nullptr;
+    int32_t* steps = nullptr;
+    uint32_t* bitmap = nullptr;
+    const int32_t map[] = {8, 2, 3};
+    const int32_t cells[] = {0, 8, 12};  // two selected cells are historical
+    std::array<int32_t, kStepCount> row{};
+    row[kStepWidth] = 3;
+    source.alloc(mapping, sizeof(map));
+    source.alloc(ids, sizeof(cells));
+    source.alloc(steps, sizeof(row));
+    source.alloc(bitmap, sizeof(uint32_t));
+    cuda_check(cudaMemcpy(mapping, map, sizeof(map), cudaMemcpyHostToDevice));
+    cuda_check(cudaMemcpy(ids, cells, sizeof(cells), cudaMemcpyHostToDevice));
+    cuda_check(cudaMemcpy(steps, row.data(), sizeof(row), cudaMemcpyHostToDevice));
+    source.state.host.fp16_host_pages = mapping;
+    std::vector<int32_t> resident(st.n_pages, -1);
+    resident[3] = 1;
+    cuda_check(cudaMemcpy(st.page_table, resident.data(), resident.size() * sizeof(int32_t), cudaMemcpyHostToDevice));
+    for (size_t part = 0; part < gpu.size(); ++part)
+        if (gpu[part]) {
+            const size_t bytes = source.sizes[part] / st.n_pages;
+            cuda_check(cudaMemset(static_cast<uint8_t*>(gpu[part]) + bytes, 90 + part, bytes));
+        }
+    QsaAttnPools src;
+    src.k_pool = st.k_pool; src.v_pool = st.v_pool;
+    src.k_q = st.k_q; src.v_q = st.v_q; src.k_scale = st.k_scale; src.v_scale = st.v_scale;
+    src.page_table = st.page_table; src.physical_pages = mapping;
+    QsaAttnPools dst;
+    dst.k_pool = stage.state.k_pool; dst.v_pool = stage.state.v_pool;
+    dst.k_q = stage.state.k_q; dst.v_q = stage.state.v_q;
+    dst.k_scale = stage.state.k_scale; dst.v_scale = stage.state.v_scale;
+    check(kv_stage_selected(dst, src, st.host, format, qsa_real_shapes(), bitmap, ids, steps, 1, 3, 9, nullptr),
+          "launch selective staging");
+    for (size_t part = 0; part < gpu.size(); ++part) {
+        if (!gpu[part]) continue;
+        const size_t bytes = source.sizes[part] / st.n_pages;
+        std::vector<uint8_t> actual(bytes), expected(bytes);
+        const auto* staged = static_cast<const uint8_t*>(stage.sources[part]);
+        const auto* host = static_cast<const uint8_t*>(source.sources[part]);
+        cuda_check(cudaMemcpy(actual.data(), staged, bytes, cudaMemcpyDefault));
+        cuda_check(cudaMemcpy(expected.data(), host + 8 * bytes, bytes, cudaMemcpyDefault));
+        check(actual == expected, "cache miss stages the mapped host page");
+        cuda_check(cudaMemcpy(actual.data(), staged + 2 * bytes, bytes, cudaMemcpyDefault));
+        check(std::all_of(actual.begin(), actual.end(), [&](uint8_t x) { return x == 90 + part; }),
+              "cache hit stages the resident physical slot");
+        std::vector<uint8_t> original(stage.sizes[part]);
+        for (size_t j = 0; j < original.size(); ++j) original[j] = uint8_t(73 + part * 31 + j * 7 + j / 257);
+        for (int page : {1, 3}) {
+            cuda_check(cudaMemcpy(actual.data(), staged + page * bytes, bytes, cudaMemcpyDefault));
+            check(std::equal(actual.begin(), actual.end(), original.begin() + page * bytes),
+                  "unselected or non-historical page remains unchanged");
+        }
+    }
 }
 
 // An elastic state backs a prefix of its cells: a snapshot longer than that is refused, not copied past it.
@@ -379,5 +562,9 @@ int main() {
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
+    mapped_kv(kKvF16, false);
+    mapped_kv(kKvInt8, true);
+    selective_staging(kKvF16);
+    selective_staging(kKvInt8);
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

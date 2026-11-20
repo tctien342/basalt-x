@@ -519,14 +519,15 @@ public:
     /// Allocates and loads the model's `experts` section.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
     bool open(const ExpertFiles& files, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
-              const std::string& shared_arena_file = {});
+              const std::string& shared_arena_file = {},
+              const std::function<bool()>& before_register = {});
     void close();
 
     bool mapped() const { return base_ != nullptr; }
     int64_t blobs() const { return blobs_; }
     const uint8_t* blob(int64_t layer, int64_t expert) override;
     const uint8_t* resident_blob(int64_t layer, int64_t expert) const override;
-    int64_t reads() const { return reads_; }
+    int64_t reads() const { return reads_.load(std::memory_order_relaxed); }
     bool pinned(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     void prefetch(int64_t layer, int64_t expert) override;
@@ -547,7 +548,7 @@ private:
     const uint8_t* base_ = nullptr;
     int64_t blobs_ = 0;
     int64_t n_expert_ = 0;
-    int64_t reads_ = 0;
+    std::atomic<int64_t> reads_{0};
     std::string note_;
     std::string ram_warning_;
     double gib_per_s_ = 0.0;

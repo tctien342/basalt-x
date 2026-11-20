@@ -12,6 +12,7 @@
 #include "basalt/models/qwen4exp/geometry.hpp"
 #include "basalt/kernels/cpu/pool.hpp"
 #include "basalt/models/qwen4exp/kernels/fused_gr.hpp"
+#include "basalt/models/qwen4exp/kernels/swift_lora.hpp"
 #include "basalt/models/qwen4exp/kernels/mid_chain.hpp"
 #include "basalt/models/qwen4exp/kernels/hc_fused.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -24,6 +25,7 @@
 #include "basalt/models/qwen4exp/kernels/s2_expert_grouped.hpp"
 #include "basalt/core/progress.hpp"
 #include "basalt/models/qwen4exp/kernels/verify_kernels.hpp"
+#include "basalt/models/qwen4exp/kernels/dec_moe.hpp"
 #include "basalt/kernels/wait_abort.hpp"
 #include "basalt/log.hpp"
 #include <algorithm>
@@ -53,13 +55,15 @@ Verifier::~Verifier() {
         if (e) cudaGraphExecDestroy(e);
     for (auto& e : exec_nr_)
         if (e) cudaGraphExecDestroy(e);
-    if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
+    for (auto& e : commit_exec_)
+        if (e) cudaGraphExecDestroy(e);
     for (auto& kv : solo_sets_) {
         for (auto& e : kv.second.exec)
             if (e) cudaGraphExecDestroy(e);
         for (auto& e : kv.second.exec_nr)
             if (e) cudaGraphExecDestroy(e);
-        if (kv.second.commit) cudaGraphExecDestroy(kv.second.commit);
+        for (auto& e : kv.second.commit)
+            if (e) cudaGraphExecDestroy(e);
     }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -71,6 +75,8 @@ Verifier::~Verifier() {
     if (lp_buf_) cudaFree(lp_buf_);
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (h_segb_) cudaFreeHost(h_segb_);
+    if (h_qslots_) cudaFreeHost(h_qslots_);
+    if (h_ple_slots_) cudaFreeHost(h_ple_slots_);
     if (h_qseg_) cudaFreeHost(h_qseg_);
     if (cs_) cudaStreamDestroy(cs_);
     if (cm_) cudaStreamDestroy(cm_);
@@ -98,13 +104,13 @@ Verifier::~Verifier() {
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (arena_) cudaFree(arena_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_commit_, h_ple_, h_out_, h_x_, h_ids_, h_seq_, h_flag_, h_ymiss_, h_pend_,
-                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_, h_head_from_};
+                     h_flagA_, h_plan_, h_flagB_, h_q_, h_qp_, h_top_, h_head_from_, h_adapter_scale_, h_swift_scale_};
     for (void* h : hosts)
         if (h) cudaFreeHost(h);
 }
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
-                    const NativeHead* head, int max_t, std::string& err) {
+                    const NativeHead* head, int max_t, std::string& err, int routed_k, int first_wide_layer) {
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -123,6 +129,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     hits_ = hits;
     head_ = head;
     max_t_ = max_t;
+    first_wide_layer_ = first_wide_layer;
+    routed_k_ = routed_k ? routed_k : static_cast<int>(ss.k);
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
     if (max_t < 2 || max_t > basalt::kernels::kVerifyMaxT || max_t > basalt::kernels::cpu::MAXT) {
@@ -141,8 +149,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: " + why + " (the verify window reproduces the default native decode path)";
         return false;
     }
-    if (!basalt::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) || ss.k != 10 || g.ssm_state_size != 128 ||
-        g.ssm_d_conv != 4) {
+    const bool wide = (routed_k_ > 10 && routed_k_ <= 23) && ss.k == 10 && max_t_ * routed_k_ <= basalt::kernels::kDmCap;
+    if (!basalt::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr) ||
+        (routed_k_ != 10 && !wide) || first_wide_layer_ < 0 || first_wide_layer_ >= g.n_layers ||
+        g.ssm_state_size != 128 || g.ssm_d_conv != 4) {
         err = "verify: geometry differs from the artifact's";
         return false;
     }
@@ -161,7 +171,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_blocks_ = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     attn_scratch_floats_ = (int64_t) basalt::kernels::qsa_decode_attn_scratch_floats(cap_, s);
 
-    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
+    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) routed_k_;
     const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
@@ -172,6 +182,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     // ---- mapped staging
     bool ok = mapped(T * 4, (void**) &h_tok_, (void**) &m_tok_) &&
+              mapped(T * sizeof(float), (void**) &h_adapter_scale_, (void**) &m_adapter_scale_) &&
+              (!swift_lora_ || mapped(T * sizeof(float), (void**) &h_swift_scale_, (void**) &m_swift_scale_)) &&
               mapped(T * basalt::kernels::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) &&
               mapped(T * (NH + NKV + IQ) * 4, (void**) &h_pos_, (void**) &m_pos_) &&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
@@ -245,6 +257,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
             basalt::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
             basalt::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
         head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
+        if (swift_lora_) {
+            swift_scratch_ = b.take<float>(T * basalt::kernels::swift_lora_rank);
+            swift_shared_scratch_ = b.take<float>(T * basalt::kernels::swift_lora_rank);
+        }
         sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
         sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
         head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
@@ -267,6 +283,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
         return false;
     }
+    arena_bytes_ = count.used;
     cudaMemset(arena_, 0, count.used);
     prof_on_ = diagnostics().profile;
     if (prof_on_) decode_gaps().host_on = true;
@@ -374,6 +391,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
     if (!dm_init(err)) return false;
+    if (wide && dm_ == nullptr) {
+        err = "verify: widened routing requires device-planned expert execution";
+        return false;
+    }
     basalt::log::info("basalt verify", "window up to %d tokens, %.1f MiB of device buffers%s", max_t,
                  (double) count.used / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");

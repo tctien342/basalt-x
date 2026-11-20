@@ -137,8 +137,9 @@ public:
     /// With `skip`, the named tensors are not read: their rows keep their metadata with `data == nullptr` and
     /// `resident == false`, and the other tensors are packed into the compacted arena `pool_bytes` sized.
     /// `report_progress == false` keeps a temporary load out of the startup progress lines.
+    /// `host_image` holds `arena_bytes` of packed weights in RAM while references still address `arena_base`.
     bool load(const PackFiles& pack, void* arena_base, uint64_t arena_bytes, std::string& err,
-              const std::set<std::string>* skip = nullptr, bool report_progress = true);
+              const std::set<std::string>* skip = nullptr, bool report_progress = true, void* host_image = nullptr);
 
     const WeightRef* find(const std::string& name) const;
     /// Point a row at another device form that stands for the tensor (an 8-bit copy keyed by its own address,

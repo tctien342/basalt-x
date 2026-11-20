@@ -94,8 +94,9 @@ void Verifier::order_after_commit(bool solo) {
 // The commit on its own stream: the epoch's counters, the indexer and PLE commits, then the GDN items from `kCommitBlocks`
 // blocks that claim them one at a time (the next window's finisher claims what is left).
 bool Verifier::capture_commit(std::string& err) {
-    if (commit_exec_ != nullptr) return true;
     using namespace basalt::kernels;
+    auto& exec = commit_exec_[rope_context_index()];
+    if (exec != nullptr) return true;
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     const QsaShapes s = shapes_of(g);
@@ -145,12 +146,17 @@ bool Verifier::capture_commit(std::string& err) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    const cudaError_t instantiated = cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphDestroy(graph);
+    if (instantiated != cudaSuccess) {
+        err = std::string("verify: commit instantiate: ") + cudaGetErrorString(instantiated);
+        return false;
+    }
     return true;
 }
 
@@ -171,7 +177,7 @@ bool Verifier::commit(int n_keep, std::string& err, int parts) {
         cudaEventRecord(ev_commit_go_, cs_);
         cudaStreamWaitEvent(cm_, ev_commit_go_, 0);
         decode_events().record(DecodeEvents::kCommitPre, cm_);
-        const cudaError_t le = cudaGraphLaunch(commit_exec_, cm_);
+        const cudaError_t le = cudaGraphLaunch(commit_exec_[last_rope_context_], cm_);
         decode_events().record(DecodeEvents::kCommitPost, cm_);
         if (gs_split_ && gs_live_) {   // the peer's heads, on its stream behind its window
             const OnDevice on(gs_dev_);

@@ -110,9 +110,10 @@ void dec_moe_glue(const NativeExpertLayout& L, const DmGlueArgs& a_in, void* scr
 }
 
 void dec_moe_wait(const DmPlan* plan, const volatile uint32_t* peer_done_m, const volatile uint32_t* host_flag_m,
-                  uint32_t ring, void* stream, unsigned long long* stats, int layer, bool trigger, bool skip_peer) {
+                  uint32_t ring, void* stream, unsigned long long* stats, int layer, bool trigger, bool skip_peer,
+                  unsigned long long* pcie_timing) {
     launch_pdl(dm_wait_kernel, dim3(1), dim3(1), 0, (cudaStream_t) stream, plan, peer_done_m, host_flag_m, ring, stats, layer,
-               (trigger ? 1 : 0) | (skip_peer ? 2 : 0));
+               (trigger ? 1 : 0) | (skip_peer ? 2 : 0), pcie_timing);
     check("dec_moe_wait");
 }
 
@@ -209,6 +210,15 @@ std::string dec_moe_stats_text(const unsigned long long* w, double windows) {
         const unsigned long long* c = w + kDmStatLayer + kDmStatPerLayer * l;
         if (c[1] == 0) continue;
         std::snprintf(buf, sizeof buf, " %.1f", c[4] / (double) c[1] / 1e3);
+        s += buf;
+    }
+    bool staged = false;
+    for (int l = 0; l < kDmStatLayers; ++l) {
+        const unsigned long long* c = w + kDmStatStage + kDmStageStatPerLayer * l;
+        if (!c[0] || c[1] < c[0] || c[3] < c[2]) continue;
+        if (!staged) s += "\n  last staged window per layer (copy / grouped compute us):";
+        staged = true;
+        std::snprintf(buf, sizeof buf, " L%d %.1f / %.1f;", l, (c[1] - c[0]) / 1e3, (c[3] - c[2]) / 1e3);
         s += buf;
     }
     s += "\n  first layers (CUDA0 done / peer done after the doorbell, us):";

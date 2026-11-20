@@ -58,6 +58,9 @@ class FakeService:
     """Service.run's events for a reply that thinks, answers and makes two calls."""
     model = "m"
 
+    def response_model(self):
+        return self.model
+
     def run(self, *a, **kw):
         a, b = ToolCall("read", {"path": "x"}), ToolCall("bash", {"cmd": "ls"})
         yield "logprobs", ("reasoning", lp("hm"), None)
